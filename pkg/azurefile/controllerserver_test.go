@@ -29,7 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-02-01/network"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2020-12-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-07-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-02-01/storage"
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -163,7 +163,7 @@ func TestCreateVolume(t *testing.T) {
 						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 					})
 
-				expectedErr := status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities not valid: driver only supports mount access type volume capability")
+				expectedErr := status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities not valid: driver does not support block volumes")
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -642,76 +642,6 @@ func TestCreateVolume(t *testing.T) {
 			},
 		},
 		{
-			name: "Request namespace does not match",
-			testFunc: func(t *testing.T) {
-				name := "baz"
-				sku := "sku"
-				kind := "StorageV2"
-				location := "centralus"
-				value := "foo bar"
-				accounts := []storage.Account{
-					{Name: &name, Sku: &storage.Sku{Name: storage.SkuName(sku)}, Kind: storage.Kind(kind), Location: &location},
-				}
-				keys := storage.AccountListKeysResult{
-					Keys: &[]storage.AccountKey{
-						{Value: &value},
-					},
-				}
-
-				allParam := map[string]string{
-					skuNameField:            "premium",
-					storageAccountTypeField: "stoacctype",
-					locationField:           "loc",
-					storageAccountField:     "stoacc",
-					resourceGroupField:      "rg",
-					shareNameField:          "",
-					diskNameField:           "diskname",
-					fsTypeField:             "",
-					storeAccountKeyField:    "storeaccountkey",
-					secretNamespaceField:    "secretnamespace",
-				}
-
-				req := &csi.CreateVolumeRequest{
-					Name:               "random-vol-name-namespace-not-match",
-					VolumeCapabilities: stdVolCap,
-					CapacityRange:      lessThanPremCapRange,
-					Parameters:         allParam,
-				}
-
-				d := NewFakeDriver()
-				d.cloud = &azure.Cloud{}
-				d.cloud.KubeClient = fake.NewSimpleClientset()
-
-				ctrl := gomock.NewController(t)
-				defer ctrl.Finish()
-
-				mockFileClient := mockfileclient.NewMockInterface(ctrl)
-				d.cloud.FileClient = mockFileClient
-
-				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
-				d.cloud.StorageAccountClient = mockStorageAccountsClient
-
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
-
-				d.AddControllerServiceCapabilities(
-					[]csi.ControllerServiceCapability_RPC_Type{
-						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					})
-
-				ctx := context.Background()
-
-				// expectedErr := status.Error(codes.Internal, "failed to store storage account key: couldn't create secret request namespace does not match object namespace, request: \"secretnamespace\" object: \"default\"")
-				_, err := d.CreateVolume(ctx, req)
-				if !reflect.DeepEqual(err, nil) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-		{
 			name: "Create disk returns error",
 			testFunc: func(t *testing.T) {
 				skipIfTestingOnWindows(t)
@@ -826,6 +756,7 @@ func TestCreateVolume(t *testing.T) {
 					fsTypeField:             "",
 					storeAccountKeyField:    "storeaccountkey",
 					secretNamespaceField:    "default",
+					mountPermissionsField:   "0755",
 				}
 
 				req := &csi.CreateVolumeRequest{
@@ -868,7 +799,7 @@ func TestCreateVolume(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid parameter",
+			name: "invalid mountPermissions",
 			testFunc: func(t *testing.T) {
 				name := "baz"
 				sku := "sku"
@@ -885,17 +816,7 @@ func TestCreateVolume(t *testing.T) {
 				}
 
 				allParam := map[string]string{
-					skuNameField:            "premium",
-					storageAccountTypeField: "stoacctype",
-					locationField:           "loc",
-					storageAccountField:     "stoacc",
-					resourceGroupField:      "rg",
-					shareNameField:          "",
-					diskNameField:           "diskname",
-					fsTypeField:             "",
-					storeAccountKeyField:    "storeaccountkey",
-					secretNamespaceField:    "default",
-					"invalidparameter":      "invalidparameter",
+					mountPermissionsField: "0abc",
 				}
 
 				req := &csi.CreateVolumeRequest{
@@ -931,7 +852,68 @@ func TestCreateVolume(t *testing.T) {
 
 				ctx := context.Background()
 
-				expectedErr := fmt.Errorf("invalid parameter %q in storage class", "invalidparameter")
+				expectedErr := status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s %s in storage class", "mountPermissions", "0abc"))
+				_, err := d.CreateVolume(ctx, req)
+				if !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "invalid parameter",
+			testFunc: func(t *testing.T) {
+				name := "baz"
+				sku := "sku"
+				kind := "StorageV2"
+				location := "centralus"
+				value := "foo bar"
+				accounts := []storage.Account{
+					{Name: &name, Sku: &storage.Sku{Name: storage.SkuName(sku)}, Kind: storage.Kind(kind), Location: &location},
+				}
+				keys := storage.AccountListKeysResult{
+					Keys: &[]storage.AccountKey{
+						{Value: &value},
+					},
+				}
+
+				allParam := map[string]string{
+					"invalidparameter": "invalidparameter",
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name:               "random-vol-name-valid-request",
+					VolumeCapabilities: stdVolCap,
+					CapacityRange:      lessThanPremCapRange,
+					Parameters:         allParam,
+				}
+
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.KubeClient = fake.NewSimpleClientset()
+
+				ctrl := gomock.NewController(t)
+				defer ctrl.Finish()
+
+				mockFileClient := mockfileclient.NewMockInterface(ctrl)
+				d.cloud.FileClient = mockFileClient
+
+				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
+				d.cloud.StorageAccountClient = mockStorageAccountsClient
+
+				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
+				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
+				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+
+				d.AddControllerServiceCapabilities(
+					[]csi.ControllerServiceCapability_RPC_Type{
+						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+					})
+
+				ctx := context.Background()
+
+				expectedErr := status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid parameter %q in storage class", "invalidparameter"))
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -2081,7 +2063,7 @@ func TestSetAzureCredentials(t *testing.T) {
 
 	for _, test := range tests {
 		d.cloud.KubeClient = test.kubeClient
-		result, err := d.SetAzureCredentials(test.accountName, test.accountKey, test.secretName, test.secretNamespace)
+		result, err := d.SetAzureCredentials(context.TODO(), test.accountName, test.accountKey, test.secretName, test.secretNamespace)
 		if result != test.expectedName || !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("desc: %s,\n input: accountName(%v), accountKey(%v),\n setAzureCredentials result: %v, expectedName: %v err: %v, expectedErr: %v",
 				test.desc, test.accountName, test.accountKey, result, test.expectedName, err, test.expectedErr)
