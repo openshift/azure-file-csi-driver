@@ -26,14 +26,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2021-08-01/network"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
+	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-07-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2022-03-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -43,6 +44,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	cloudprovider "k8s.io/cloud-provider"
+	"k8s.io/utils/pointer"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient/mockfileclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient/mockstorageaccountclient"
@@ -324,7 +326,7 @@ func TestCreateVolume(t *testing.T) {
 						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 					})
 
-				expectedErr := status.Errorf(codes.InvalidArgument, "accessTier(test_accessTier) is not supported, supported AccessTier list: [Cool Hot Premium TransactionOptimized]")
+				expectedErr := status.Errorf(codes.InvalidArgument, "shareAccessTier(test_accessTier) is not supported, supported ShareAccessTier list: [Cool Hot Premium TransactionOptimized]")
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -537,38 +539,6 @@ func TestCreateVolume(t *testing.T) {
 			},
 		},
 		{
-			name: "NFS protocol is not supported in cross subscription",
-			testFunc: func(t *testing.T) {
-				allParam := map[string]string{
-					subscriptionIDField: "abc",
-					protocolField:       "nfs",
-				}
-
-				req := &csi.CreateVolumeRequest{
-					Name:               "random-vol-name-vol-cap-invalid",
-					CapacityRange:      stdCapRange,
-					VolumeCapabilities: stdVolCap,
-					Parameters:         allParam,
-				}
-
-				d := NewFakeDriver()
-				d.cloud = &azure.Cloud{
-					Config: azure.Config{},
-				}
-
-				d.AddControllerServiceCapabilities(
-					[]csi.ControllerServiceCapability_RPC_Type{
-						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					})
-
-				expectedErr := status.Errorf(codes.InvalidArgument, "NFS protocol is not supported in cross subscription(abc)")
-				_, err := d.CreateVolume(context.Background(), req)
-				if !reflect.DeepEqual(err, expectedErr) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-		{
 			name: "storeAccountKey must set as true in cross subscription",
 			testFunc: func(t *testing.T) {
 				allParam := map[string]string{
@@ -593,7 +563,7 @@ func TestCreateVolume(t *testing.T) {
 						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 					})
 
-				expectedErr := status.Errorf(codes.InvalidArgument, "storeAccountKey must set as true in cross subscription(abc)")
+				expectedErr := status.Errorf(codes.InvalidArgument, "resourceGroup must be provided in cross subscription(abc)")
 				_, err := d.CreateVolume(context.Background(), req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -626,38 +596,6 @@ func TestCreateVolume(t *testing.T) {
 					})
 
 				expectedErr := status.Errorf(codes.InvalidArgument, "matchTags must set as false when storageAccount(abc) is provided")
-				_, err := d.CreateVolume(context.Background(), req)
-				if !reflect.DeepEqual(err, expectedErr) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-		{
-			name: "disableDeleteRetentionPolicy is not supported with Standard account type",
-			testFunc: func(t *testing.T) {
-				allParam := map[string]string{
-					storageAccountTypeField:           "standard",
-					disableDeleteRetentionPolicyField: "true",
-				}
-
-				req := &csi.CreateVolumeRequest{
-					Name:               "random-vol-name",
-					CapacityRange:      stdCapRange,
-					VolumeCapabilities: stdVolCap,
-					Parameters:         allParam,
-				}
-
-				d := NewFakeDriver()
-				d.cloud = &azure.Cloud{
-					Config: azure.Config{},
-				}
-
-				d.AddControllerServiceCapabilities(
-					[]csi.ControllerServiceCapability_RPC_Type{
-						csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-					})
-
-				expectedErr := status.Errorf(codes.InvalidArgument, "disableDeleteRetentionPolicy is not supported with Standard account type(standard)")
 				_, err := d.CreateVolume(context.Background(), req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -762,12 +700,13 @@ func TestCreateVolume(t *testing.T) {
 					FileServicePropertiesProperties: &storage.FileServicePropertiesProperties{},
 				}
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetServiceProperties(gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
-				mockFileClient.EXPECT().SetServiceProperties(gomock.Any(), gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
+				mockFileClient.EXPECT().GetServiceProperties(context.TODO(), gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
+				mockFileClient.EXPECT().SetServiceProperties(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -831,7 +770,8 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
@@ -886,11 +826,12 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, fmt.Errorf("test error")).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, fmt.Errorf("test error")).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -962,7 +903,8 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1035,7 +977,8 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: to.Int32Ptr(1)}}, nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: pointer.Int32(1)}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1124,11 +1067,12 @@ func TestCreateVolume(t *testing.T) {
 					mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 					d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-					mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+					mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+					mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 					mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 					mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 					mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-					mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+					mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 					d.AddControllerServiceCapabilities(
 						[]csi.ControllerServiceCapability_RPC_Type{
@@ -1195,11 +1139,12 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1255,11 +1200,12 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1316,11 +1262,12 @@ func TestCreateVolume(t *testing.T) {
 				mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
-				mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1385,15 +1332,16 @@ func TestCreateVolume(t *testing.T) {
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 				tagValue := "TestTagValue"
 
-				first := mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf(accountLimitExceedManagementAPI))
-				second := mockFileClient.EXPECT().CreateFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				first := mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, fmt.Errorf(accountLimitExceedManagementAPI))
+				second := mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil)
 				gomock.InOrder(first, second)
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().GetProperties(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.Account{Tags: map[string]*string{"TestKey": &tagValue}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 				d.AddControllerServiceCapabilities(
 					[]csi.ControllerServiceCapability_RPC_Type{
@@ -1496,8 +1444,8 @@ func TestDeleteVolume(t *testing.T) {
 						},
 					},
 				}
-				d.dataPlaneAPIVolMap = sync.Map{}
-				d.dataPlaneAPIVolMap.Store("vol_1#f5713de20cde511e8ba4900#fileshare#diskname.vhd##secret", "1")
+				d.dataPlaneAPIAccountCache, _ = azcache.NewTimedcache(10*time.Minute, func(key string) (interface{}, error) { return nil, nil })
+				d.dataPlaneAPIAccountCache.Set("f5713de20cde511e8ba4900", "1")
 				d.cloud = &azure.Cloud{}
 
 				expectedErr := status.Errorf(codes.NotFound, "get account info from(vol_1#f5713de20cde511e8ba4900#fileshare#diskname.vhd##secret) failed with error: could not get account key from secret(azure-storage-account-f5713de20cde511e8ba4900-secret): KubeClient is nil")
@@ -1529,7 +1477,8 @@ func TestDeleteVolume(t *testing.T) {
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
 				d.cloud = &azure.Cloud{}
 				d.cloud.FileClient = mockFileClient
-				mockFileClient.EXPECT().DeleteFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("test error")).Times(1)
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().DeleteFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("test error")).Times(1)
 
 				expectedErr := status.Errorf(codes.Internal, "DeleteFileShare fileshare under account(f5713de20cde511e8ba4900) rg() failed with error: test error")
 				_, err := d.DeleteVolume(ctx, req)
@@ -1560,7 +1509,8 @@ func TestDeleteVolume(t *testing.T) {
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
 				d.cloud = &azure.Cloud{}
 				d.cloud.FileClient = mockFileClient
-				mockFileClient.EXPECT().DeleteFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().DeleteFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
 				expectedResp := &csi.DeleteSnapshotResponse{}
 				resp, err := d.DeleteVolume(ctx, req)
@@ -1731,7 +1681,8 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(key, nil).AnyTimes()
 		mockFileClient := mockfileclient.NewMockInterface(ctrl)
 		d.cloud.FileClient = mockFileClient
-		mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, test.mockedFileShareErr).AnyTimes()
+		mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+		mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, test.mockedFileShareErr).AnyTimes()
 
 		_, err := d.ValidateVolumeCapabilities(context.Background(), &test.req)
 		if !reflect.DeepEqual(err, test.expectedErr) {
@@ -1748,7 +1699,7 @@ func TestControllerPublishVolume(t *testing.T) {
 	d.cloud = azure.GetTestCloud(ctrl)
 	d.cloud.Location = "centralus"
 	d.cloud.ResourceGroup = "rg"
-	d.dataPlaneAPIVolMap = sync.Map{}
+	d.dataPlaneAPIAccountCache, _ = azcache.NewTimedcache(10*time.Minute, func(key string) (interface{}, error) { return nil, nil })
 	nodeName := "vm1"
 	instanceID := fmt.Sprintf("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/%s", nodeName)
 	vm := compute.VirtualMachine{
@@ -1876,7 +1827,7 @@ func TestControllerPublishVolume(t *testing.T) {
 		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm1", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusNotFound, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
 		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm2", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusBadGateway, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
 		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm3", gomock.Any()).Return(vm, nil).AnyTimes()
-		mockVMsClient.EXPECT().Update(gomock.Any(), d.cloud.ResourceGroup, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+		mockVMsClient.EXPECT().Update(gomock.Any(), d.cloud.ResourceGroup, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 		_, err := d.ControllerPublishVolume(context.Background(), test.req)
 		if !reflect.DeepEqual(err, test.expectedErr) {
@@ -1986,7 +1937,7 @@ func TestCreateSnapshot(t *testing.T) {
 				SourceVolumeId: "vol_1",
 				Name:           "snapname",
 			},
-			expectedErr: status.Errorf(codes.Internal, "failed to check if snapshot(snapname) exists: file share is empty after parsing sourceVolumeID: vol_1"),
+			expectedErr: status.Errorf(codes.Internal, `GetFileShareInfo(vol_1) failed with error: error parsing volume id: "vol_1", should at least contain two #`),
 		},
 	}
 
@@ -2135,7 +2086,7 @@ func TestControllerExpandVolume(t *testing.T) {
 						csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 					})
 
-				expectedErr := status.Errorf(codes.InvalidArgument, "GetAccountInfo(vol_1) failed with error: error parsing volume id: \"vol_1\", should at least contain two #")
+				expectedErr := status.Errorf(codes.InvalidArgument, "GetFileShareInfo(vol_1) failed with error: error parsing volume id: \"vol_1\", should at least contain two #")
 				_, err := d.ControllerExpandVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -2211,7 +2162,8 @@ func TestControllerExpandVolume(t *testing.T) {
 				d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "vol_1", gomock.Any()).Return(key, nil).AnyTimes()
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
-				mockFileClient.EXPECT().ResizeFileShare(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("test error")).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().ResizeFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("test error")).AnyTimes()
 				d.cloud.FileClient = mockFileClient
 
 				expectErr := status.Errorf(codes.Internal, "expand volume error: test error")
@@ -2234,9 +2186,8 @@ func TestControllerExpandVolume(t *testing.T) {
 						ResourceGroup: "vol_2",
 					},
 				}
-				d.dataPlaneAPIVolMap = sync.Map{}
-				d.dataPlaneAPIVolMap.Store("#f5713de20cde511e8ba4900#filename##secret", "1")
-
+				d.dataPlaneAPIAccountCache, _ = azcache.NewTimedcache(10*time.Minute, func(key string) (interface{}, error) { return nil, nil })
+				d.dataPlaneAPIAccountCache.Set("f5713de20cde511e8ba4900", "1")
 				ctrl := gomock.NewController(t)
 				defer ctrl.Finish()
 				value := base64.StdEncoding.EncodeToString([]byte("acc_key"))
@@ -2296,9 +2247,10 @@ func TestControllerExpandVolume(t *testing.T) {
 				d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "capz-d18sqm", gomock.Any()).Return(key, nil).AnyTimes()
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
-				mockFileClient.EXPECT().ResizeFileShare(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+				mockFileClient.EXPECT().ResizeFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 				shareQuota := int32(0)
-				mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &shareQuota}}, nil).AnyTimes()
+				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &shareQuota}}, nil).AnyTimes()
 				d.cloud.FileClient = mockFileClient
 
 				expectedResp := &csi.ControllerExpandVolumeResponse{CapacityBytes: stdVolSize}
@@ -2450,13 +2402,22 @@ func TestSnapshotExists(t *testing.T) {
 		desc           string
 		sourceVolumeID string
 		key            storage.AccountListKeysResult
+		secret         map[string]string
 		expectedErr    error
 	}{
 		{
-			desc:           "Invalid volume ID",
+			desc:           "Invalid volume ID with data plane api",
 			sourceVolumeID: "vol_1",
 			key:            validKey,
+			secret:         map[string]string{"accountName": "TestAccountName", "accountKey": base64.StdEncoding.EncodeToString([]byte("TestAccountKey"))},
 			expectedErr:    fmt.Errorf("file share is empty after parsing sourceVolumeID: vol_1"),
+		},
+		{
+			desc:           "Invalid volume ID with management api",
+			sourceVolumeID: "vol_1",
+			key:            validKey,
+			secret:         validSecret,
+			expectedErr:    fmt.Errorf("error parsing volume id: %q, should at least contain two #", "vol_1"),
 		},
 	}
 
@@ -2467,7 +2428,7 @@ func TestSnapshotExists(t *testing.T) {
 		d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
 		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "", gomock.Any()).Return(test.key, nil).AnyTimes()
 
-		_, _, err := d.snapshotExists(context.Background(), test.sourceVolumeID, "sname", validSecret)
+		_, _, _, _, err := d.snapshotExists(context.Background(), test.sourceVolumeID, "sname", test.secret, false)
 		if !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedErr)
 		}

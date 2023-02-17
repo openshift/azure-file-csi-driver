@@ -21,7 +21,7 @@ import (
 
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -171,7 +171,7 @@ func (pod *PodDetails) SetupWithPreProvisionedVolumes(client clientset.Interface
 	return tpod, cleanupFuncs
 }
 
-func (pod *PodDetails) SetupDeployment(client clientset.Interface, namespace *v1.Namespace, csiDriver driver.DynamicPVTestDriver, storageClassParameters map[string]string) (*TestDeployment, []func()) {
+func (pod *PodDetails) SetupDeployment(client clientset.Interface, namespace *v1.Namespace, csiDriver driver.DynamicPVTestDriver, storageClassParameters map[string]string) (*TestDeployment, []func(), string) {
 	cleanupFuncs := make([]func(), 0)
 	volume := pod.Volumes[0]
 	ginkgo.By("setting up the StorageClass")
@@ -189,7 +189,11 @@ func (pod *PodDetails) SetupDeployment(client clientset.Interface, namespace *v1
 	tDeployment := NewTestDeployment(client, namespace, pod.Cmd, tpvc.persistentVolumeClaim, fmt.Sprintf("%s%d", volume.VolumeMount.NameGenerate, 1), fmt.Sprintf("%s%d", volume.VolumeMount.MountPathGenerate, 1), volume.VolumeMount.ReadOnly, pod.IsWindows, pod.WinServerVer)
 
 	cleanupFuncs = append(cleanupFuncs, tDeployment.Cleanup)
-	return tDeployment, cleanupFuncs
+	var volumeID string
+	if tpvc.persistentVolume != nil && tpvc.persistentVolume.Spec.CSI != nil {
+		volumeID = tpvc.persistentVolume.Spec.CSI.VolumeHandle
+	}
+	return tDeployment, cleanupFuncs, volumeID
 }
 
 func (pod *PodDetails) SetupStatefulset(client clientset.Interface, namespace *v1.Namespace, csiDriver driver.DynamicPVTestDriver) (*TestStatefulset, []func()) {

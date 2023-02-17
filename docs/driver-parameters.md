@@ -16,7 +16,8 @@ resourceGroup | specify the resource group in which Azure file share will be cre
 shareName | specify Azure file share name | existing or new Azure file name | No | if empty, driver will generate an Azure file share name
 shareNamePrefix | specify Azure file share name prefix created by driver | can only contain lowercase letters, numbers, hyphens, and length should be less than 21 | No |
 folderName | specify folder name in Azure file share | existing folder name in Azure file share | No | if folder name does not exist in file share, mount would fail
-accessTier | [Access tier for file share](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-planning#storage-tiers) | GpV2 account can choose between `TransactionOptimized` (default), `Hot`, and `Cool`. FileStorage account can choose `Premium` | No | empty(use default setting for different storage account types)
+shareAccessTier | [Access tier for file share](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-planning#storage-tiers) | GpV2 account can choose between `TransactionOptimized` (default), `Hot`, and `Cool`. FileStorage account can choose `Premium` | No | empty(use default setting for different storage account types)
+accountAccessTier | [Access tier for storage account](https://learn.microsoft.com/en-us/azure/storage/blobs/access-tiers-overview) | Standard account can choose `Hot` or `Cool`, and Premium account can only choose `Premium` | No | empty(use default setting for different storage account types)
 server | specify Azure storage account server address | existing server address, e.g. `accountname.privatelink.file.core.windows.net` | No | if empty, driver will use default `accountname.file.core.windows.net` or other sovereign cloud account address
 disableDeleteRetentionPolicy | specify whether disable DeleteRetentionPolicy for storage account created by driver | `true`,`false` | No | `false`
 allowBlobPublicAccess | Allow or disallow public access to all blobs or containers for storage account created by driver | `true`,`false` | No | `false`
@@ -65,6 +66,7 @@ pvc-92a4d7f2-f23b-4904-bad4-2cbfcff6e388
 
 Name | Meaning | Available Value | Mandatory | Default value
 --- | --- | --- | --- | ---
+volumeHandle | Specify a value the driver can use to uniquely identify the share in the cluster. | A recommended way to produce a unique value is to combine the globally unique storage account name and share name: {account-name}_{file-share-name}. Note: The # character is reserved for internal use. | Yes |
 volumeAttributes.resourceGroup | Azure resource group name | existing resource group name | No | if empty, driver will use the same resource group name as current k8s cluster
 volumeAttributes.storageAccount | existing storage account name | existing storage account name | Yes |
 volumeAttributes.shareName | Azure file share name | existing Azure file share name | Yes |
@@ -86,8 +88,10 @@ kubectl create secret generic azure-storage-account-{accountname}-secret --from-
  ```
 
 ### Tips
-  - only mounting Azure SMB File share requires account key, and if secret is not provided in PV config, it would try to get `azure-storage-account-{accountname}-secret` in the pod namespace, if not found, it would try using kubelet identity to get account key directly using Azure API.
-  - mounting Azure NFS File share does not require account key, storage account needs to be configured with same vnet with agent node.
+  - mounting Azure SMB File share requires account key, if `nodeStageSecretRef` field is not provided in PV config, this driver would try to get `azure-storage-account-{accountname}-secret` in the pod namespace first, if that secret does not exist, it would get account key by Azure storage account API directly using kubelet identity (make sure kubelet identity has reader access to the storage account).
+  - mounting Azure NFS File share does not need account key, NFS mount access is configured by either of the following settings:
+    - `Firewalls and virtual networks`: select `Enabled from selected virtual networks and IP addresses` with same vnet as agent node
+    - `Private endpoint connections`
 
 #### `shareName` parameter supports following pv/pvc metadata conversion
 > if `shareName` value contains following strings, it would be converted into corresponding pv/pvc name or namespace

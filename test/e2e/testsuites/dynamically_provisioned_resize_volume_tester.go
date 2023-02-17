@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 
 	v1 "k8s.io/api/core/v1"
@@ -124,7 +124,7 @@ func (t *DynamicallyProvisionedResizeVolumeTest) Run(client clientset.Interface,
 		var accountName string
 		var shareName string
 		if newPv.Spec.PersistentVolumeSource.CSI != nil {
-			resourceGroup, accountName, shareName, _, _, err = azurefile.GetFileShareInfo(newPv.Spec.PersistentVolumeSource.CSI.VolumeHandle)
+			resourceGroup, accountName, shareName, _, _, _, err = azurefile.GetFileShareInfo(newPv.Spec.PersistentVolumeSource.CSI.VolumeHandle)
 			framework.ExpectNoError(err, fmt.Sprintf("Error getting filesource for azurefile %v", err))
 		} else if newPv.Spec.PersistentVolumeSource.AzureFile != nil {
 			resourceGroup = creds.ResourceGroup

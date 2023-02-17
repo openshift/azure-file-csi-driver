@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/testsuites"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,10 +37,12 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	restclientset "k8s.io/client-go/rest"
 	"k8s.io/kubernetes/test/e2e/framework"
+	admissionapi "k8s.io/pod-security-admission/api"
 )
 
 var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 	f := framework.NewDefaultFramework("azurefile")
+	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	var (
 		cs          clientset.Interface
@@ -76,7 +78,6 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 
 		volumes := []testsuites.VolumeDetails{
 			{
-				FSType:    "ext4",
 				ClaimSize: "100Gi",
 				VolumeMount: testsuites.VolumeMountDetails{
 					NameGenerate:      "test-volume-",
@@ -93,7 +94,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				"tags":    tags,
 				// make sure this is the first test case due to storeAccountKey is set as false
 				"storeAccountKey":        "false",
-				"accessTier":             "Premium",
+				"shareAccessTier":        "Premium",
 				"requireInfraEncryption": "true",
 			},
 			Tags: tags,
@@ -260,7 +261,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		}
 		if !isUsingInTreeVolumePlugin {
 			scParameters["allowBlobPublicAccess"] = "true"
-			scParameters["accessTier"] = "Cool"
+			scParameters["shareAccessTier"] = "Cool"
 		}
 		test := testsuites.DynamicallyProvisionedReadOnlyVolumeTest{
 			CSIDriver:              testDriver,
@@ -321,6 +322,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		}
 		if !isUsingInTreeVolumePlugin {
 			scParameters["accessTier"] = ""
+			scParameters["accountAccessTier"] = "Hot"
 		}
 		test := testsuites.DynamicallyProvisionedReclaimPolicyTest{
 			CSIDriver:              testDriver,
@@ -372,12 +374,17 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				WinServerVer: winServerVer,
 			},
 		}
+
+		scParameters := map[string]string{
+			"skuName": "Standard_LRS",
+		}
+		if !isUsingInTreeVolumePlugin {
+			scParameters["accountAccessTier"] = "Cool"
+		}
 		test := testsuites.DynamicallyProvisionedResizeVolumeTest{
-			CSIDriver: testDriver,
-			Pods:      pods,
-			StorageClassParameters: map[string]string{
-				"skuName": "Standard_LRS",
-			},
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
 		}
 		test.Run(cs, ns)
 	})
@@ -731,7 +738,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(cs, ns)
 	})
 
-	ginkgo.It("should create a volume on demand with useDataPlaneAPI [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a Premium_LRS volume on demand with useDataPlaneAPI [file.csi.azure.com] [Windows]", func() {
 		skipIfUsingInTreeVolumePlugin()
 
 		pods := []testsuites.PodDetails{
@@ -763,6 +770,52 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 
 		scParameters := map[string]string{
 			"skuName":                      "Premium_LRS",
+			"secretNamespace":              "kube-system",
+			"createAccount":                "true",
+			"useDataPlaneAPI":              "true",
+			"disableDeleteRetentionPolicy": "true",
+			"accountAccessTier":            "Premium",
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should create a Standard_LRS volume on demand with disableDeleteRetentionPolicy [file.csi.azure.com] [Windows]", func() {
+		skipIfUsingInTreeVolumePlugin()
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "10Gi",
+						MountOptions: []string{
+							"dir_mode=0777",
+							"file_mode=0777",
+							"uid=0",
+							"gid=0",
+							"mfsymlinks",
+							"cache=strict",
+							"nosharesock",
+							"vers=3.1.1",
+						},
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+				IsWindows:    isWindowsCluster,
+				WinServerVer: winServerVer,
+			},
+		}
+
+		scParameters := map[string]string{
+			"skuName":                      "Standard_LRS",
 			"secretNamespace":              "kube-system",
 			"createAccount":                "true",
 			"useDataPlaneAPI":              "true",
@@ -807,6 +860,82 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			PodCheck: &testsuites.PodExecCheck{
 				Cmd:            podCheckCmd,
 				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
+			},
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should be able to unmount smb volume if volume is already deleted [file.csi.azure.com]", func() {
+		skipIfUsingInTreeVolumePlugin()
+
+		pod := testsuites.PodDetails{
+			Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
+			Volumes: []testsuites.VolumeDetails{
+				{
+					ClaimSize: "10Gi",
+					VolumeMount: testsuites.VolumeMountDetails{
+						NameGenerate:      "test-volume-",
+						MountPathGenerate: "/mnt/test-",
+					},
+				},
+			},
+			IsWindows:    isWindowsCluster,
+			WinServerVer: winServerVer,
+			UseCMD:       false,
+		}
+		podCheckCmd := []string{"cat", "/mnt/test-1/data"}
+		expectedString := "hello world\n"
+		if isWindowsCluster {
+			podCheckCmd = []string{"cmd", "/c", "type C:\\mnt\\test-1\\data.txt"}
+			expectedString = "hello world\r\n"
+		}
+		test := testsuites.DynamicallyProvisionedVolumeUnmountTest{
+			CSIDriver: testDriver,
+			Azurefile: azurefileDriver,
+			Pod:       pod,
+			PodCheck: &testsuites.PodExecCheck{
+				Cmd:            podCheckCmd,
+				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
+			},
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("should be able to unmount nfs volume if volume is already deleted [file.csi.azure.com]", func() {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfTestingInWindowsCluster()
+
+		pod := testsuites.PodDetails{
+			Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
+			Volumes: []testsuites.VolumeDetails{
+				{
+					ClaimSize: "10Gi",
+					VolumeMount: testsuites.VolumeMountDetails{
+						NameGenerate:      "test-volume-",
+						MountPathGenerate: "/mnt/test-",
+					},
+				},
+			},
+			IsWindows:    isWindowsCluster,
+			WinServerVer: winServerVer,
+			UseCMD:       false,
+		}
+		podCheckCmd := []string{"cat", "/mnt/test-1/data"}
+		expectedString := "hello world\n"
+		if isWindowsCluster {
+			podCheckCmd = []string{"cmd", "/c", "type C:\\mnt\\test-1\\data.txt"}
+			expectedString = "hello world\r\n"
+		}
+		test := testsuites.DynamicallyProvisionedVolumeUnmountTest{
+			CSIDriver: testDriver,
+			Azurefile: azurefileDriver,
+			Pod:       pod,
+			PodCheck: &testsuites.PodExecCheck{
+				Cmd:            podCheckCmd,
+				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
+			},
+			StorageClassParameters: map[string]string{
+				"protocol": "nfs",
 			},
 		}
 		test.Run(cs, ns)
@@ -1150,9 +1279,18 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(cs, ns)
 	})
 
-	ginkgo.It("should create a volume after driver restart [kubernetes.io/azure-file] [file.csi.azure.com]", func() {
-		ginkgo.Skip("test case is disabled since node logs would be lost after driver restart")
+	ginkgo.It("smb volume mount is still valid after driver restart [file.csi.azure.com]", func() {
 		skipIfUsingInTreeVolumePlugin()
+
+		// print azure file driver logs before driver restart
+		azurefileLog := testCmd{
+			command:  "bash",
+			args:     []string{"test/utils/azurefile_log.sh"},
+			startLog: "===================azurefile log (before restart)===================",
+			endLog:   "====================================================================",
+		}
+		execTestCmd([]testCmd{azurefileLog})
+
 		pod := testsuites.PodDetails{
 			Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
 			Volumes: []testsuites.VolumeDetails{
@@ -1183,6 +1321,49 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				ExpectedString: expectedString,
 			},
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS"},
+			RestartDriverFunc: func() {
+				restartDriver := testCmd{
+					command:  "bash",
+					args:     []string{"test/utils/restart_driver_daemonset.sh"},
+					startLog: "Restart driver node daemonset ...",
+					endLog:   "Restart driver node daemonset done successfully",
+				}
+				execTestCmd([]testCmd{restartDriver})
+			},
+		}
+		test.Run(cs, ns)
+	})
+
+	ginkgo.It("nfs volume mount is still valid after driver restart [file.csi.azure.com]", func() {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfTestingInWindowsCluster()
+
+		pod := testsuites.PodDetails{
+			Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 3600; done"),
+			Volumes: []testsuites.VolumeDetails{
+				{
+					FSType:    "ext3",
+					ClaimSize: "10Gi",
+					VolumeMount: testsuites.VolumeMountDetails{
+						NameGenerate:      "test-volume-",
+						MountPathGenerate: "/mnt/test-",
+					},
+				},
+			},
+			IsWindows:    isWindowsCluster,
+			WinServerVer: winServerVer,
+		}
+
+		podCheckCmd := []string{"cat", "/mnt/test-1/data"}
+		expectedString := "hello world\n"
+		test := testsuites.DynamicallyProvisionedRestartDriverTest{
+			CSIDriver: testDriver,
+			Pod:       pod,
+			PodCheck: &testsuites.PodExecCheck{
+				Cmd:            podCheckCmd,
+				ExpectedString: expectedString,
+			},
+			StorageClassParameters: map[string]string{"protocol": "nfs"},
 			RestartDriverFunc: func() {
 				restartDriver := testCmd{
 					command:  "bash",

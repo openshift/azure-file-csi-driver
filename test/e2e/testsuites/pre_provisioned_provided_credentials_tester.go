@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 
 	"sigs.k8s.io/azurefile-csi-driver/pkg/azurefile"
 	"sigs.k8s.io/azurefile-csi-driver/test/e2e/driver"
@@ -41,7 +41,7 @@ type PreProvisionedProvidedCredentiasTest struct {
 func (t *PreProvisionedProvidedCredentiasTest) Run(client clientset.Interface, namespace *v1.Namespace) {
 	for _, pod := range t.Pods {
 		for n, volume := range pod.Volumes {
-			_, accountName, accountKey, fileShareName, _, err := t.Azurefile.GetAccountInfo(context.Background(), volume.VolumeID, nil, nil)
+			_, accountName, accountKey, fileShareName, _, _, err := t.Azurefile.GetAccountInfo(context.Background(), volume.VolumeID, nil, nil)
 			framework.ExpectNoError(err, fmt.Sprintf("Error GetAccountInfo from volumeID(%s): %v", volume.VolumeID, err))
 
 			ginkgo.By("creating the secret")

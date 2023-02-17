@@ -86,16 +86,30 @@ change below deployment config, e.g.
 ```
 
 ### troubleshooting connection failure on agent node
-> server address of sovereign cloud: accountname.blob.core.chinacloudapi.cn
+> server address of sovereign cloud: accountname.file.core.chinacloudapi.cn
 ##### SMB
  - On Linux node
 ```console
 mkdir /tmp/test
-sudo mount -v -t cifs //accountname.blob.core.windows.net/filesharename /tmp/test -o  username=accountname,password=accountkey,dir_mode=0777,file_mode=0777,cache=strict,actimeo=30
+sudo mount -v -t cifs //accountname.file.core.windows.net/filesharename /tmp/test -o  username=accountname,password=accountkey,dir_mode=0777,file_mode=0777,cache=strict,actimeo=30
 ```
 
 <details><summary>
-Get client-side logs on Linux node if there is still mount error 
+Get client-side logs on AKS Linux node if there is mount error 
+</summary>
+
+```console
+# get ama-logs pod which is running on the AKS Linux node
+kubectl get po -n kube-system -o wide | grep ama-logs
+kubectl -n kube-system cp ama-logs-xxxx:/var/log/messages /tmp/messages
+kubectl -n kube-system cp ama-logs-xxxx:/var/log/syslog /tmp/syslog
+kubectl -n kube-system cp ama-logs-xxxx:/var/log/kern.log /tmp/kern.log
+```
+
+</details>
+
+<details><summary>
+Get client-side logs on Linux node if there is mount error 
 </summary>
 
 ```console
@@ -120,11 +134,22 @@ cd x:
 dir
 ```
 
+<details><summary>
+Get client-side logs on Windows node if there is mount error 
+</summary>
+
+```console
+Get SMBClient events from Event Viewer under following path:
+  Application and Services Logs -> Microsoft -> Windows -> SMBClient
+```
+ 
+</details>
+
  - NFSv4
  
 ```console
 mkdir /tmp/test
-mount -v -t nfs -o vers=4,minorversion=1,sec=sys accountname.blob.core.windows.net:/accountname/filesharename /tmp/test
+mount -v -t nfs -o vers=4,minorversion=1,sec=sys accountname.file.core.windows.net:/accountname/filesharename /tmp/test
 ```
 
  - [Troubleshoot Azure File mount issues on AKS](https://docs.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/fail-to-mount-azure-file-share)
@@ -147,3 +172,5 @@ Azure premium files follows provisioned model where IOPS and throughput are asso
 
 ##### For more, refer to this doc for perforance troubleshooting tips - [Link to performance troubleshooting tips](https://docs.microsoft.com/en-us/azure/storage/files/storage-troubleshooting-files-performance)
 
+##### [Troubleshoot AKS Storage-related issues](https://docs.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/fail-to-mount-azure-file-share)
+##### [Storage considerations for Azure Kubernetes Service (AKS)](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/scenarios/app-platform/aks/storage)

@@ -16,7 +16,7 @@
 ### install a specific version
 ```console
 helm repo add azurefile-csi-driver https://raw.githubusercontent.com/kubernetes-sigs/azurefile-csi-driver/master/charts
-helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version v1.21.0
+helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version v1.25.1
 ```
 
 ### install on RedHat/CentOS
@@ -57,19 +57,19 @@ The following table lists the configurable parameters of the latest Azure File C
 | `image.azurefile.tag`                             | azurefile-csi-driver docker image tag                      | ``                                                            |
 | `image.azurefile.pullPolicy`                      | azurefile-csi-driver image pull policy                     | `IfNotPresent`                                                      |
 | `image.csiProvisioner.repository`                 | csi-provisioner docker image                               | `/oss/kubernetes-csi/csi-provisioner`              |
-| `image.csiProvisioner.tag`                        | csi-provisioner docker image tag                           | `v3.2.0`                                                            |
+| `image.csiProvisioner.tag`                        | csi-provisioner docker image tag                           | `v3.3.0`                                                            |
 | `image.csiProvisioner.pullPolicy`                 | csi-provisioner image pull policy                          | `IfNotPresent`                                                      |
 | `image.csiAttacher.repository`                    | csi-attacher docker image                                  | `/oss/kubernetes-csi/csi-attacher`                 |
-| `image.csiAttacher.tag`                           | csi-attacher docker image tag                              | `v3.5.0`                                                            |
+| `image.csiAttacher.tag`                           | csi-attacher docker image tag                              | `v4.0.0`                                                            |
 | `image.csiAttacher.pullPolicy`                    | csi-attacher image pull policy                             | `IfNotPresent`                                                      |
 | `image.csiResizer.repository`                     | csi-resizer docker image                                   | `/oss/kubernetes-csi/csi-resizer`                  |
-| `image.csiResizer.tag`                            | csi-resizer docker image tag                               | `v1.5.0`                                                            |
+| `image.csiResizer.tag`                            | csi-resizer docker image tag                               | `v1.6.0`                                                            |
 | `image.csiResizer.pullPolicy`                     | csi-resizer image pull policy                              | `IfNotPresent`                                                      |
 | `image.livenessProbe.repository`                  | liveness-probe docker image                                | `/oss/kubernetes-csi/livenessprobe`                |
-| `image.livenessProbe.tag`                         | liveness-probe docker image tag                            | `v2.7.0`                                                            |
+| `image.livenessProbe.tag`                         | liveness-probe docker image tag                            | `v2.8.0`                                                            |
 | `image.livenessProbe.pullPolicy`                  | liveness-probe image pull policy                           | `IfNotPresent`                                                      |
 | `image.nodeDriverRegistrar.repository`            | csi-node-driver-registrar docker image                     | `/oss/kubernetes-csi/csi-node-driver-registrar`    |
-| `image.nodeDriverRegistrar.tag`                   | csi-node-driver-registrar docker image tag                 | `v2.5.1`                                                            |
+| `image.nodeDriverRegistrar.tag`                   | csi-node-driver-registrar docker image tag                 | `v2.6.2`                                                            |
 | `image.nodeDriverRegistrar.pullPolicy`            | csi-node-driver-registrar image pull policy                | `IfNotPresent`                                                      |
 | `imagePullSecrets`                                | Specify docker-registry secret names as an array           | [] (does not add image pull secrets to deployed pods)             |
 | `customLabels`                                    | Custom labels to add into metadata                         | `{}`                                                                |
@@ -84,6 +84,10 @@ The following table lists the configurable parameters of the latest Azure File C
 | `controller.cloudConfigSecretNamespace`           | cloud config secret namespace of controller driver          | `kube-system`
 | `controller.allowEmptyCloudConfig`                | Whether allow running controller driver without cloud config          | `true`
 | `controller.replicas`                             | replicas of csi-azurefile-controller                    | `2`                                                                 |
+| `controller.labels`                               | controller deployment extra labels                    | `{}`
+| `controller.annotations`                          | controller deployment extra annotations               | `{}`
+| `controller.podLabels`                            | controller pods extra labels                          | `{}`
+| `controller.podAnnotations`                       | controller pods extra annotations                     | `{}`
 | `controller.hostNetwork`                          | `hostNetwork` setting on controller driver(could be disabled if controller does not depend on MSI setting)                            | `true`                                                            | `true`, `false`
 | `controller.metricsPort`                          | metrics port of csi-azurefile-controller                   |`29614`                                                        |
 | `controller.livenessProbe.healthPort `            | health check port for liveness probe                   | `29612` |
@@ -130,6 +134,10 @@ The following table lists the configurable parameters of the latest Azure File C
 | `snapshot.image.csiSnapshotController.pullPolicy` | snapshot-controller image pull policy                      | `IfNotPresent`                                                 |
 | `snapshot.snapshotController.name`                | snapshot controller name                                   | `csi-snapshot-controller`                                                           |
 | `snapshot.snapshotController.replicas`            | the replicas of snapshot-controller                        | `2`                                                          |
+| `snapshot.snapshotController.labels`                               | snapshot controller deployment extra labels                    | `{}`
+| `snapshot.snapshotController.annotations`                          | snapshot controller deployment extra annotations               | `{}`
+| `snapshot.snapshotController.podLabels`                            | snapshot controller pods extra labels                          | `{}`
+| `snapshot.snapshotController.podAnnotations`                       | snapshot controller pods extra annotations                     | `{}`
 | `snapshot.snapshotController.resources.limits.memory`          | csi-snapshot-controller memory limits                          | 100Mi                                                          |
 | `snapshot.snapshotController.resources.requests.cpu`           | csi-snapshot-controller cpu requests                    | 10m                                                            |
 | `snapshot.snapshotController.resources.requests.memory`        | csi-snapshot-controller memory requests                 | 20Mi                                                           |
@@ -143,6 +151,10 @@ The following table lists the configurable parameters of the latest Azure File C
 | `linux.tolerations`                               | linux node driver tolerations                            |
 | `linux.affinity`                                  | linux node pod affinity                                     | `{}`                                                             |
 | `linux.nodeSelector`                              | linux node pod node selector                                | `{}`                                                             |
+| `linux.labels`                                    | linux node daemonset extra labels                     | `{}`
+| `linux.annotations`                               | linux node daemonset extra annotations                | `{}`
+| `linux.podLabels`                                 | linux node pods extra labels                          | `{}`
+| `linux.podAnnotations`                            | linux node pods extra annotations                     | `{}`
 | `linux.resources.livenessProbe.limits.memory`          | liveness-probe memory limits                          | 100Mi                                                          |
 | `linux.resources.livenessProbe.requests.cpu`           | liveness-probe cpu requests                    | 10m                                                            |
 | `linux.resources.livenessProbe.requests.memory`        | liveness-probe memory requests                 | 20Mi                                                           |
@@ -159,6 +171,10 @@ The following table lists the configurable parameters of the latest Azure File C
 | `windows.tolerations`                             | windows node driver tolerations                            |                                                              |
 | `windows.affinity`                                | windows node pod affinity                                     | `{}`                                                             |
 | `windows.nodeSelector`                            | windows node pod node selector                                | `{}`                                                             |
+| `windows.labels`                                  | windows node daemonset extra labels                     | `{}`
+| `windows.annotations`                             | windows node daemonset extra annotations                | `{}`
+| `windows.podLabels`                               | windows node pods extra labels                          | `{}`
+| `windows.podAnnotations`                          | windows node pods extra annotations                     | `{}`
 | `windows.resources.livenessProbe.limits.memory`          | liveness-probe memory limits                          | 150Mi                                                          |
 | `windows.resources.livenessProbe.requests.cpu`           | liveness-probe cpu requests                    | 10m                                                            |
 | `windows.resources.livenessProbe.requests.memory`        | liveness-probe memory requests                 | 40Mi                                                           |

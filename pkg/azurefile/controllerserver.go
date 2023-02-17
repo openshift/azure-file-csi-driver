@@ -22,12 +22,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	volumehelper "sigs.k8s.io/azurefile-csi-driver/pkg/util"
 
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	"github.com/Azure/azure-storage-file-go/azfile"
-	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pborman/uuid"
 
@@ -36,17 +36,21 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/pointer"
 
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
 const (
 	azureFileCSIDriverName = "azurefile_csi_driver"
 	privateEndpoint        = "privateendpoint"
+	snapshotTimeFormat     = "2006-01-02T15:04:05.0000000Z07:00"
+	snapshotsExpand        = "snapshots"
 )
 
 var (
@@ -108,12 +112,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		parameters = make(map[string]string)
 	}
 	var sku, subsID, resourceGroup, location, account, fileShareName, diskName, fsType, secretName string
-	var secretNamespace, pvcNamespace, protocol, customTags, storageEndpointSuffix, networkEndpointType, accessTier, rootSquashType string
-	var createAccount, useDataPlaneAPI, useSeretCache, disableDeleteRetentionPolicy, enableLFS, matchTags bool
+	var secretNamespace, pvcNamespace, protocol, customTags, storageEndpointSuffix, networkEndpointType, shareAccessTier, accountAccessTier, rootSquashType string
+	var createAccount, useDataPlaneAPI, useSeretCache, matchTags bool
 	var vnetResourceGroup, vnetName, subnetName, shareNamePrefix, fsGroupChangePolicy string
-	var requireInfraEncryption *bool
+	var requireInfraEncryption, disableDeleteRetentionPolicy, enableLFS *bool
 	// set allowBlobPublicAccess as false by default
-	allowBlobPublicAccess := to.BoolPtr(false)
+	allowBlobPublicAccess := pointer.Bool(false)
 
 	fileShareNameReplaceMap := map[string]string{}
 	// store account key to k8s secret by default
@@ -160,11 +164,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		case useSecretCacheField:
 			useSeretCache = strings.EqualFold(v, trueValue)
 		case enableLargeFileSharesField:
-			enableLFS = strings.EqualFold(v, trueValue)
+			value, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s: %s in storage class", enableLargeFileSharesField, v))
+			}
+			enableLFS = &value
 		case useDataPlaneAPIField:
 			useDataPlaneAPI = strings.EqualFold(v, trueValue)
 		case disableDeleteRetentionPolicyField:
-			disableDeleteRetentionPolicy = strings.EqualFold(v, trueValue)
+			value, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s: %s in storage class", disableDeleteRetentionPolicyField, v))
+			}
+			disableDeleteRetentionPolicy = &value
 		case pvcNamespaceKey:
 			pvcNamespace = v
 			fileShareNameReplaceMap[pvcNamespaceMetadata] = v
@@ -173,13 +185,19 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		case networkEndpointTypeField:
 			networkEndpointType = v
 		case accessTierField:
-			accessTier = v
+			shareAccessTier = v
+		case shareAccessTierField:
+			shareAccessTier = v
+		case accountAccessTierField:
+			accountAccessTier = v
 		case rootSquashTypeField:
 			rootSquashType = v
 		case allowBlobPublicAccessField:
-			if strings.EqualFold(v, trueValue) {
-				allowBlobPublicAccess = to.BoolPtr(true)
+			value, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s: %s in storage class", allowBlobPublicAccessField, v))
 			}
+			allowBlobPublicAccess = &value
 		case pvcNameKey:
 			fileShareNameReplaceMap[pvcNameMetadata] = v
 		case pvNameKey:
@@ -206,9 +224,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		case shareNamePrefixField:
 			shareNamePrefix = v
 		case requireInfraEncryptionField:
-			if strings.EqualFold(v, trueValue) {
-				requireInfraEncryption = to.BoolPtr(true)
+			value, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s: %s in storage class", requireInfraEncryptionField, v))
 			}
+			requireInfraEncryption = &value
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid parameter %q in storage class", k))
 		}
@@ -219,11 +239,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	if subsID != "" && subsID != d.cloud.SubscriptionID {
-		if fsType == nfs || protocol == nfs {
-			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("NFS protocol is not supported in cross subscription(%s)", subsID))
-		}
-		if !storeAccountKey {
-			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("storeAccountKey must set as true in cross subscription(%s)", subsID))
+		if resourceGroup == "" {
+			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("resourceGroup must be provided in cross subscription(%s)", subsID))
 		}
 	}
 
@@ -247,8 +264,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Errorf(codes.InvalidArgument, "protocol(%s) is not supported, supported protocol list: %v", protocol, supportedProtocolList)
 	}
 
-	if !isSupportedAccessTier(accessTier) {
-		return nil, status.Errorf(codes.InvalidArgument, "accessTier(%s) is not supported, supported AccessTier list: %v", accessTier, storage.PossibleShareAccessTierValues())
+	if !isSupportedShareAccessTier(shareAccessTier) {
+		return nil, status.Errorf(codes.InvalidArgument, "shareAccessTier(%s) is not supported, supported ShareAccessTier list: %v", shareAccessTier, storage.PossibleShareAccessTierValues())
+	}
+
+	if !isSupportedAccountAccessTier(accountAccessTier) {
+		return nil, status.Errorf(codes.InvalidArgument, "accountAccessTier(%s) is not supported, supported AccountAccessTier list: %v", accountAccessTier, storage.PossibleAccessTierValues())
 	}
 
 	if !isSupportedRootSquashType(rootSquashType) {
@@ -265,10 +286,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	if protocol == nfs && fsType != "" && fsType != nfs {
 		return nil, status.Errorf(codes.InvalidArgument, "fsType(%s) is not supported with protocol(%s)", fsType, protocol)
-	}
-
-	if disableDeleteRetentionPolicy && !strings.HasPrefix(strings.ToLower(sku), premium) {
-		return nil, status.Errorf(codes.InvalidArgument, "disableDeleteRetentionPolicy is not supported with Standard account type(%s)", sku)
 	}
 
 	enableHTTPSTrafficOnly := true
@@ -293,13 +310,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 		if !createPrivateEndpoint {
 			// set VirtualNetworkResourceIDs for storage account firewall setting
-			vnetResourceID := d.getSubnetResourceID()
+			vnetResourceID := d.getSubnetResourceID(vnetResourceGroup, vnetName, subnetName)
 			klog.V(2).Infof("set vnetResourceID(%s) for NFS protocol", vnetResourceID)
 			vnetResourceIDs = []string{vnetResourceID}
-			if account == "" {
-				if err := d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
-					return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
-				}
+			if err := d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
+				return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
 			}
 		}
 	}
@@ -341,6 +356,17 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Errorf(codes.InvalidArgument, err.Error())
 	}
 
+	if strings.TrimSpace(storageEndpointSuffix) == "" {
+		if d.cloud.Environment.StorageEndpointSuffix != "" {
+			storageEndpointSuffix = d.cloud.Environment.StorageEndpointSuffix
+		} else {
+			storageEndpointSuffix = defaultStorageEndPointSuffix
+		}
+	}
+	if d.fileClient != nil {
+		d.fileClient.StorageEndpointSuffix = storageEndpointSuffix
+	}
+
 	accountOptions := &azure.AccountOptions{
 		Name:                                    account,
 		Type:                                    sku,
@@ -361,6 +387,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		VNetName:                                vnetName,
 		SubnetName:                              subnetName,
 		RequireInfrastructureEncryption:         requireInfraEncryption,
+		AccessTier:                              accountAccessTier,
+		StorageType:                             provider.StorageTypeFile,
+		StorageEndpointSuffix:                   storageEndpointSuffix,
 	}
 
 	var accountKey, lockKey string
@@ -369,7 +398,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if v, ok := d.volMap.Load(volName); ok {
 			accountName = v.(string)
 		} else {
-			lockKey = fmt.Sprintf("%s%s%s%s%s%v", sku, accountKind, resourceGroup, location, protocol, createPrivateEndpoint)
+			lockKey = fmt.Sprintf("%s%s%s%s%s%s%s%v%v%v%v%v", sku, accountKind, resourceGroup, location, protocol, subsID, accountAccessTier,
+				createPrivateEndpoint, pointer.BoolDeref(allowBlobPublicAccess, false), pointer.BoolDeref(requireInfraEncryption, false),
+				pointer.BoolDeref(enableLFS, false), pointer.BoolDeref(disableDeleteRetentionPolicy, false))
 			// search in cache first
 			cache, err := d.accountSearchCache.Get(lockKey, azcache.CacheReadTypeDefault)
 			if err != nil {
@@ -402,16 +433,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
-	if strings.TrimSpace(storageEndpointSuffix) == "" {
-		if d.cloud.Environment.StorageEndpointSuffix != "" {
-			storageEndpointSuffix = d.cloud.Environment.StorageEndpointSuffix
-		} else {
-			storageEndpointSuffix = defaultStorageEndPointSuffix
-		}
-	}
-	if d.fileClient != nil {
-		d.fileClient.StorageEndpointSuffix = storageEndpointSuffix
-	}
 	if createPrivateEndpoint {
 		setKeyValueInMap(parameters, serverNameField, fmt.Sprintf("%s.privatelink.file.%s", accountName, storageEndpointSuffix))
 	}
@@ -427,7 +448,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		secret = createStorageAccountSecret(accountName, accountKey)
 		// skip validating file share quota if useDataPlaneAPI
 	} else {
-		if quota, err := d.getFileShareQuota(resourceGroup, accountName, validFileShareName, secret); err != nil {
+		if quota, err := d.getFileShareQuota(ctx, subsID, resourceGroup, accountName, validFileShareName, secret); err != nil {
 			return nil, status.Errorf(codes.Internal, err.Error())
 		} else if quota != -1 && quota < fileShareSize {
 			return nil, status.Errorf(codes.AlreadyExists, "request file share(%s) already exists, but its capacity %d is smaller than %d", validFileShareName, quota, fileShareSize)
@@ -438,26 +459,26 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		Name:       validFileShareName,
 		Protocol:   shareProtocol,
 		RequestGiB: fileShareSize,
-		AccessTier: accessTier,
+		AccessTier: shareAccessTier,
 		RootSquash: rootSquashType,
 	}
 
 	var volumeID string
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_create_volume", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_create_volume", d.cloud.ResourceGroup, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
 	}()
 
-	klog.V(2).Infof("begin to create file share(%s) on account(%s) type(%s) rg(%s) location(%s) size(%d) protocol(%s)", validFileShareName, accountName, sku, resourceGroup, location, fileShareSize, shareProtocol)
-	if err := d.CreateFileShare(accountOptions, shareOptions, secret); err != nil {
+	klog.V(2).Infof("begin to create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d) protocol(%s)", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, shareProtocol)
+	if err := d.CreateFileShare(ctx, accountOptions, shareOptions, secret); err != nil {
 		if strings.Contains(err.Error(), accountLimitExceedManagementAPI) || strings.Contains(err.Error(), accountLimitExceedDataPlaneAPI) {
-			klog.Warningf("create file share(%s) on account(%s) type(%s) rg(%s) location(%s) size(%d), error: %v, skip matching current account", validFileShareName, account, sku, resourceGroup, location, fileShareSize, err)
+			klog.Warningf("create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d), error: %v, skip matching current account", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, err)
 			tags := map[string]*string{
-				azure.SkipMatchingTag: to.StringPtr(""),
+				azure.SkipMatchingTag: pointer.String(""),
 			}
 			if rerr := d.cloud.AddStorageAccountTags(ctx, subsID, resourceGroup, accountName, tags); rerr != nil {
-				klog.Warningf("AddStorageAccountTags(%v) on account(%s) rg(%s) failed with error: %v", tags, accountName, resourceGroup, rerr.Error())
+				klog.Warningf("AddStorageAccountTags(%v) on account(%s) subsID(%s) rg(%s) failed with error: %v", tags, accountName, subsID, resourceGroup, rerr.Error())
 			}
 			// release volume lock first to prevent deadlock
 			d.volumeLocks.Release(volName)
@@ -469,7 +490,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			d.volMap.Delete(volName)
 			return d.CreateVolume(ctx, req)
 		}
-		return nil, status.Errorf(codes.Internal, "failed to create file share(%s) on account(%s) type(%s) rg(%s) location(%s) size(%d), error: %v", validFileShareName, account, sku, resourceGroup, location, fileShareSize, err)
+		return nil, status.Errorf(codes.Internal, "failed to create file share(%s) on account(%s) type(%s) subsID(%s) rg(%s) location(%s) size(%d), error: %v", validFileShareName, account, sku, subsID, resourceGroup, location, fileShareSize, err)
 	}
 	klog.V(2).Infof("create file share %s on storage account %s successfully", validFileShareName, accountName)
 
@@ -530,10 +551,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		uuid = volName
 	}
 	volumeID = fmt.Sprintf(volumeIDTemplate, resourceGroup, accountName, validFileShareName, diskName, uuid, secretNamespace)
+	if subsID != "" && subsID != d.cloud.SubscriptionID {
+		volumeID = volumeID + "#" + subsID
+	}
 
 	if useDataPlaneAPI {
 		d.dataPlaneAPIVolMap.Store(volumeID, "")
-		d.dataPlaneAPIVolMap.Store(accountName, "")
 	}
 
 	isOperationSucceeded = true
@@ -565,7 +588,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 	defer d.volumeLocks.Release(volumeID)
 
-	resourceGroupName, accountName, fileShareName, _, secretNamespace, err := GetFileShareInfo(volumeID)
+	resourceGroupName, accountName, fileShareName, _, secretNamespace, subsID, err := GetFileShareInfo(volumeID)
 	if err != nil {
 		// According to CSI Driver Sanity Tester, should succeed when an invalid volume id is used
 		klog.Errorf("GetFileShareInfo(%s) in DeleteVolume failed with error: %v", volumeID, err)
@@ -574,6 +597,9 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 	if resourceGroupName == "" {
 		resourceGroupName = d.cloud.ResourceGroup
+	}
+	if subsID == "" {
+		subsID = d.cloud.SubscriptionID
 	}
 
 	secret := req.GetSecrets()
@@ -584,24 +610,24 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		}
 
 		// use data plane api, get account key first
-		_, _, accountKey, _, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), reqContext)
+		_, _, accountKey, _, _, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), reqContext)
 		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "get account info from(%s) failed with error: %v", volumeID, err)
 		}
 		secret = createStorageAccountSecret(accountName, accountKey)
 	}
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_delete_volume", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_delete_volume", resourceGroupName, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
 	}()
 
-	if err := d.DeleteFileShare(resourceGroupName, accountName, fileShareName, secret); err != nil {
+	if err := d.DeleteFileShare(ctx, subsID, resourceGroupName, accountName, fileShareName, secret); err != nil {
 		return nil, status.Errorf(codes.Internal, "DeleteFileShare %s under account(%s) rg(%s) failed with error: %v", fileShareName, accountName, resourceGroupName, err)
 	}
-	klog.V(2).Infof("azure file(%s) under rg(%s) account(%s) volume(%s) is deleted successfully", fileShareName, resourceGroupName, accountName, volumeID)
-	if err := d.RemoveStorageAccountTag(ctx, resourceGroupName, accountName, azure.SkipMatchingTag); err != nil {
+	klog.V(2).Infof("azure file(%s) under subsID(%s) rg(%s) account(%s) volume(%s) is deleted successfully", fileShareName, subsID, resourceGroupName, accountName, volumeID)
+	if err := d.RemoveStorageAccountTag(ctx, subsID, resourceGroupName, accountName, azure.SkipMatchingTag); err != nil {
 		klog.Warningf("RemoveStorageAccountTag(%s) under rg(%s) account(%s) failed with %v", azure.SkipMatchingTag, resourceGroupName, accountName, err)
 	}
 
@@ -625,15 +651,18 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities not provided")
 	}
 
-	resourceGroupName, accountName, _, fileShareName, diskName, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), req.GetVolumeContext())
+	resourceGroupName, accountName, _, fileShareName, diskName, subsID, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), req.GetVolumeContext())
 	if err != nil || accountName == "" || fileShareName == "" {
 		return nil, status.Errorf(codes.NotFound, "get account info from(%s) failed with error: %v", volumeID, err)
 	}
 	if resourceGroupName == "" {
 		resourceGroupName = d.cloud.ResourceGroup
 	}
+	if subsID == "" {
+		subsID = d.cloud.SubscriptionID
+	}
 
-	if quota, err := d.getFileShareQuota(resourceGroupName, accountName, fileShareName, req.GetSecrets()); err != nil {
+	if quota, err := d.getFileShareQuota(ctx, subsID, resourceGroupName, accountName, fileShareName, req.GetSecrets()); err != nil {
 		return nil, status.Errorf(codes.Internal, "error checking if volume(%s) exists: %v", volumeID, err)
 	} else if quota == -1 {
 		return nil, status.Errorf(codes.NotFound, "the requested volume(%s) does not exist.", volumeID)
@@ -686,13 +715,12 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	volContext := req.GetVolumeContext()
-	_, accountName, accountKey, fileShareName, diskName, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), volContext)
+	_, accountName, accountKey, fileShareName, diskName, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), volContext)
 	// always check diskName first since if it's not vhd disk attach, ControllerPublishVolume is not necessary
 	if !strings.HasSuffix(diskName, vhdSuffix) {
 		klog.V(2).Infof("skip ControllerPublishVolume(%s) since it's not vhd disk attach", volumeID)
 		if useDataPlaneAPI(volContext) {
 			d.dataPlaneAPIVolMap.Store(volumeID, "")
-			d.dataPlaneAPIVolMap.Store(accountName, "")
 		}
 		return &csi.ControllerPublishVolumeResponse{}, nil
 	}
@@ -755,7 +783,7 @@ func (d *Driver) ControllerUnpublishVolume(ctx context.Context, req *csi.Control
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
 	}
 
-	_, accountName, accountKey, fileShareName, diskName, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), map[string]string{})
+	_, accountName, accountKey, fileShareName, diskName, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), map[string]string{})
 	// always check diskName first since if it's not vhd disk detach, ControllerUnpublishVolume is not necessary
 	if !strings.HasSuffix(diskName, vhdSuffix) {
 		klog.V(2).Infof("skip ControllerUnpublishVolume(%s) since it's not vhd disk detach", volumeID)
@@ -797,13 +825,34 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")
 	}
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_create_snapshot", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
+	rgName, accountName, fileShareName, _, _, subsID, err := GetFileShareInfo(sourceVolumeID) //nolint:dogsled
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("GetFileShareInfo(%s) failed with error: %v", sourceVolumeID, err))
+	}
+	if rgName == "" {
+		rgName = d.cloud.ResourceGroup
+	}
+	if subsID == "" {
+		subsID = d.cloud.SubscriptionID
+	}
+
+	var useDataPlaneAPI bool
+	for k, v := range req.GetParameters() {
+		switch strings.ToLower(k) {
+		case useDataPlaneAPIField:
+			useDataPlaneAPI = strings.EqualFold(v, trueValue)
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid parameter %q in storage class", k))
+		}
+	}
+
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_create_snapshot", rgName, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, SourceResourceID, sourceVolumeID, SnapshotName, snapshotName)
 	}()
 
-	exists, item, err := d.snapshotExists(ctx, sourceVolumeID, snapshotName, req.GetSecrets())
+	exists, itemSnapshot, itemSnapshotTime, itemSnapshotQuota, err := d.snapshotExists(ctx, sourceVolumeID, snapshotName, req.GetSecrets(), useDataPlaneAPI)
 	if err != nil {
 		if exists {
 			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
@@ -812,57 +861,64 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 	if exists {
 		klog.V(2).Infof("snapshot(%s) already exists", snapshotName)
-		tp := timestamppb.New(item.Properties.LastModified)
-		if tp == nil {
-			return nil, status.Errorf(codes.Internal, "Failed to convert timestamp(%v)", item.Properties.LastModified)
-		}
-		if item.Snapshot == nil {
-			return nil, status.Errorf(codes.Internal, "Snapshot property of %s is nil", item.Name)
-		}
 		return &csi.CreateSnapshotResponse{
 			Snapshot: &csi.Snapshot{
-				SizeBytes:      volumehelper.GiBToBytes(int64(item.Properties.Quota)),
-				SnapshotId:     sourceVolumeID + "#" + *item.Snapshot,
+				SizeBytes:      volumehelper.GiBToBytes(int64(itemSnapshotQuota)),
+				SnapshotId:     sourceVolumeID + "#" + itemSnapshot,
 				SourceVolumeId: sourceVolumeID,
-				CreationTime:   tp,
+				CreationTime:   timestamppb.New(itemSnapshotTime),
 				// Since the snapshot of azurefile has no field of ReadyToUse, here ReadyToUse is always set to true.
 				ReadyToUse: true,
 			},
 		}, nil
 	}
 
-	shareURL, err := d.getShareURL(ctx, sourceVolumeID, req.GetSecrets())
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get share url with (%s): %v", sourceVolumeID, err)
+	if len(req.GetSecrets()) > 0 || useDataPlaneAPI {
+		shareURL, err := d.getShareURL(ctx, sourceVolumeID, req.GetSecrets())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get share url with (%s): %v", sourceVolumeID, err)
+		}
+
+		snapshotShare, err := shareURL.CreateSnapshot(ctx, azfile.Metadata{snapshotNameKey: snapshotName})
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "create snapshot from(%s) failed with %v, shareURL: %q", sourceVolumeID, err, shareURL)
+		}
+
+		properties, err := shareURL.GetProperties(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to get snapshot properties from (%s): %v", snapshotShare.Snapshot(), err)
+		}
+
+		itemSnapshot = snapshotShare.Snapshot()
+		itemSnapshotTime = properties.LastModified()
+		itemSnapshotQuota = properties.Quota()
+	} else {
+		snapshotShare, err := d.cloud.FileClient.WithSubscriptionID(subsID).CreateFileShare(ctx, rgName, accountName, &fileclient.ShareOptions{Name: fileShareName, RequestGiB: defaultAzureFileQuota, Metadata: map[string]*string{snapshotNameKey: &snapshotName}}, snapshotsExpand)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "create snapshot from(%s) failed with %v, accountName: %q", sourceVolumeID, err, accountName)
+		}
+
+		if snapshotShare.SnapshotTime == nil {
+			return nil, status.Errorf(codes.Internal, "Last modified time of snapshot is null")
+		}
+
+		itemSnapshot = snapshotShare.SnapshotTime.Format(snapshotTimeFormat)
+		itemSnapshotTime = snapshotShare.SnapshotTime.Time
+		itemSnapshotQuota = pointer.Int32Deref(snapshotShare.ShareQuota, 0)
 	}
 
-	snapshotShare, err := shareURL.CreateSnapshot(ctx, azfile.Metadata{snapshotNameKey: snapshotName})
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create snapshot from(%s) failed with %v, shareURL: %q", sourceVolumeID, err, shareURL)
-	}
-
-	klog.V(2).Infof("Created share snapshot: %s", snapshotShare.Snapshot())
-
-	properties, err := shareURL.GetProperties(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get snapshot properties from (%s): %v", snapshotShare.Snapshot(), err)
-	}
-
-	tp := timestamppb.New(properties.LastModified())
-	if tp == nil {
-		return nil, status.Errorf(codes.Internal, "Failed to convert timestamp(%v)", properties.LastModified())
-	}
-
+	klog.V(2).Infof("Created share snapshot: %s", itemSnapshot)
 	createResp := &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
-			SizeBytes:      volumehelper.GiBToBytes(int64(properties.Quota())),
-			SnapshotId:     sourceVolumeID + "#" + snapshotShare.Snapshot(),
+			SizeBytes:      volumehelper.GiBToBytes(int64(itemSnapshotQuota)),
+			SnapshotId:     sourceVolumeID + "#" + itemSnapshot,
 			SourceVolumeId: sourceVolumeID,
-			CreationTime:   tp,
+			CreationTime:   timestamppb.New(itemSnapshotTime),
 			// Since the snapshot of azurefile has no field of ReadyToUse, here ReadyToUse is always set to true.
 			ReadyToUse: true,
 		},
 	}
+
 	isOperationSucceeded = true
 	return createResp, nil
 }
@@ -872,31 +928,47 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 	if len(req.SnapshotId) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Snapshot ID must be provided")
 	}
-
-	shareURL, err := d.getShareURL(ctx, req.SnapshotId, req.GetSecrets())
-	if err != nil {
+	rgName, accountName, fileShareName, _, _, _, err := GetFileShareInfo(req.SnapshotId) //nolint:dogsled
+	if fileShareName == "" || err != nil {
 		// According to CSI Driver Sanity Tester, should succeed when an invalid snapshot id is used
 		klog.V(4).Infof("failed to get share url with (%s): %v, returning with success", req.SnapshotId, err)
 		return &csi.DeleteSnapshotResponse{}, nil
 	}
-
 	snapshot, err := getSnapshot(req.SnapshotId)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get snapshot name with (%s): %v", req.SnapshotId, err)
 	}
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_delete_snapshot", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
+	if rgName == "" {
+		rgName = d.cloud.ResourceGroup
+	}
+	subsID := d.cloud.SubscriptionID
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_delete_snapshot", rgName, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, SnapshotID, req.SnapshotId)
 	}()
 
-	if _, err := shareURL.WithSnapshot(snapshot).Delete(ctx, azfile.DeleteSnapshotsOptionNone); err != nil {
-		if strings.Contains(err.Error(), "ShareSnapshotNotFound") {
+	var deleteErr error
+	if len(req.GetSecrets()) > 0 {
+		shareURL, err := d.getShareURL(ctx, req.SnapshotId, req.GetSecrets())
+		if err != nil {
+			// According to CSI Driver Sanity Tester, should succeed when an invalid snapshot id is used
+			klog.V(4).Infof("failed to get share url with (%s): %v, returning with success", req.SnapshotId, err)
+			return &csi.DeleteSnapshotResponse{}, nil
+		}
+
+		_, deleteErr = shareURL.WithSnapshot(snapshot).Delete(ctx, azfile.DeleteSnapshotsOptionNone)
+	} else {
+		deleteErr = d.cloud.FileClient.WithSubscriptionID(subsID).DeleteFileShare(ctx, rgName, accountName, fileShareName, snapshot)
+	}
+
+	if deleteErr != nil {
+		if strings.Contains(deleteErr.Error(), "ShareSnapshotNotFound") {
 			klog.Warningf("the specify snapshot(%s) was not found", snapshot)
 			return &csi.DeleteSnapshotResponse{}, nil
 		}
-		return nil, status.Errorf(codes.Internal, "failed to delete snapshot(%s): %v", snapshot, err)
+		return nil, status.Errorf(codes.Internal, "failed to delete snapshot(%s): %v", snapshot, deleteErr)
 	}
 
 	klog.V(2).Infof("delete snapshot(%s) successfully", snapshot)
@@ -924,9 +996,9 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 		return nil, status.Errorf(codes.InvalidArgument, "invalid expand volume request: %v", req)
 	}
 
-	resourceGroupName, accountName, fileShareName, diskName, secretNamespace, err := GetFileShareInfo(volumeID)
+	resourceGroupName, accountName, fileShareName, diskName, secretNamespace, subsID, err := GetFileShareInfo(volumeID)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("GetAccountInfo(%s) failed with error: %v", volumeID, err))
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("GetFileShareInfo(%s) failed with error: %v", volumeID, err))
 	}
 	if strings.HasSuffix(diskName, vhdSuffix) {
 		// todo: figure out how to support vhd disk resize
@@ -935,8 +1007,11 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	if resourceGroupName == "" {
 		resourceGroupName = d.cloud.ResourceGroup
 	}
+	if subsID == "" {
+		subsID = d.cloud.SubscriptionID
+	}
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_expand_volume", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_expand_volume", resourceGroupName, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
@@ -949,14 +1024,14 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 			setKeyValueInMap(reqContext, secretNamespaceField, secretNamespace)
 		}
 		// use data plane api, get account key first
-		_, _, accountKey, _, _, err := d.GetAccountInfo(ctx, volumeID, secrets, reqContext)
+		_, _, accountKey, _, _, _, err := d.GetAccountInfo(ctx, volumeID, secrets, reqContext)
 		if err != nil {
 			return nil, status.Errorf(codes.NotFound, "get account info from(%s) failed with error: %v", volumeID, err)
 		}
 		secrets = createStorageAccountSecret(accountName, accountKey)
 	}
 
-	if err = d.ResizeFileShare(resourceGroupName, accountName, fileShareName, int(requestGiB), secrets); err != nil {
+	if err = d.ResizeFileShare(ctx, subsID, resourceGroupName, accountName, fileShareName, int(requestGiB), secrets); err != nil {
 		return nil, status.Errorf(codes.Internal, "expand volume error: %v", err)
 	}
 
@@ -981,7 +1056,7 @@ func (d *Driver) getShareURL(ctx context.Context, sourceVolumeID string, secrets
 }
 
 func (d *Driver) getServiceURL(ctx context.Context, sourceVolumeID string, secrets map[string]string) (azfile.ServiceURL, string, error) {
-	_, accountName, accountKey, fileShareName, _, err := d.GetAccountInfo(ctx, sourceVolumeID, secrets, map[string]string{})
+	_, accountName, accountKey, fileShareName, _, _, err := d.GetAccountInfo(ctx, sourceVolumeID, secrets, map[string]string{}) //nolint:dogsled
 	if err != nil {
 		return azfile.ServiceURL{}, "", err
 	}
@@ -1011,31 +1086,71 @@ func (d *Driver) getServiceURL(ctx context.Context, sourceVolumeID string, secre
 // 1. Judge if the specify snapshot name already exists.
 // 2. If it exists, we should judge if its source file share name equals that we specify.
 // As long as the snapshot already exists, returns true. But when the source is different, an error will be returned.
-func (d *Driver) snapshotExists(ctx context.Context, sourceVolumeID, snapshotName string, secrets map[string]string) (bool, azfile.ShareItem, error) {
-	serviceURL, fileShareName, err := d.getServiceURL(ctx, sourceVolumeID, secrets)
-	if err != nil {
-		return false, azfile.ShareItem{}, err
-	}
-	if fileShareName == "" {
-		return false, azfile.ShareItem{}, fmt.Errorf("file share is empty after parsing sourceVolumeID: %s", sourceVolumeID)
-	}
+// If its source file share name equals that we specify, also returns its x-ms-snapshot string, last modeified time and share quota.
+func (d *Driver) snapshotExists(ctx context.Context, sourceVolumeID, snapshotName string, secrets map[string]string, useDataPlaneAPI bool) (bool, string, time.Time, int32, error) {
+	if len(secrets) > 0 || useDataPlaneAPI {
+		serviceURL, fileShareName, err := d.getServiceURL(ctx, sourceVolumeID, secrets)
+		if err != nil {
+			return false, "", time.Time{}, 0, err
+		}
+		if fileShareName == "" {
+			return false, "", time.Time{}, 0, fmt.Errorf("file share is empty after parsing sourceVolumeID: %s", sourceVolumeID)
+		}
 
-	// List share snapshots.
-	listSnapshot, err := serviceURL.ListSharesSegment(ctx, azfile.Marker{}, azfile.ListSharesOptions{Detail: azfile.ListSharesDetail{Metadata: true, Snapshots: true}})
-	if err != nil {
-		return false, azfile.ShareItem{}, err
-	}
-	for _, share := range listSnapshot.ShareItems {
-		if share.Metadata[snapshotNameKey] == snapshotName {
-			if share.Name == fileShareName {
-				klog.V(2).Infof("found share(%s) snapshot(%s) Metadata(%v)", share.Name, *share.Snapshot, share.Metadata)
-				return true, share, nil
+		// List share snapshots.
+		listSnapshot, err := serviceURL.ListSharesSegment(ctx, azfile.Marker{}, azfile.ListSharesOptions{Detail: azfile.ListSharesDetail{Metadata: true, Snapshots: true}})
+		if err != nil {
+			return false, "", time.Time{}, 0, err
+		}
+		for _, share := range listSnapshot.ShareItems {
+			if share.Metadata[snapshotNameKey] == snapshotName {
+				if share.Name == fileShareName {
+					klog.V(2).Infof("found share(%s) snapshot(%s) Metadata(%v)", share.Name, *share.Snapshot, share.Metadata)
+					if share.Snapshot == nil {
+						return true, "", share.Properties.LastModified, share.Properties.Quota, status.Errorf(codes.Internal, "Snapshot property of %s is nil", share.Name)
+					}
+					return true, *share.Snapshot, share.Properties.LastModified, share.Properties.Quota, nil
+				}
+				return true, "", time.Time{}, 0, fmt.Errorf("snapshot(%s) already exists, while the current file share name(%s) does not equal to %s, SourceVolumeId(%s)", snapshotName, share.Name, fileShareName, sourceVolumeID)
 			}
-			return true, azfile.ShareItem{}, fmt.Errorf("snapshot(%s) already exists, while the current file share name(%s) does not equal to %s, SourceVolumeId(%s)", snapshotName, share.Name, fileShareName, sourceVolumeID)
+		}
+	} else {
+		rgName, accountName, fileShareName, _, _, subsID, err := GetFileShareInfo(sourceVolumeID) //nolint:dogsled
+		if err != nil {
+			return false, "", time.Time{}, 0, err
+		}
+		if fileShareName == "" {
+			return false, "", time.Time{}, 0, fmt.Errorf("file share is empty after parsing sourceVolumeID: %s", sourceVolumeID)
+		}
+
+		// List share snapshots.
+		listSnapshot, err := d.cloud.FileClient.WithSubscriptionID(subsID).ListFileShare(ctx, rgName, accountName, "", snapshotsExpand)
+		if err != nil {
+			return false, "", time.Time{}, 0, err
+		}
+		if listSnapshot == nil {
+			return false, "", time.Time{}, 0, nil
+		}
+		for _, share := range listSnapshot {
+			if share.SnapshotTime == nil { //the fileshare is not a snapshot
+				continue
+			}
+			shareSnapshotTime := share.SnapshotTime.Format(snapshotTimeFormat)
+			fileshare, err := d.cloud.FileClient.WithSubscriptionID(subsID).GetFileShare(ctx, rgName, accountName, pointer.StringDeref(share.Name, ""), shareSnapshotTime)
+			if err != nil {
+				klog.V(2).Infof("get share(%s) snapshot(%s) error(%s)", pointer.StringDeref(share.Name, ""), shareSnapshotTime, err)
+				return false, "", time.Time{}, 0, nil
+			}
+			if fileshare.Metadata != nil && pointer.StringDeref(fileshare.Metadata[snapshotNameKey], "") == snapshotName {
+				if pointer.StringDeref(fileshare.Name, "") == fileShareName {
+					klog.V(2).Infof("found share(%s) snapshot(%s) Metadata(%v)", pointer.StringDeref(fileshare.Name, ""), shareSnapshotTime, fileshare.Metadata)
+					return true, shareSnapshotTime, share.SnapshotTime.Time, pointer.Int32Deref(share.ShareQuota, 0), nil
+				}
+				return true, "", time.Time{}, 0, fmt.Errorf("snapshot(%s) already exists, while the current file share name(%s) does not equal to %s, SourceVolumeId(%s)", snapshotName, pointer.StringDeref(share.Name, ""), fileShareName, sourceVolumeID)
+			}
 		}
 	}
-
-	return false, azfile.ShareItem{}, nil
+	return false, "", time.Time{}, 0, nil
 }
 
 // isValidVolumeCapabilities validates the given VolumeCapability array is valid

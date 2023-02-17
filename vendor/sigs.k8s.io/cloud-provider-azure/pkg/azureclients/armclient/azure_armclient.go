@@ -30,13 +30,12 @@ import (
 	"time"
 	"unicode"
 
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients"
-
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/tracing"
-
 	"k8s.io/klog/v2"
+
+	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
 	"sigs.k8s.io/cloud-provider-azure/pkg/version"
 )
@@ -76,7 +75,7 @@ func sender() autorest.Sender {
 				Timeout:   30 * time.Second, // the same as default transport
 				KeepAlive: 30 * time.Second, // the same as default transport
 			}).DialContext,
-			ForceAttemptHTTP2:     true,             // always attempt HTTP/2 even though custom dialer is provided
+			ForceAttemptHTTP2:     false,            // respect custom dialer (default is true)
 			MaxIdleConns:          100,              // Zero means no limit, the same as default transport
 			MaxIdleConnsPerHost:   100,              // Default is 2, ref:https://cs.opensource.google/go/go/+/go1.18.4:src/net/http/transport.go;l=58
 			IdleConnTimeout:       90 * time.Second, // the same as default transport
@@ -93,6 +92,20 @@ func sender() autorest.Sender {
 		}
 		j, _ := cookiejar.New(nil)
 		defaultSenders.sender = &http.Client{Jar: j, Transport: roundTripper}
+
+		// In go-autorest SDK https://github.com/Azure/go-autorest/blob/master/autorest/sender.go#L258-L287,
+		// if ARM returns http.StatusTooManyRequests, the sender doesn't increase the retry attempt count,
+		// hence the Azure clients will keep retrying forever until it get a status code other than 429.
+		// So we explicitly removes http.StatusTooManyRequests from autorest.StatusCodesForRetry.
+		// Refer https://github.com/Azure/go-autorest/issues/398.
+		// TODO(feiskyer): Use autorest.SendDecorator to customize the retry policy when new Azure SDK is available.
+		statusCodesForRetry := make([]int, 0)
+		for _, code := range autorest.StatusCodesForRetry {
+			if code != http.StatusTooManyRequests {
+				statusCodesForRetry = append(statusCodesForRetry, code)
+			}
+		}
+		autorest.StatusCodesForRetry = statusCodesForRetry
 	})
 	return defaultSenders.sender
 }
@@ -145,7 +158,6 @@ func New(authorizer autorest.Authorizer, clientConfig azureclients.ClientConfig,
 	client.client.Sender = autorest.DecorateSender(client.client,
 		autorest.DoCloseIfError(),
 		retry.DoExponentialBackoffRetry(backoff),
-		DoHackRegionalRetryDecorator(client),
 		DoDumpRequest(10),
 	)
 
@@ -314,9 +326,6 @@ func (c *Client) GetResourceWithExpandQuery(ctx context.Context, resourceID, exp
 // GetResourceWithExpandAPIVersionQuery get a resource by resource ID with expand and API version.
 func (c *Client) GetResourceWithExpandAPIVersionQuery(ctx context.Context, resourceID, expand, apiVersion string) (*http.Response, *retry.Error) {
 	decorators := []autorest.PrepareDecorator{
-		autorest.AsGet(),
-		autorest.WithBaseURL(c.baseURI),
-		autorest.WithPathParameters("{resourceID}", map[string]interface{}{"resourceID": resourceID}),
 		withAPIVersion(apiVersion),
 	}
 	if expand != "" {
@@ -325,15 +334,7 @@ func (c *Client) GetResourceWithExpandAPIVersionQuery(ctx context.Context, resou
 		}))
 	}
 
-	preparer := autorest.CreatePreparer(decorators...)
-	request, err := preparer.Prepare((&http.Request{}).WithContext(ctx))
-
-	if err != nil {
-		klog.V(5).Infof("Received error in %s: resourceID: %s, error: %s", "get.prepare", resourceID, err)
-		return nil, retry.NewError(false, err)
-	}
-
-	return c.Send(ctx, request)
+	return c.GetResource(ctx, resourceID, decorators...)
 }
 
 // GetResourceWithQueries get a resource by resource ID with queries.
@@ -362,7 +363,7 @@ func (c *Client) GetResource(ctx context.Context, resourceID string, decorators 
 		return nil, retry.NewError(false, err)
 	}
 
-	return c.Send(ctx, request)
+	return c.Send(ctx, request, DoHackRegionalRetryForGET(c))
 }
 
 // PutResource puts a resource by resource ID

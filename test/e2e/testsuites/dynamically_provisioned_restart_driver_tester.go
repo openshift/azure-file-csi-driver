@@ -17,7 +17,7 @@ limitations under the License.
 package testsuites
 
 import (
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 
@@ -35,7 +35,7 @@ type DynamicallyProvisionedRestartDriverTest struct {
 }
 
 func (t *DynamicallyProvisionedRestartDriverTest) Run(client clientset.Interface, namespace *v1.Namespace) {
-	tDeployment, cleanup := t.Pod.SetupDeployment(client, namespace, t.CSIDriver, t.StorageClassParameters)
+	tDeployment, cleanup, _ := t.Pod.SetupDeployment(client, namespace, t.CSIDriver, t.StorageClassParameters)
 	// defer must be called here for resources not get removed before using them
 	for i := range cleanup {
 		defer cleanup[i]()

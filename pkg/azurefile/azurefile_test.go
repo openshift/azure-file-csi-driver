@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient/mockfileclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient/mockstorageaccountclient"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
+	auth "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 )
 
 const (
@@ -56,6 +57,13 @@ func NewFakeDriver() *Driver {
 	driver := NewDriver(&driverOptions)
 	driver.Name = fakeDriverName
 	driver.Version = vendorVersion
+	driver.cloud = &azure.Cloud{
+		Config: azure.Config{
+			AzureAuthConfig: auth.AzureAuthConfig{
+				SubscriptionID: "subscriptionID",
+			},
+		},
+	}
 	return driver
 }
 
@@ -64,6 +72,13 @@ func NewFakeDriverCustomOptions(opts DriverOptions) *Driver {
 	driver := NewDriver(&driverOptions)
 	driver.Name = fakeDriverName
 	driver.Version = vendorVersion
+	driver.cloud = &azure.Cloud{
+		Config: azure.Config{
+			AzureAuthConfig: auth.AzureAuthConfig{
+				SubscriptionID: "subscriptionID",
+			},
+		},
+	}
 	return driver
 }
 
@@ -171,6 +186,7 @@ func TestGetFileShareInfo(t *testing.T) {
 		fileShareName     string
 		diskName          string
 		namespace         string
+		subsID            string
 		expectedError     error
 	}{
 		{
@@ -248,10 +264,30 @@ func TestGetFileShareInfo(t *testing.T) {
 			diskName:          "",
 			expectedError:     fmt.Errorf("error parsing volume id: \"\", should at least contain two #"),
 		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
+			resourceGroupName: "rg",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "fileShareName",
+			diskName:          "diskname.vhd",
+			namespace:         "namespace",
+			subsID:            "subsID",
+			expectedError:     nil,
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace",
+			resourceGroupName: "rg",
+			accountName:       "f5713de20cde511e8ba4900",
+			fileShareName:     "fileShareName",
+			diskName:          "diskname.vhd",
+			namespace:         "namespace",
+			subsID:            "",
+			expectedError:     nil,
+		},
 	}
 
 	for _, test := range tests {
-		resourceGroupName, accountName, fileShareName, diskName, namespace, expectedError := GetFileShareInfo(test.id)
+		resourceGroupName, accountName, fileShareName, diskName, namespace, subsID, expectedError := GetFileShareInfo(test.id)
 		if resourceGroupName != test.resourceGroupName {
 			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, resourceGroupName, test.resourceGroupName)
 		}
@@ -266,6 +302,9 @@ func TestGetFileShareInfo(t *testing.T) {
 		}
 		if namespace != test.namespace {
 			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, namespace, test.namespace)
+		}
+		if subsID != test.subsID {
+			t.Errorf("GetFileShareInfo(%q) returned with: %q, expected: %q", test.id, subsID, test.subsID)
 		}
 		if !reflect.DeepEqual(expectedError, test.expectedError) {
 			t.Errorf("GetFileShareInfo(%q) returned with: %v, expected: %v", test.id, expectedError, test.expectedError)
@@ -719,7 +758,7 @@ func TestGetAccountInfo(t *testing.T) {
 		d.cloud.KubeClient = clientSet
 		d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
 		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), test.rgName, gomock.Any()).Return(key, nil).AnyTimes()
-		rgName, accountName, _, fileShareName, diskName, err := d.GetAccountInfo(context.Background(), test.volumeID, test.secrets, test.reqContext)
+		rgName, accountName, _, fileShareName, diskName, _, err := d.GetAccountInfo(context.Background(), test.volumeID, test.secrets, test.reqContext)
 		if test.expectErr && err == nil {
 			t.Errorf("Unexpected non-error")
 			continue
@@ -843,8 +882,9 @@ func TestGetFileShareQuota(t *testing.T) {
 	for _, test := range tests {
 		mockFileClient := mockfileclient.NewMockInterface(ctrl)
 		d.cloud.FileClient = mockFileClient
-		mockFileClient.EXPECT().GetFileShare(gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
-		quota, err := d.getFileShareQuota(resourceGroupName, accountName, fileShareName, test.secrets)
+		mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
+		mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+		quota, err := d.getFileShareQuota(context.TODO(), "", resourceGroupName, accountName, fileShareName, test.secrets)
 		if !reflect.DeepEqual(err, test.expectedError) {
 			t.Errorf("test name: %s, Unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
@@ -959,7 +999,7 @@ func TestIsSupportedProtocol(t *testing.T) {
 	}
 }
 
-func TestIsSupportedAccessTier(t *testing.T) {
+func TestIsSupportedShareAccessTier(t *testing.T) {
 	tests := []struct {
 		accessTier     string
 		expectedResult bool
@@ -999,7 +1039,54 @@ func TestIsSupportedAccessTier(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := isSupportedAccessTier(test.accessTier)
+		result := isSupportedShareAccessTier(test.accessTier)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedTier(%s) returned with %v, not equal to %v", test.accessTier, result, test.expectedResult)
+		}
+	}
+}
+
+func TestIsSupportedAccountAccessTier(t *testing.T) {
+	tests := []struct {
+		accessTier     string
+		expectedResult bool
+	}{
+		{
+			accessTier:     "",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "TransactionOptimized",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "Hot",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "Cool",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "Premium",
+			expectedResult: true,
+		},
+		{
+			accessTier:     "transactionOptimized",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "premium",
+			expectedResult: false,
+		},
+		{
+			accessTier:     "unknown",
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedAccountAccessTier(test.accessTier)
 		if result != test.expectedResult {
 			t.Errorf("isSupportedTier(%s) returned with %v, not equal to %v", test.accessTier, result, test.expectedResult)
 		}
@@ -1038,5 +1125,86 @@ func TestIsSupportedRootSquashType(t *testing.T) {
 		if result != test.expectedResult {
 			t.Errorf("isSupportedRootSquashType(%s) returned with %v, not equal to %v", test.rootSquashType, result, test.expectedResult)
 		}
+	}
+}
+
+func TestGetSubnetResourceID(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "NetworkResourceSubscriptionID is Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.SubscriptionID = "fakeSubID"
+				d.cloud.NetworkResourceSubscriptionID = ""
+				d.cloud.ResourceGroup = "foo"
+				d.cloud.VnetResourceGroup = "foo"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, d.cloud.SubscriptionID, "foo", d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.SubscriptionID should be used as the SubID")
+			},
+		},
+		{
+			name: "NetworkResourceSubscriptionID is not Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.SubscriptionID = "fakeSubID"
+				d.cloud.NetworkResourceSubscriptionID = "fakeNetSubID"
+				d.cloud.ResourceGroup = "foo"
+				d.cloud.VnetResourceGroup = "foo"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, d.cloud.NetworkResourceSubscriptionID, "foo", d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.NetworkResourceSubscriptionID should be used as the SubID")
+			},
+		},
+		{
+			name: "VnetResourceGroup is Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = ""
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", d.cloud.ResourceGroup, d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.Resourcegroup should be used as the rg")
+			},
+		},
+		{
+			name: "VnetResourceGroup is not Empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = "fakeVnetResourceGroup"
+				actualOutput := d.getSubnetResourceID("", "", "")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", d.cloud.VnetResourceGroup, d.cloud.VnetName, d.cloud.SubnetName)
+				assert.Equal(t, actualOutput, expectedOutput, "cloud.VnetResourceGroup should be used as the rg")
+			},
+		},
+		{
+			name: "VnetResourceGroup, vnetName, subnetName is specified",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{}
+				d.cloud.SubscriptionID = "bar"
+				d.cloud.NetworkResourceSubscriptionID = "bar"
+				d.cloud.ResourceGroup = "fakeResourceGroup"
+				d.cloud.VnetResourceGroup = "fakeVnetResourceGroup"
+				actualOutput := d.getSubnetResourceID("vnetrg", "vnetName", "subnetName")
+				expectedOutput := fmt.Sprintf(subnetTemplate, "bar", "vnetrg", "vnetName", "subnetName")
+				assert.Equal(t, actualOutput, expectedOutput, "VnetResourceGroup, vnetName, subnetName is specified")
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
 	}
 }
