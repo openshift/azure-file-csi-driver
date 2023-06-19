@@ -31,8 +31,10 @@ csi-azurefile-node-dr4s4                        3/3     Running   0          7m4
 
  - get pod description and logs
 ```console
-kubectl describe pod csi-azurefile-node-cvgbs -n kube-system > csi-azurefile-node-description.log
 kubectl logs csi-azurefile-node-cvgbs -c azurefile -n kube-system > csi-azurefile-node.log
+# only collect following logs if there is driver crash issue
+kubectl describe pod csi-azurefile-node-cvgbs -n kube-system > csi-azurefile-node-description.log
+kubectl logs csi-azurefile-node-cvgbs -c node-driver-registrar -n kube-system > node-driver-registrar.log
 ```
 
  - check cifs mount inside driver
@@ -81,7 +83,7 @@ kubectl edit ds csi-azurefile-node -n kube-system
 ```
 change below deployment config, e.g.
 ```console
-        image: mcr.microsoft.com/k8s/csi/azurefile-csi:v1.5.0
+        image: mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.24.0
         imagePullPolicy: Always
 ```
 
@@ -152,7 +154,8 @@ mkdir /tmp/test
 mount -v -t nfs -o vers=4,minorversion=1,sec=sys accountname.file.core.windows.net:/accountname/filesharename /tmp/test
 ```
 
- - [Troubleshoot Azure File mount issues on AKS](https://docs.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/fail-to-mount-azure-file-share)
+ - [Troubleshoot Azure File mount issues on AKS](http://aka.ms/filemounterror)
+ - [Troubleshoot Azure Files problems in Linux (SMB)](https://learn.microsoft.com/en-us/azure/storage/files/storage-troubleshoot-linux-file-connection-problems)
 
 ### Troubleshooting performance issues on Azure Files
 
@@ -172,5 +175,5 @@ Azure premium files follows provisioned model where IOPS and throughput are asso
 
 ##### For more, refer to this doc for perforance troubleshooting tips - [Link to performance troubleshooting tips](https://docs.microsoft.com/en-us/azure/storage/files/storage-troubleshooting-files-performance)
 
-##### [Troubleshoot AKS Storage-related issues](https://docs.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/fail-to-mount-azure-file-share)
 ##### [Storage considerations for Azure Kubernetes Service (AKS)](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/scenarios/app-platform/aks/storage)
+##### [Compare access to Azure Files, Blob Storage, and Azure NetApp Files with NFS](https://learn.microsoft.com/en-us/azure/storage/common/nfs-comparison#comparison)

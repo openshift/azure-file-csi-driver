@@ -7,7 +7,7 @@
 ### About
 This driver allows Kubernetes to access [Azure File](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-introduction) volume using smb and nfs protocols, csi plugin name: `file.csi.azure.com`
 
-Disclaimer: Deploying this driver manually is not an officially supported Microsoft product. For a fully managed and supported experience on Kubernetes, use [AKS with the managed Azure file csi driver](https://learn.microsoft.com/en-us/azure/aks/azure-file-csi).
+Disclaimer: Deploying this driver manually is not an officially supported Microsoft product. For a fully managed and supported experience on Kubernetes, use [AKS with the managed Azure file csi driver](https://learn.microsoft.com/azure/aks/azure-files-csi).
 
 ### Project status: GA
 
@@ -15,9 +15,9 @@ Disclaimer: Deploying this driver manually is not an officially supported Micros
 |Driver Version  |Image                                                      | supported k8s version |
 |----------------|---------------------------------------------------------- |-----------------------|
 |master branch   |mcr.microsoft.com/k8s/csi/azurefile-csi:latest             | 1.21+                 |
-|v1.25.1         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.25.1 | 1.21+                 |
-|v1.24.0         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.24.0 | 1.21+                 |
-|v1.23.0         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.23.0 | 1.21+                 |
+|v1.28.0         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.28.0 | 1.21+                 |
+|v1.27.0         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.27.0 | 1.21+                 |
+|v1.26.3         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.26.3 | 1.21+                 |
 
 ### Driver parameters
 Please refer to [driver parameters](./docs/driver-parameters.md)
@@ -37,8 +37,10 @@ This option does not depend on cloud provider config file, supports cross subscr
 ### Install driver on a Kubernetes cluster
  - install by [helm charts](./charts)
  - install by [kubectl](./docs/install-azurefile-csi-driver.md)
- - install open source csi driver on AKS, follow guide [here](./docs/install-driver-on-aks.md)
- - install managed csi driver on following platforms:
+ - install open source CSI driver on following platforms:
+   - [AKS](./docs/install-driver-on-aks.md)
+   - [Azure RedHat OpenShift](https://github.com/ezYakaEagle442/aro-pub-storage/blob/master/setup-store-CSI-driver-azure-file.md)
+ - install managed CSI driver on following platforms:
    - [AKS](https://learn.microsoft.com/en-us/azure/aks/csi-storage-drivers)
    - [Azure RedHat OpenShift](https://docs.openshift.com/container-platform/4.11/storage/container_storage_interface/persistent-storage-csi-azure-file.html)
 
@@ -50,7 +52,8 @@ This option does not depend on cloud provider config file, supports cross subscr
  - [NFS](./deploy/example/nfs)
  - [Snapshot](./deploy/example/snapshot)
  - [Resize](./deploy/example/resize)
- 
+ - [Workload identity](./docs/workload-identity.md)
+
 ### Troubleshooting
  - [CSI driver troubleshooting guide](./docs/csi-debug.md) 
 

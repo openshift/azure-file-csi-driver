@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -93,8 +92,10 @@ func TestNewFakeDriver(t *testing.T) {
 
 func TestAppendDefaultMountOptions(t *testing.T) {
 	tests := []struct {
-		options  []string
-		expected []string
+		options                 []string
+		appendClosetimeoOption  bool
+		appendNoShareSockOption bool
+		expected                []string
 	}{
 		{
 			options: []string{"dir_mode=0777"},
@@ -139,6 +140,24 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 			},
 		},
 		{
+			options: []string{"acregmax=1"},
+			expected: []string{
+				"acregmax=1",
+				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				mfsymlinks,
+			},
+		},
+		{
+			options: []string{"acdirmax=2"},
+			expected: []string{
+				"acdirmax=2",
+				fmt.Sprintf("%s=%s", fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				mfsymlinks,
+			},
+		},
+		{
 			options: []string{mfsymlinks},
 			expected: []string{
 				mfsymlinks,
@@ -165,10 +184,43 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 				mfsymlinks,
 			},
 		},
+		{
+			options:                []string{""},
+			appendClosetimeoOption: true,
+			expected: []string{"", fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"sloppy,closetimeo=0",
+			},
+		},
+		{
+			options:                 []string{""},
+			appendNoShareSockOption: true,
+			expected: []string{"", fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"nosharesock",
+			},
+		},
+		{
+			options:                 []string{"nosharesock"},
+			appendNoShareSockOption: true,
+			expected: []string{fmt.Sprintf("%s=%s",
+				fileMode, defaultFileMode),
+				fmt.Sprintf("%s=%s", dirMode, defaultDirMode),
+				fmt.Sprintf("%s=%s", actimeo, defaultActimeo),
+				mfsymlinks,
+				"nosharesock",
+			},
+		},
 	}
 
 	for _, test := range tests {
-		result := appendDefaultMountOptions(test.options)
+		result := appendDefaultMountOptions(test.options, test.appendNoShareSockOption, test.appendClosetimeoOption)
 		sort.Strings(result)
 		sort.Strings(test.expected)
 
@@ -544,7 +596,7 @@ func TestGetSnapshot(t *testing.T) {
 
 func TestIsCorruptedDir(t *testing.T) {
 	skipIfTestingOnWindows(t)
-	existingMountPath, err := ioutil.TempDir(os.TempDir(), "csi-mount-test")
+	existingMountPath, err := os.MkdirTemp(os.TempDir(), "csi-mount-test")
 	if err != nil {
 		t.Fatalf("failed to create tmp dir: %v", err)
 	}
@@ -912,7 +964,7 @@ func TestRun(t *testing.T) {
 		{
 			name: "Successful run",
 			testFunc: func(t *testing.T) {
-				if err := ioutil.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
+				if err := os.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
 					t.Error(err)
 				}
 
@@ -937,7 +989,7 @@ func TestRun(t *testing.T) {
 		{
 			name: "Successful run with node ID missing",
 			testFunc: func(t *testing.T) {
-				if err := ioutil.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
+				if err := os.WriteFile(fakeCredFile, []byte(fakeCredContent), 0666); err != nil {
 					t.Error(err)
 				}
 

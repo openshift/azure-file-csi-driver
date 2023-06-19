@@ -130,7 +130,9 @@ const (
 	subnetNameField                   = "subnetname"
 	shareNamePrefixField              = "sharenameprefix"
 	requireInfraEncryptionField       = "requireinfraencryption"
+	enableMultichannelField           = "enablemultichannel"
 	premium                           = "premium"
+	selectRandomMatchingAccountField  = "selectrandommatchingaccount"
 
 	accountNotProvisioned = "StorageAccountIsNotProvisioned"
 	// this is a workaround fix for 429 throttling issue, will update cloud provider for better fix later
@@ -190,11 +192,16 @@ type DriverOptions struct {
 	AllowEmptyCloudConfig                  bool
 	AllowInlineVolumeKeyAccessWithIdentity bool
 	EnableVHDDiskFeature                   bool
+	EnableVolumeMountGroup                 bool
 	EnableGetVolumeStats                   bool
+	AppendMountErrorHelpLink               bool
 	MountPermissions                       uint64
 	FSGroupChangePolicy                    string
 	KubeAPIQPS                             float64
 	KubeAPIBurst                           int
+	EnableWindowsHostProcess               bool
+	AppendClosetimeoOption                 bool
+	AppendNoShareSockOption                bool
 }
 
 // Driver implements all interfaces of CSI drivers
@@ -210,9 +217,14 @@ type Driver struct {
 	allowInlineVolumeKeyAccessWithIdentity bool
 	enableVHDDiskFeature                   bool
 	enableGetVolumeStats                   bool
+	enableVolumeMountGroup                 bool
+	appendMountErrorHelpLink               bool
 	mountPermissions                       uint64
 	kubeAPIQPS                             float64
 	kubeAPIBurst                           int
+	enableWindowsHostProcess               bool
+	appendClosetimeoOption                 bool
+	appendNoShareSockOption                bool
 	fileClient                             *azureFileClient
 	mounter                                *mount.SafeFormatAndMount
 	// lock per volume attach (only for vhd disk feature)
@@ -252,11 +264,16 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.allowEmptyCloudConfig = options.AllowEmptyCloudConfig
 	driver.allowInlineVolumeKeyAccessWithIdentity = options.AllowInlineVolumeKeyAccessWithIdentity
 	driver.enableVHDDiskFeature = options.EnableVHDDiskFeature
+	driver.enableVolumeMountGroup = options.EnableVolumeMountGroup
 	driver.enableGetVolumeStats = options.EnableGetVolumeStats
+	driver.appendMountErrorHelpLink = options.AppendMountErrorHelpLink
 	driver.mountPermissions = options.MountPermissions
 	driver.fsGroupChangePolicy = options.FSGroupChangePolicy
 	driver.kubeAPIQPS = options.KubeAPIQPS
 	driver.kubeAPIBurst = options.KubeAPIBurst
+	driver.enableWindowsHostProcess = options.EnableWindowsHostProcess
+	driver.appendClosetimeoOption = options.AppendClosetimeoOption
+	driver.appendNoShareSockOption = options.AppendNoShareSockOption
 	driver.volLockMap = newLockMap()
 	driver.subnetLockMap = newLockMap()
 	driver.volumeLocks = newVolumeLocks()
@@ -297,7 +314,7 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 
 	userAgent := GetUserAgent(d.Name, d.customUserAgent, d.userAgentSuffix)
 	klog.V(2).Infof("driver userAgent: %s", userAgent)
-	d.cloud, err = getCloudProvider(kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.kubeAPIQPS, d.kubeAPIBurst)
+	d.cloud, err = getCloudProvider(kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.enableWindowsHostProcess, d.kubeAPIQPS, d.kubeAPIBurst)
 	if err != nil {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
@@ -306,7 +323,7 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 	// todo: set backoff from cloud provider config
 	d.fileClient = newAzureFileClient(&d.cloud.Environment, &retry.Backoff{Steps: 1})
 
-	d.mounter, err = mounter.NewSafeMounter()
+	d.mounter, err = mounter.NewSafeMounter(d.enableWindowsHostProcess)
 	if err != nil {
 		klog.Fatalf("Failed to get safe mounter. Error: %v", err)
 	}
@@ -317,7 +334,6 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-			//csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
 		})
@@ -334,7 +350,9 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 	nodeCap := []csi.NodeServiceCapability_RPC_Type{
 		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
-		csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
+	}
+	if d.enableVolumeMountGroup {
+		nodeCap = append(nodeCap, csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP)
 	}
 	if d.enableGetVolumeStats {
 		nodeCap = append(nodeCap, csi.NodeServiceCapability_RPC_GET_VOLUME_STATS)
@@ -414,12 +432,19 @@ func GetFileShareInfo(id string) (string, string, string, string, string, string
 }
 
 // check whether mountOptions contains file_mode, dir_mode, vers, if not, append default mode
-func appendDefaultMountOptions(mountOptions []string) []string {
+func appendDefaultMountOptions(mountOptions []string, appendNoShareSockOption, appendClosetimeoOption bool) []string {
 	var defaultMountOptions = map[string]string{
 		fileMode:   defaultFileMode,
 		dirMode:    defaultDirMode,
 		actimeo:    defaultActimeo,
 		mfsymlinks: "",
+	}
+
+	if appendClosetimeoOption {
+		defaultMountOptions["sloppy,closetimeo=0"] = ""
+	}
+	if appendNoShareSockOption {
+		defaultMountOptions["nosharesock"] = ""
 	}
 
 	// stores the mount options already included in mountOptions
@@ -430,6 +455,10 @@ func appendDefaultMountOptions(mountOptions []string) []string {
 			if strings.HasPrefix(mountOption, k) {
 				included[k] = true
 			}
+		}
+		// actimeo would set both acregmax and acdirmax, so we only need to check one of them
+		if strings.Contains(mountOption, "acregmax") || strings.Contains(mountOption, "acdirmax") {
+			included[actimeo] = true
 		}
 	}
 
@@ -445,11 +474,6 @@ func appendDefaultMountOptions(mountOptions []string) []string {
 		}
 	}
 
-	/* todo: looks like fsGroup is not included in CSI
-	if !gidFlag && fsGroup != nil {
-		allMountOptions = append(allMountOptions, fmt.Sprintf("%s=%d", gid, *fsGroup))
-	}
-	*/
 	return allMountOptions
 }
 

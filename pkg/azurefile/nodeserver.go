@@ -18,7 +18,6 @@ package azurefile
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -295,7 +294,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			if ephemeralVol {
 				cifsMountFlags = util.JoinMountOptions(cifsMountFlags, strings.Split(ephemeralVolMountOptions, ","))
 			}
-			mountOptions = appendDefaultMountOptions(cifsMountFlags)
+			mountOptions = appendDefaultMountOptions(cifsMountFlags, d.appendNoShareSockOption, d.appendClosetimeoOption)
 		}
 	}
 
@@ -318,7 +317,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		if err := wait.PollImmediate(1*time.Second, 2*time.Minute, func() (bool, error) {
 			return true, SMBMount(d.mounter, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions)
 		}); err != nil {
-			return nil, status.Error(codes.Internal, fmt.Sprintf("volume(%s) mount %s on %s failed with %v", volumeID, source, cifsMountPath, err))
+			var helpLinkMsg string
+			if d.appendMountErrorHelpLink {
+				helpLinkMsg = "\nPlease refer to http://aka.ms/filemounterror for possible causes and solutions for mount errors."
+			}
+			return nil, status.Error(codes.Internal, fmt.Sprintf("volume(%s) mount %s on %s failed with %v%s", volumeID, source, cifsMountPath, err, helpLinkMsg))
 		}
 		if protocol == nfs {
 			if performChmodOp {
@@ -520,7 +523,7 @@ func (d *Driver) ensureMountPoint(target string, perm os.FileMode) (bool, error)
 
 	if !notMnt {
 		// testing original mount point, make sure the mount link is valid
-		_, err := ioutil.ReadDir(target)
+		_, err := os.ReadDir(target)
 		if err == nil {
 			klog.V(2).Infof("already mounted to target %s", target)
 			return !notMnt, nil

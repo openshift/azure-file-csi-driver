@@ -17,7 +17,6 @@ limitations under the License.
 package e2e
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
@@ -51,7 +50,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		testDriver  driver.PVTestDriver
 	)
 
-	ginkgo.BeforeEach(func() {
+	ginkgo.BeforeEach(func(ctx ginkgo.SpecContext) {
 		checkPodsRestart := testCmd{
 			command:  "bash",
 			args:     []string{"test/utils/check_driver_pods_restart.sh"},
@@ -72,7 +71,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 
 	testDriver = driver.InitAzureFileDriver()
 
-	ginkgo.It("should create a storage account with tags [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a storage account with tags [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		// Because the pv object created by kubernetes.io/azure-file does not contain storage account name, skip the test with in-tree volume plugin.
 		skipIfUsingInTreeVolumePlugin()
 
@@ -100,10 +99,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Tags: tags,
 		}
 
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a volume on demand with mount options [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a volume on demand with mount options [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		pods := []testsuites.PodDetails{
 			{
 				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
@@ -140,16 +139,55 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			scParameters["enableLargeFileshares"] = "true"
 			scParameters["networkEndpointType"] = "privateEndpoint"
 			scParameters["accessTier"] = "Hot"
+			scParameters["selectRandomMatchingAccount"] = "true"
 		}
 		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
 			CSIDriver:              testDriver,
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a pod with volume mount subpath [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a smb multi-channel volume with max_channels options [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
+		skipIfUsingInTreeVolumePlugin()
+		if !isCapzTest {
+			ginkgo.Skip("test case is only available for capz test")
+		}
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "100Gi",
+						MountOptions: []string{
+							"max_channels=2",
+						},
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+				IsWindows:    isWindowsCluster,
+				WinServerVer: winServerVer,
+			},
+		}
+
+		scParameters := map[string]string{
+			"skuName":                     "Premium_LRS",
+			"enableMultichannel":          "true",
+			"selectRandomMatchingAccount": "true",
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should create a pod with volume mount subpath [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pods := []testsuites.PodDetails{
@@ -181,10 +219,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create multiple PV objects, bind to PVCs and attach all to different pods on the same node [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create multiple PV objects, bind to PVCs and attach all to different pods on the same node [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		pods := []testsuites.PodDetails{
 			{
 				Cmd: convertToPowershellCommandIfNecessary("while true; do echo $(date -u) >> /mnt/test-1/data; sleep 100; done"),
@@ -233,11 +271,11 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			ColocatePods:           true,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
 	// Track issue https://github.com/kubernetes/kubernetes/issues/70505
-	ginkgo.It("should create a volume on demand and mount it as readOnly in a pod [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a volume on demand and mount it as readOnly in a pod [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		pods := []testsuites.PodDetails{
 			{
 				Cmd: convertToPowershellCommandIfNecessary("touch /mnt/test-1/data"),
@@ -268,10 +306,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a deployment object, write and read to it, delete the pod and write and read to it again [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a deployment object, write and read to it, delete the pod and write and read to it again [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		pod := testsuites.PodDetails{
 			Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' >> /mnt/test-1/data && while true; do sleep 100; done"),
 			Volumes: []testsuites.VolumeDetails{
@@ -305,10 +343,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It(fmt.Sprintf("should delete PV with reclaimPolicy %q [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", v1.PersistentVolumeReclaimDelete), func() {
+	ginkgo.It(fmt.Sprintf("should delete PV with reclaimPolicy %q [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", v1.PersistentVolumeReclaimDelete), func(ctx ginkgo.SpecContext) {
 		reclaimPolicy := v1.PersistentVolumeReclaimDelete
 		volumes := []testsuites.VolumeDetails{
 			{
@@ -329,10 +367,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Volumes:                volumes,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It(fmt.Sprintf("should retain PV with reclaimPolicy %q [file.csi.azure.com] [Windows]", v1.PersistentVolumeReclaimRetain), func() {
+	ginkgo.It(fmt.Sprintf("should retain PV with reclaimPolicy %q [file.csi.azure.com] [Windows]", v1.PersistentVolumeReclaimRetain), func(ctx ginkgo.SpecContext) {
 		// This tests uses the CSI driver to delete the PV.
 		// TODO: Go via the k8s interfaces and also make it more reliable for in-tree and then
 		//       test can be enabled.
@@ -354,10 +392,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				"skuName": "Premium_LRS",
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a volume on demand and resize it [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a volume on demand and resize it [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		pods := []testsuites.PodDetails{
 			{
 				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
@@ -386,10 +424,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a vhd disk volume on demand [kubernetes.io/azure-file] [file.csi.azure.com][disk]", func() {
+	ginkgo.It("should create a vhd disk volume on demand [kubernetes.io/azure-file] [file.csi.azure.com][disk]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -412,10 +450,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS", "fsType": "ext4"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should receive FailedMount event with invalid mount options [file.csi.azure.com] [disk]", func() {
+	ginkgo.It("should receive FailedMount event with invalid mount options [file.csi.azure.com] [disk]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -443,10 +481,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "ext4"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should receive FailedMount event with invalid mount options [file.csi.azure.com] [disk]", func() {
+	ginkgo.It("should receive FailedMount event with invalid mount options [file.csi.azure.com] [disk]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -474,10 +512,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "ext4"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create multiple PV objects, bind to PVCs and attach all to different pods on the same node [file.csi.azure.com][disk]", func() {
+	ginkgo.It("should create multiple PV objects, bind to PVCs and attach all to different pods on the same node [file.csi.azure.com][disk]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -517,11 +555,11 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			ColocatePods:           true,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "xfs"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
 	// Track issue https://github.com/kubernetes/kubernetes/issues/70505
-	ginkgo.It("should create a vhd disk volume on demand and mount it as readOnly in a pod [file.csi.azure.com][disk]", func() {
+	ginkgo.It("should create a vhd disk volume on demand and mount it as readOnly in a pod [file.csi.azure.com][disk]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -546,10 +584,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "ext3"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a deployment object, write and read to it, delete the pod and write and read to it again [file.csi.azure.com] [disk]", func() {
+	ginkgo.It("should create a deployment object, write and read to it, delete the pod and write and read to it again [file.csi.azure.com] [disk]", func(ctx ginkgo.SpecContext) {
 		ginkgo.Skip("test case is disabled due to controller.attachRequired is disabled by default now")
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
@@ -576,10 +614,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			},
 			StorageClassParameters: map[string]string{"skuName": "Standard_LRS", "fsType": "xfs"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It(fmt.Sprintf("should delete PV with reclaimPolicy %q [file.csi.azure.com] [disk]", v1.PersistentVolumeReclaimDelete), func() {
+	ginkgo.It(fmt.Sprintf("should delete PV with reclaimPolicy %q [file.csi.azure.com] [disk]", v1.PersistentVolumeReclaimDelete), func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -596,10 +634,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Volumes:                volumes,
 			StorageClassParameters: map[string]string{"skuName": "Standard_RAGRS", "fsType": "ext2"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It(fmt.Sprintf("[env] should retain PV with reclaimPolicy %q [file.csi.azure.com] [disk]", v1.PersistentVolumeReclaimRetain), func() {
+	ginkgo.It(fmt.Sprintf("[env] should retain PV with reclaimPolicy %q [file.csi.azure.com] [disk]", v1.PersistentVolumeReclaimRetain), func(ctx ginkgo.SpecContext) {
 		// This tests uses the CSI driver to delete the PV.
 		// TODO: Go via the k8s interfaces and also make it more reliable for in-tree and then
 		//       test can be enabled.
@@ -620,10 +658,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Azurefile:              azurefileDriver,
 			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "xfs"},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a pod with multiple volumes [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a pod with multiple volumes [kubernetes.io/azure-file] [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		volumes := []testsuites.VolumeDetails{}
@@ -650,10 +688,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			CSIDriver: testDriver,
 			Pods:      pods,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a pod, write and read to it, take a volume snapshot, and validate whether it is ready to use [file.csi.azure.com]", func() {
+	ginkgo.It("should create a pod, write and read to it, take a volume snapshot, and validate whether it is ready to use [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
 
@@ -674,15 +712,18 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Cmd: "grep 'hello world' /mnt/test-1/data",
 		}
 		test := testsuites.DynamicallyProvisionedVolumeSnapshotTest{
-			CSIDriver:              testDriver,
-			Pod:                    pod,
-			PodWithSnapshot:        podWithSnapshot,
-			StorageClassParameters: map[string]string{"skuName": "Standard_LRS"},
+			CSIDriver:       testDriver,
+			Pod:             pod,
+			PodWithSnapshot: podWithSnapshot,
+			StorageClassParameters: map[string]string{
+				"skuName":                     "Standard_LRS",
+				"selectRandomMatchingAccount": "true",
+			},
 		}
-		test.Run(cs, snapshotrcs, ns)
+		test.Run(ctx, cs, snapshotrcs, ns)
 	})
 
-	ginkgo.It("should create a volume on demand with mount options (Bring Your Own Key) [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a volume on demand with mount options (Bring Your Own Key) [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		// get storage account secret name
 		err := os.Chdir("../..")
@@ -735,10 +776,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: bringKeyStorageClassParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a Premium_LRS volume on demand with useDataPlaneAPI [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a Premium_LRS volume on demand with useDataPlaneAPI [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pods := []testsuites.PodDetails{
@@ -781,10 +822,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a Standard_LRS volume on demand with disableDeleteRetentionPolicy [file.csi.azure.com] [Windows]", func() {
+	ginkgo.It("should create a Standard_LRS volume on demand with disableDeleteRetentionPolicy [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pods := []testsuites.PodDetails{
@@ -826,10 +867,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a statefulset object, write and read to it, delete the pod and write and read to it again [file.csi.azure.com]", func() {
+	ginkgo.It("should create a statefulset object, write and read to it, delete the pod and write and read to it again [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pod := testsuites.PodDetails{
@@ -862,10 +903,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should be able to unmount smb volume if volume is already deleted [file.csi.azure.com]", func() {
+	ginkgo.It("should be able to unmount smb volume if volume is already deleted [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pod := testsuites.PodDetails{
@@ -898,10 +939,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				ExpectedString: expectedString, // pod will be restarted so expect to see 2 instances of string
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should be able to unmount nfs volume if volume is already deleted [file.csi.azure.com]", func() {
+	ginkgo.It("should be able to unmount nfs volume if volume is already deleted [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -938,10 +979,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				"protocol": "nfs",
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create an CSI inline volume [file.csi.azure.com]", func() {
+	ginkgo.It("should create an CSI inline volume [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		// get storage account secret name
@@ -971,7 +1012,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		shareName := "csi-inline-smb-volume"
 		req := makeCreateVolumeReq(shareName, ns.Name)
 		req.Parameters["storageAccount"] = accountName
-		resp, err := azurefileDriver.CreateVolume(context.Background(), req)
+		resp, err := azurefileDriver.CreateVolume(ctx, req)
 		if err != nil {
 			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
 		}
@@ -1010,10 +1051,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			ReadOnly:        false,
 			CSIInlineVolume: true,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create an inline volume by in-tree driver [kubernetes.io/azure-file]", func() {
+	ginkgo.It("should create an inline volume by in-tree driver [kubernetes.io/azure-file]", func(ctx ginkgo.SpecContext) {
 		if !isTestingMigration {
 			ginkgo.Skip("test case is only available for migration test")
 		}
@@ -1044,7 +1085,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		shareName := "intree-inline-smb-volume"
 		req := makeCreateVolumeReq("intree-inline-smb-volume", ns.Name)
 		req.Parameters["storageAccount"] = accountName
-		resp, err := azurefileDriver.CreateVolume(context.Background(), req)
+		resp, err := azurefileDriver.CreateVolume(ctx, req)
 		if err != nil {
 			ginkgo.Fail(fmt.Sprintf("create volume error: %v", err))
 		}
@@ -1084,13 +1125,12 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			ShareName:  shareName,
 			ReadOnly:   false,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should mount on-prem smb server [file.csi.azure.com]", func() {
+	ginkgo.It("should mount on-prem smb server [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		if isWindowsCluster && isCapzTest {
-			log.Println("test case is not available for capz Windows test")
 			ginkgo.Skip("test case is not available for capz Windows test")
 		}
 
@@ -1099,8 +1139,8 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		secreteData := map[string]string{"azurestorageaccountname": "USERNAME"}
 		secreteData["azurestorageaccountkey"] = "PASSWORD"
 		tsecret := testsuites.NewTestSecret(f.ClientSet, ns, secretName, secreteData)
-		tsecret.Create()
-		defer tsecret.Cleanup()
+		tsecret.Create(ctx)
+		defer tsecret.Cleanup(ctx)
 
 		server := "smb-server.default.svc.cluster.local"
 		if isWindowsCluster {
@@ -1158,10 +1198,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			ReadOnly:        false,
 			CSIInlineVolume: true,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a NFS volume on demand with mount options [file.csi.azure.com] [nfs]", func() {
+	ginkgo.It("should create a NFS volume on demand with mount options [file.csi.azure.com] [nfs]", func(ctx ginkgo.SpecContext) {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
 
@@ -1172,7 +1212,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 					{
 						ClaimSize: "100Gi",
 						MountOptions: []string{
-							"nconnect=8",
+							"nconnect=4",
 							"rsize=1048576",
 							"wsize=1048576",
 						},
@@ -1196,10 +1236,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				"mountPermissions": "0755",
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a NFS volume on demand on a storage account with private endpoint [file.csi.azure.com] [nfs]", func() {
+	ginkgo.It("should create a NFS volume on demand on a storage account with private endpoint [file.csi.azure.com] [nfs]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -1210,7 +1250,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 					{
 						ClaimSize: "100Gi",
 						MountOptions: []string{
-							"nconnect=8",
+							"nconnect=4",
 							"rsize=1048576",
 							"wsize=1048576",
 						},
@@ -1237,10 +1277,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			Pods:                   pods,
 			StorageClassParameters: scParameters,
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a pod with multiple NFS volumes [file.csi.azure.com]", func() {
+	ginkgo.It("should create a pod with multiple NFS volumes [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
 
@@ -1276,10 +1316,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		if supportZRSwithNFS {
 			test.StorageClassParameters["skuName"] = "Premium_ZRS"
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("smb volume mount is still valid after driver restart [file.csi.azure.com]", func() {
+	ginkgo.It("smb volume mount is still valid after driver restart [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		// print azure file driver logs before driver restart
@@ -1331,10 +1371,10 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				execTestCmd([]testCmd{restartDriver})
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("nfs volume mount is still valid after driver restart [file.csi.azure.com]", func() {
+	ginkgo.It("nfs volume mount is still valid after driver restart [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 		skipIfTestingInWindowsCluster()
 
@@ -1374,7 +1414,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				execTestCmd([]testCmd{restartDriver})
 			},
 		}
-		test.Run(cs, ns)
+		test.Run(ctx, cs, ns)
 	})
 })
 

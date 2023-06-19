@@ -39,7 +39,7 @@ var (
 	endpoint                               = flag.String("endpoint", "unix://tmp/csi.sock", "CSI endpoint")
 	nodeID                                 = flag.String("nodeid", "", "node id")
 	version                                = flag.Bool("version", false, "Print the version and exit.")
-	metricsAddress                         = flag.String("metrics-address", "0.0.0.0:29614", "export the metrics")
+	metricsAddress                         = flag.String("metrics-address", "", "export the metrics")
 	kubeconfig                             = flag.String("kubeconfig", "", "Absolute path to the kubeconfig file. Required only when running out of cluster.")
 	driverName                             = flag.String("drivername", azurefile.DefaultDriverName, "name of the driver")
 	cloudConfigSecretName                  = flag.String("cloud-config-secret-name", "azure-cloud-provider", "secret name of cloud config")
@@ -47,6 +47,7 @@ var (
 	customUserAgent                        = flag.String("custom-user-agent", "", "custom userAgent")
 	userAgentSuffix                        = flag.String("user-agent-suffix", "", "userAgent suffix")
 	allowEmptyCloudConfig                  = flag.Bool("allow-empty-cloud-config", true, "allow running driver without cloud config")
+	enableVolumeMountGroup                 = flag.Bool("enable-volume-mount-group", true, "indicates whether enabling VOLUME_MOUNT_GROUP")
 	enableGetVolumeStats                   = flag.Bool("enable-get-volume-stats", true, "allow GET_VOLUME_STATS on agent node")
 	mountPermissions                       = flag.Uint64("mount-permissions", 0777, "mounted folder permissions")
 	allowInlineVolumeKeyAccessWithIdentity = flag.Bool("allow-inline-volume-key-access-with-identity", false, "allow accessing storage account key using cluster identity for inline volume")
@@ -54,6 +55,10 @@ var (
 	enableVHDDiskFeature                   = flag.Bool("enable-vhd", true, "enable VHD disk feature (experimental)")
 	kubeAPIQPS                             = flag.Float64("kube-api-qps", 25.0, "QPS to use while communicating with the kubernetes apiserver.")
 	kubeAPIBurst                           = flag.Int("kube-api-burst", 50, "Burst to use while communicating with the kubernetes apiserver.")
+	appendMountErrorHelpLink               = flag.Bool("append-mount-error-help-link", true, "Whether to include a link for help with mount errors when a mount error occurs.")
+	enableWindowsHostProcess               = flag.Bool("enable-windows-host-process", false, "enable windows host process")
+	appendClosetimeoOption                 = flag.Bool("append-closetimeo-option", false, "Whether appending closetimeo=0 option to smb mount command")
+	appendNoShareSockOption                = flag.Bool("append-nosharesock-option", true, "Whether appending nosharesock option to smb mount command")
 )
 
 func main() {
@@ -86,13 +91,18 @@ func handle() {
 		CustomUserAgent:                        *customUserAgent,
 		UserAgentSuffix:                        *userAgentSuffix,
 		AllowEmptyCloudConfig:                  *allowEmptyCloudConfig,
+		EnableVolumeMountGroup:                 *enableVolumeMountGroup,
 		EnableGetVolumeStats:                   *enableGetVolumeStats,
 		MountPermissions:                       *mountPermissions,
 		AllowInlineVolumeKeyAccessWithIdentity: *allowInlineVolumeKeyAccessWithIdentity,
 		FSGroupChangePolicy:                    *fsGroupChangePolicy,
 		EnableVHDDiskFeature:                   *enableVHDDiskFeature,
+		AppendMountErrorHelpLink:               *appendMountErrorHelpLink,
 		KubeAPIQPS:                             *kubeAPIQPS,
 		KubeAPIBurst:                           *kubeAPIBurst,
+		EnableWindowsHostProcess:               *enableWindowsHostProcess,
+		AppendClosetimeoOption:                 *appendClosetimeoOption,
+		AppendNoShareSockOption:                *appendNoShareSockOption,
 	}
 	driver := azurefile.NewDriver(&driverOptions)
 	if driver == nil {
@@ -102,6 +112,9 @@ func handle() {
 }
 
 func exportMetrics() {
+	if *metricsAddress == "" {
+		return
+	}
 	l, err := net.Listen("tcp", *metricsAddress)
 	if err != nil {
 		klog.Warningf("failed to get listener for metrics endpoint: %v", err)
