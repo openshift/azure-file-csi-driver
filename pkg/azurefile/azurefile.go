@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,7 @@ const (
 	createAccountField                = "createaccount"
 	useDataPlaneAPIField              = "usedataplaneapi"
 	storeAccountKeyField              = "storeaccountkey"
+	getLatestAccountKeyField          = "getlatestaccountkey"
 	useSecretCacheField               = "usesecretcache"
 	getAccountKeyFromSecretField      = "getaccountkeyfromsecret"
 	disableDeleteRetentionPolicyField = "disabledeleteretentionpolicy"
@@ -237,17 +239,17 @@ type Driver struct {
 	// a map storing all volumes created by this driver <volumeName, accountName>
 	volMap sync.Map
 	// a timed cache storing all account name and keys retrieved by this driver <accountName, accountkey>
-	accountCacheMap *azcache.TimedCache
+	accountCacheMap azcache.Resource
 	// a map storing all secret names created by this driver <secretCacheKey, "">
-	secretCacheMap *azcache.TimedCache
+	secretCacheMap azcache.Resource
 	// a map storing all volumes using data plane API <volumeID, "">
 	dataPlaneAPIVolMap sync.Map
 	// a timed cache storing all storage accounts that are using data plane API temporarily
-	dataPlaneAPIAccountCache *azcache.TimedCache
+	dataPlaneAPIAccountCache azcache.Resource
 	// a timed cache storing account search history (solve account list throttling issue)
-	accountSearchCache *azcache.TimedCache
+	accountSearchCache azcache.Resource
 	// a timed cache storing tag removing history (solve account update throttling issue)
-	removeTagCache *azcache.TimedCache
+	removeTagCache azcache.Resource
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -281,23 +283,23 @@ func NewDriver(options *DriverOptions) *Driver {
 	var err error
 	getter := func(key string) (interface{}, error) { return nil, nil }
 
-	if driver.secretCacheMap, err = azcache.NewTimedcache(time.Minute, getter); err != nil {
+	if driver.secretCacheMap, err = azcache.NewTimedCache(time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
-	if driver.accountSearchCache, err = azcache.NewTimedcache(time.Minute, getter); err != nil {
+	if driver.accountSearchCache, err = azcache.NewTimedCache(time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
-	if driver.removeTagCache, err = azcache.NewTimedcache(3*time.Minute, getter); err != nil {
+	if driver.removeTagCache, err = azcache.NewTimedCache(3*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
-	if driver.accountCacheMap, err = azcache.NewTimedcache(3*time.Minute, getter); err != nil {
+	if driver.accountCacheMap, err = azcache.NewTimedCache(3*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
-	if driver.dataPlaneAPIAccountCache, err = azcache.NewTimedcache(10*time.Minute, getter); err != nil {
+	if driver.dataPlaneAPIAccountCache, err = azcache.NewTimedCache(10*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
@@ -499,10 +501,10 @@ func getStorageAccount(secrets map[string]string) (string, string, error) {
 	}
 
 	if accountName == "" {
-		return "", "", fmt.Errorf("could not find accountname or azurestorageaccountname field secrets(%v)", secrets)
+		return "", "", fmt.Errorf("could not find accountname or azurestorageaccountname field in secrets")
 	}
 	if accountKey == "" {
-		return "", "", fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets(%v)", secrets)
+		return "", "", fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets")
 	}
 	accountName = strings.TrimSpace(accountName)
 
@@ -621,8 +623,8 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 	}
 
 	var protocol, accountKey, secretName, pvcNamespace string
-	// indicates whether get account key only from k8s secret
-	getAccountKeyFromSecret := false
+	// getAccountKeyFromSecret indicates whether get account key only from k8s secret
+	var getAccountKeyFromSecret, getLatestAccountKey bool
 
 	for k, v := range reqContext {
 		switch strings.ToLower(k) {
@@ -648,6 +650,10 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			secretNamespace = v
 		case pvcNamespaceKey:
 			pvcNamespace = v
+		case getLatestAccountKeyField:
+			if getLatestAccountKey, err = strconv.ParseBool(v); err != nil {
+				return rgName, accountName, accountKey, fileShareName, diskName, subsID, fmt.Errorf("invalid %s: %s in volume context", getLatestAccountKeyField, v)
+			}
 		}
 	}
 
@@ -692,7 +698,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 					klog.Warningf("GetStorageAccountFromSecret(%s, %s) failed with error: %v", secretName, secretNamespace, err)
 					if !getAccountKeyFromSecret && d.cloud.StorageAccountClient != nil && accountName != "" {
 						klog.V(2).Infof("use cluster identity to get account key from (%s, %s, %s)", subsID, rgName, accountName)
-						accountKey, err = d.cloud.GetStorageAccesskey(ctx, subsID, accountName, rgName)
+						accountKey, err = d.cloud.GetStorageAccesskey(ctx, subsID, accountName, rgName, getLatestAccountKey)
 						if err != nil {
 							klog.Errorf("GetStorageAccesskey(%s, %s, %s) failed with error: %v", subsID, rgName, accountName, err)
 						}
@@ -905,7 +911,7 @@ func (d *Driver) GetStorageAccesskey(ctx context.Context, accountOptions *azure.
 	_, accountKey, err := d.GetStorageAccountFromSecret(ctx, secretName, secretNamespace)
 	if err != nil {
 		klog.V(2).Infof("could not get account(%s) key from secret(%s), error: %v, use cluster identity to get account key instead", accountOptions.Name, secretName, err)
-		accountKey, err = d.cloud.GetStorageAccesskey(ctx, accountOptions.SubscriptionID, accountName, accountOptions.ResourceGroup)
+		accountKey, err = d.cloud.GetStorageAccesskey(ctx, accountOptions.SubscriptionID, accountName, accountOptions.ResourceGroup, accountOptions.GetLatestAccountKey)
 	}
 
 	if err == nil && accountKey != "" {
