@@ -90,7 +90,6 @@ func TestValidateControllerServiceRequest(t *testing.T) {
 			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 			csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 			csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
-			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		})
 
 	// Test controller service publish/unpublish is supported
@@ -109,8 +108,6 @@ func TestValidateControllerServiceRequest(t *testing.T) {
 	err = d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_GET_CAPACITY)
 	assert.NoError(t, err)
 
-	// Test controller service clone volumes is supported
-	err = d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CLONE_VOLUME)
 	assert.NoError(t, err)
 }
 

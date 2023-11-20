@@ -386,7 +386,6 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
-			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		})
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
