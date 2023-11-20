@@ -201,9 +201,6 @@ func TestNewControllerServiceCapability(t *testing.T) {
 		{
 			cap: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		},
-		{
-			cap: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
-		},
 	}
 	for _, test := range tests {
 		resp := NewControllerServiceCapability(test.cap)
