@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/url"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,8 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pborman/uuid"
 	"github.com/rubiojr/go-vhd/vhd"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +46,7 @@ import (
 
 	csicommon "sigs.k8s.io/azurefile-csi-driver/pkg/csi-common"
 	"sigs.k8s.io/azurefile-csi-driver/pkg/mounter"
+	fileutil "sigs.k8s.io/azurefile-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
@@ -60,6 +64,7 @@ const (
 	fileMode           = "file_mode"
 	dirMode            = "dir_mode"
 	actimeo            = "actimeo"
+	noResvPort         = "noresvport"
 	mfsymlinks         = "mfsymlinks"
 	defaultFileMode    = "0777"
 	defaultDirMode     = "0777"
@@ -73,6 +78,7 @@ const (
 	// Minimum size of Azure Premium Files is 100GiB
 	// See https://docs.microsoft.com/en-us/azure/storage/files/storage-files-planning#provisioned-shares
 	defaultAzureFileQuota = 100
+	minimumAccountQuota   = 100 // GB
 
 	// key of snapshot name in metadata
 	snapshotNameKey = "initiator"
@@ -135,6 +141,7 @@ const (
 	enableMultichannelField           = "enablemultichannel"
 	premium                           = "premium"
 	selectRandomMatchingAccountField  = "selectrandommatchingaccount"
+	accountQuotaField                 = "accountquota"
 
 	accountNotProvisioned = "StorageAccountIsNotProvisioned"
 	// this is a workaround fix for 429 throttling issue, will update cloud provider for better fix later
@@ -172,6 +179,9 @@ const (
 	SnapshotID       = "snapshot_id"
 
 	FSGroupChangeNone = "None"
+
+	waitForCopyInterval = 5 * time.Second
+	waitForCopyTimeout  = 3 * time.Minute
 )
 
 var (
@@ -204,6 +214,12 @@ type DriverOptions struct {
 	EnableWindowsHostProcess               bool
 	AppendClosetimeoOption                 bool
 	AppendNoShareSockOption                bool
+	AppendNoResvPortOption                 bool
+	AppendActimeoOption                    bool
+	SkipMatchingTagCacheExpireInMinutes    int
+	VolStatsCacheExpireInMinutes           int
+	PrintVolumeStatsCallLogs               bool
+	SasTokenExpirationMinutes              int
 }
 
 // Driver implements all interfaces of CSI drivers
@@ -227,6 +243,9 @@ type Driver struct {
 	enableWindowsHostProcess               bool
 	appendClosetimeoOption                 bool
 	appendNoShareSockOption                bool
+	appendNoResvPortOption                 bool
+	appendActimeoOption                    bool
+	printVolumeStatsCallLogs               bool
 	fileClient                             *azureFileClient
 	mounter                                *mount.SafeFormatAndMount
 	// lock per volume attach (only for vhd disk feature)
@@ -248,8 +267,16 @@ type Driver struct {
 	dataPlaneAPIAccountCache azcache.Resource
 	// a timed cache storing account search history (solve account list throttling issue)
 	accountSearchCache azcache.Resource
-	// a timed cache storing tag removing history (solve account update throttling issue)
-	removeTagCache azcache.Resource
+	// a timed cache storing whether skipMatchingTag is added or removed recently
+	skipMatchingTagCache azcache.Resource
+	// a timed cache when resize file share failed due to account limit exceeded
+	resizeFileShareFailureCache azcache.Resource
+	// a timed cache storing volume stats <volumeID, volumeStats>
+	volStatsCache azcache.Resource
+	// sas expiry time for azcopy in volume clone
+	sasTokenExpirationMinutes int
+	// azcopy for provide exec mock for ut
+	azcopy *fileutil.Azcopy
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -276,9 +303,14 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.enableWindowsHostProcess = options.EnableWindowsHostProcess
 	driver.appendClosetimeoOption = options.AppendClosetimeoOption
 	driver.appendNoShareSockOption = options.AppendNoShareSockOption
+	driver.appendNoResvPortOption = options.AppendNoResvPortOption
+	driver.appendActimeoOption = options.AppendActimeoOption
+	driver.printVolumeStatsCallLogs = options.PrintVolumeStatsCallLogs
+	driver.sasTokenExpirationMinutes = options.SasTokenExpirationMinutes
 	driver.volLockMap = newLockMap()
 	driver.subnetLockMap = newLockMap()
 	driver.volumeLocks = newVolumeLocks()
+	driver.azcopy = &fileutil.Azcopy{}
 
 	var err error
 	getter := func(key string) (interface{}, error) { return nil, nil }
@@ -291,7 +323,10 @@ func NewDriver(options *DriverOptions) *Driver {
 		klog.Fatalf("%v", err)
 	}
 
-	if driver.removeTagCache, err = azcache.NewTimedCache(3*time.Minute, getter, false); err != nil {
+	if options.SkipMatchingTagCacheExpireInMinutes <= 0 {
+		options.SkipMatchingTagCacheExpireInMinutes = 30 // default expire in 30 minutes
+	}
+	if driver.skipMatchingTagCache, err = azcache.NewTimedCache(time.Duration(options.SkipMatchingTagCacheExpireInMinutes)*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
@@ -300,6 +335,17 @@ func NewDriver(options *DriverOptions) *Driver {
 	}
 
 	if driver.dataPlaneAPIAccountCache, err = azcache.NewTimedCache(10*time.Minute, getter, false); err != nil {
+		klog.Fatalf("%v", err)
+	}
+
+	if driver.resizeFileShareFailureCache, err = azcache.NewTimedCache(3*time.Minute, getter, false); err != nil {
+		klog.Fatalf("%v", err)
+	}
+
+	if options.VolStatsCacheExpireInMinutes <= 0 {
+		options.VolStatsCacheExpireInMinutes = 10 // default expire in 10 minutes
+	}
+	if driver.volStatsCache, err = azcache.NewTimedCache(time.Duration(options.VolStatsCacheExpireInMinutes)*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
 
@@ -334,7 +380,6 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 	d.AddControllerServiceCapabilities(
 		[]csi.ControllerServiceCapability_RPC_Type{
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-			csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
@@ -434,7 +479,7 @@ func GetFileShareInfo(id string) (string, string, string, string, string, string
 }
 
 // check whether mountOptions contains file_mode, dir_mode, vers, if not, append default mode
-func appendDefaultMountOptions(mountOptions []string, appendNoShareSockOption, appendClosetimeoOption bool) []string {
+func appendDefaultCifsMountOptions(mountOptions []string, appendNoShareSockOption, appendClosetimeoOption bool) []string {
 	var defaultMountOptions = map[string]string{
 		fileMode:   defaultFileMode,
 		dirMode:    defaultDirMode,
@@ -461,6 +506,46 @@ func appendDefaultMountOptions(mountOptions []string, appendNoShareSockOption, a
 		// actimeo would set both acregmax and acdirmax, so we only need to check one of them
 		if strings.Contains(mountOption, "acregmax") || strings.Contains(mountOption, "acdirmax") {
 			included[actimeo] = true
+		}
+	}
+
+	allMountOptions := mountOptions
+
+	for k, v := range defaultMountOptions {
+		if _, isIncluded := included[k]; !isIncluded {
+			if v != "" {
+				allMountOptions = append(allMountOptions, fmt.Sprintf("%s=%s", k, v))
+			} else {
+				allMountOptions = append(allMountOptions, k)
+			}
+		}
+	}
+
+	return allMountOptions
+}
+
+// check whether mountOptions contains actimeo, if not, append default mode
+func appendDefaultNfsMountOptions(mountOptions []string, appendNoResvPortOption, appendActimeoOption bool) []string {
+	var defaultMountOptions = map[string]string{}
+	if appendNoResvPortOption {
+		defaultMountOptions[noResvPort] = ""
+	}
+	if appendActimeoOption {
+		defaultMountOptions[actimeo] = defaultActimeo
+	}
+
+	if len(defaultMountOptions) == 0 {
+		return mountOptions
+	}
+
+	// stores the mount options already included in mountOptions
+	included := make(map[string]bool)
+
+	for _, mountOption := range mountOptions {
+		for k := range defaultMountOptions {
+			if strings.HasPrefix(mountOption, k) {
+				included[k] = true
+			}
 		}
 	}
 
@@ -864,20 +949,94 @@ func (d *Driver) ResizeFileShare(ctx context.Context, subsID, resourceGroup, acc
 	})
 }
 
+// copyFileShare copies a fileshare in the same storage account
+func (d *Driver) copyFileShare(req *csi.CreateVolumeRequest, accountKey string, shareOptions *fileclient.ShareOptions, storageEndpointSuffix string) error {
+	if shareOptions.Protocol == storage.EnabledProtocolsNFS {
+		return fmt.Errorf("protocol nfs is not supported for volume cloning")
+	}
+	var sourceVolumeID string
+	if req.GetVolumeContentSource() != nil && req.GetVolumeContentSource().GetVolume() != nil {
+		sourceVolumeID = req.GetVolumeContentSource().GetVolume().GetVolumeId()
+	}
+	resourceGroupName, accountName, srcFileShareName, _, _, _, err := GetFileShareInfo(sourceVolumeID) //nolint:dogsled
+	if err != nil {
+		return status.Error(codes.NotFound, err.Error())
+	}
+	dstFileShareName := shareOptions.Name
+	if srcFileShareName == "" || dstFileShareName == "" {
+		return fmt.Errorf("srcFileShareName(%s) or dstFileShareName(%s) is empty", srcFileShareName, dstFileShareName)
+	}
+
+	klog.V(2).Infof("generate sas token for account(%s)", accountName)
+	accountSasToken, genErr := generateSASToken(accountName, accountKey, storageEndpointSuffix, d.sasTokenExpirationMinutes)
+	if genErr != nil {
+		return genErr
+	}
+
+	timeAfter := time.After(waitForCopyTimeout)
+	timeTick := time.Tick(waitForCopyInterval)
+	srcPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, srcFileShareName, accountSasToken)
+	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, dstFileShareName, accountSasToken)
+
+	jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName)
+	klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
+	if jobState == fileutil.AzcopyJobError || jobState == fileutil.AzcopyJobCompleted {
+		return err
+	}
+	klog.V(2).Infof("begin to copy fileshare %s to %s", srcFileShareName, dstFileShareName)
+	for {
+		select {
+		case <-timeTick:
+			jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName)
+			klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
+			switch jobState {
+			case fileutil.AzcopyJobError, fileutil.AzcopyJobCompleted:
+				return err
+			case fileutil.AzcopyJobNotFound:
+				klog.V(2).Infof("copy fileshare %s to %s", srcFileShareName, dstFileShareName)
+				out, copyErr := exec.Command("azcopy", "copy", srcPath, dstPath, "--recursive", "--check-length=false").CombinedOutput()
+				if copyErr != nil {
+					klog.Warningf("CopyFileShare(%s, %s, %s) failed with error(%v): %v", resourceGroupName, accountName, dstFileShareName, copyErr, string(out))
+				} else {
+					klog.V(2).Infof("copied fileshare %s to %s successfully", srcFileShareName, dstFileShareName)
+				}
+				return copyErr
+			}
+		case <-timeAfter:
+			return fmt.Errorf("timeout waiting for copy fileshare %s to %s succeed", srcFileShareName, dstFileShareName)
+		}
+	}
+}
+
+// GetTotalAccountQuota returns the total quota in GB of all file shares in the storage account and the number of file shares
+func (d *Driver) GetTotalAccountQuota(ctx context.Context, subsID, resourceGroup, accountName string) (int32, int32, error) {
+	fileshares, err := d.cloud.FileClient.WithSubscriptionID(subsID).ListFileShare(ctx, resourceGroup, accountName, "", "")
+	if err != nil {
+		return -1, -1, err
+	}
+	var totalQuotaGB int32
+	for _, fs := range fileshares {
+		if fs.ShareQuota != nil {
+			totalQuotaGB += *fs.ShareQuota
+		}
+	}
+	return totalQuotaGB, int32(len(fileshares)), nil
+}
+
 // RemoveStorageAccountTag remove tag from storage account
 func (d *Driver) RemoveStorageAccountTag(ctx context.Context, subsID, resourceGroup, account, key string) error {
 	// search in cache first
-	cache, err := d.removeTagCache.Get(account, azcache.CacheReadTypeDefault)
+	cache, err := d.skipMatchingTagCache.Get(account, azcache.CacheReadTypeDefault)
 	if err != nil {
 		return err
 	}
 	if cache != nil {
-		klog.V(6).Infof("skip remove tag(%s) on account(%s) subsID(%s) resourceGroup(%s) since tag already removed in a short time", key, account, subsID, resourceGroup)
+		klog.V(6).Infof("skip remove tag(%s) on account(%s) subsID(%s) resourceGroup(%s) since tag is added or removed in a short time", key, account, subsID, resourceGroup)
 		return nil
 	}
 
 	klog.V(2).Infof("remove tag(%s) on account(%s) subsID(%s), resourceGroup(%s)", key, account, subsID, resourceGroup)
-	defer d.removeTagCache.Set(account, key)
+	defer d.skipMatchingTagCache.Set(account, "")
 	if rerr := d.cloud.RemoveStorageAccountTag(ctx, subsID, resourceGroup, account, key); rerr != nil {
 		return rerr.Error()
 	}

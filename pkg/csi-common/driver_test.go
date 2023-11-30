@@ -108,6 +108,7 @@ func TestValidateControllerServiceRequest(t *testing.T) {
 	err = d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_GET_CAPACITY)
 	assert.NoError(t, err)
 
+	assert.NoError(t, err)
 }
 
 func TestValidateNodeServiceRequest(t *testing.T) {

@@ -179,6 +179,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			"skuName":                     "Premium_LRS",
 			"enableMultichannel":          "true",
 			"selectRandomMatchingAccount": "true",
+			"accountQuota":                "200",
 		}
 		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
 			CSIDriver:              testDriver,
@@ -229,7 +230,6 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				Cmd: convertToPowershellCommandIfNecessary("while true; do echo $(date -u) >> /mnt/test-1/data; sleep 100; done"),
 				Volumes: []testsuites.VolumeDetails{
 					{
-						FSType:    "ext3",
 						ClaimSize: "10Gi",
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -244,7 +244,6 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				Cmd: convertToPowershellCommandIfNecessary("while true; do echo $(date -u) >> /mnt/test-1/data; sleep 100; done"),
 				Volumes: []testsuites.VolumeDetails{
 					{
-						FSType:    "ext4",
 						ClaimSize: "10Gi",
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -525,7 +524,6 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				Cmd: "while true; do echo $(date -u) >> /mnt/test-1/data; sleep 100; done",
 				Volumes: []testsuites.VolumeDetails{
 					{
-						FSType:    "ext3",
 						ClaimSize: "10Gi",
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -538,7 +536,6 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				Cmd: convertToPowershellCommandIfNecessary("while true; do echo $(date -u) >> /mnt/test-1/data; sleep 100; done"),
 				Volumes: []testsuites.VolumeDetails{
 					{
-						FSType:    "ext4",
 						ClaimSize: "10Gi",
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -554,7 +551,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			CSIDriver:              testDriver,
 			Pods:                   pods,
 			ColocatePods:           true,
-			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "fsType": "xfs"},
+			StorageClassParameters: map[string]string{"skuName": "Premium_LRS"},
 		}
 		test.Run(ctx, cs, ns)
 	})
@@ -688,6 +685,37 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test := testsuites.DynamicallyProvisionedPodWithMultiplePVsTest{
 			CSIDriver: testDriver,
 			Pods:      pods,
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should create a pod with multiple volumes with accountQuota setting [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
+		skipIfUsingInTreeVolumePlugin()
+
+		volumes := []testsuites.VolumeDetails{}
+		for i := 1; i <= 6; i++ {
+			volume := testsuites.VolumeDetails{
+				ClaimSize: "100Gi",
+				VolumeMount: testsuites.VolumeMountDetails{
+					NameGenerate:      "test-volume-",
+					MountPathGenerate: "/mnt/test-",
+				},
+			}
+			volumes = append(volumes, volume)
+		}
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd:          convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes:      volumes,
+				IsWindows:    isWindowsCluster,
+				WinServerVer: winServerVer,
+			},
+		}
+		test := testsuites.DynamicallyProvisionedPodWithMultiplePVsTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: map[string]string{"skuName": "Premium_LRS", "accountQuota": "200"},
 		}
 		test.Run(ctx, cs, ns)
 	})
@@ -1216,6 +1244,8 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 							"nconnect=4",
 							"rsize=1048576",
 							"wsize=1048576",
+							"noresvport",
+							"actimeo=30",
 						},
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -1254,6 +1284,8 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 							"nconnect=4",
 							"rsize=1048576",
 							"wsize=1048576",
+							"noresvport",
+							"actimeo=30",
 						},
 						VolumeMount: testsuites.VolumeMountDetails{
 							NameGenerate:      "test-volume-",
@@ -1325,10 +1357,11 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 
 		// print azure file driver logs before driver restart
 		azurefileLog := testCmd{
-			command:  "bash",
-			args:     []string{"test/utils/azurefile_log.sh"},
-			startLog: "===================azurefile log (before restart)===================",
-			endLog:   "====================================================================",
+			command:     "bash",
+			args:        []string{"test/utils/azurefile_log.sh"},
+			startLog:    "===================azurefile log (before restart)===================",
+			endLog:      "====================================================================",
+			ignoreError: true,
 		}
 		execTestCmd([]testCmd{azurefileLog})
 
@@ -1413,6 +1446,68 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 					endLog:   "Restart driver node daemonset done successfully",
 				}
 				execTestCmd([]testCmd{restartDriver})
+			},
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should clone a volume from an existing volume [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
+		skipIfTestingInWindowsCluster()
+		skipIfTestingInMigrationCluster()
+		skipIfUsingInTreeVolumePlugin()
+
+		pod := testsuites.PodDetails{
+			Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data",
+			Volumes: []testsuites.VolumeDetails{
+				{
+					ClaimSize: "10Gi",
+					VolumeMount: testsuites.VolumeMountDetails{
+						NameGenerate:      "test-volume-",
+						MountPathGenerate: "/mnt/test-",
+					},
+				},
+			},
+		}
+		podWithClonedVolume := testsuites.PodDetails{
+			Cmd: "grep 'hello world' /mnt/test-1/data",
+		}
+		test := testsuites.DynamicallyProvisionedVolumeCloningTest{
+			CSIDriver:           testDriver,
+			Pod:                 pod,
+			PodWithClonedVolume: podWithClonedVolume,
+			StorageClassParameters: map[string]string{
+				"skuName": "Standard_LRS",
+			},
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should clone a large size volume from an existing volume [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
+		skipIfTestingInWindowsCluster()
+		skipIfTestingInMigrationCluster()
+		skipIfUsingInTreeVolumePlugin()
+
+		pod := testsuites.PodDetails{
+			Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data && dd if=/dev/zero of=/mnt/test-1/test bs=99G count=5",
+			Volumes: []testsuites.VolumeDetails{
+				{
+					ClaimSize: "100Gi",
+					VolumeMount: testsuites.VolumeMountDetails{
+						NameGenerate:      "test-volume-",
+						MountPathGenerate: "/mnt/test-",
+					},
+				},
+			},
+		}
+		podWithClonedVolume := testsuites.PodDetails{
+			Cmd: "grep 'hello world' /mnt/test-1/data",
+		}
+		test := testsuites.DynamicallyProvisionedVolumeCloningTest{
+			CSIDriver:           testDriver,
+			Pod:                 pod,
+			PodWithClonedVolume: podWithClonedVolume,
+			StorageClassParameters: map[string]string{
+				"skuName": "Standard_LRS",
 			},
 		}
 		test.Run(ctx, cs, ns)

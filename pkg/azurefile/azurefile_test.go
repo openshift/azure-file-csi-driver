@@ -29,6 +29,8 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
+	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/client-go/kubernetes/fake"
@@ -63,6 +65,11 @@ func NewFakeDriver() *Driver {
 			},
 		},
 	}
+	driver.AddControllerServiceCapabilities(
+		[]csi.ControllerServiceCapability_RPC_Type{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		})
 	return driver
 }
 
@@ -78,6 +85,10 @@ func NewFakeDriverCustomOptions(opts DriverOptions) *Driver {
 			},
 		},
 	}
+	driver.AddControllerServiceCapabilities(
+		[]csi.ControllerServiceCapability_RPC_Type{
+			csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+		})
 	return driver
 }
 
@@ -90,7 +101,7 @@ func TestNewFakeDriver(t *testing.T) {
 	assert.NotNil(t, d)
 }
 
-func TestAppendDefaultMountOptions(t *testing.T) {
+func TestAppendDefaultCifsMountOptions(t *testing.T) {
 	tests := []struct {
 		options                 []string
 		appendClosetimeoOption  bool
@@ -220,12 +231,56 @@ func TestAppendDefaultMountOptions(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		result := appendDefaultMountOptions(test.options, test.appendNoShareSockOption, test.appendClosetimeoOption)
+		result := appendDefaultCifsMountOptions(test.options, test.appendNoShareSockOption, test.appendClosetimeoOption)
 		sort.Strings(result)
 		sort.Strings(test.expected)
 
 		if !reflect.DeepEqual(result, test.expected) {
-			t.Errorf("input: %q, appendDefaultMountOptions result: %q, expected: %q", test.options, result, test.expected)
+			t.Errorf("input: %q, appendDefaultCifsMountOptions result: %q, expected: %q", test.options, result, test.expected)
+		}
+	}
+}
+
+func TestAppendDefaultNfsMountOptions(t *testing.T) {
+	tests := []struct {
+		options                []string
+		appendNoResvPortOption bool
+		appendActimeoOption    bool
+		expected               []string
+	}{
+		{
+			options:                []string{""},
+			appendNoResvPortOption: false,
+			appendActimeoOption:    false,
+			expected:               []string{""},
+		},
+		{
+			options:                []string{},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, defaultActimeo), noResvPort},
+		},
+		{
+			options:                []string{noResvPort},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, defaultActimeo), noResvPort},
+		},
+		{
+			options:                []string{fmt.Sprintf("%s=%s", actimeo, "60")},
+			appendNoResvPortOption: true,
+			appendActimeoOption:    true,
+			expected:               []string{fmt.Sprintf("%s=%s", actimeo, "60"), noResvPort},
+		},
+	}
+
+	for _, test := range tests {
+		result := appendDefaultNfsMountOptions(test.options, test.appendNoResvPortOption, test.appendActimeoOption)
+		sort.Strings(result)
+		sort.Strings(test.expected)
+
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("input: %q, appendDefaultNfsMountOptions result: %q, expected: %q", test.options, result, test.expected)
 		}
 	}
 }
@@ -1272,5 +1327,70 @@ func TestGetSubnetResourceID(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestGetTotalAccountQuota(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &azure.Cloud{}
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	fileShareItemsWithQuota := []storage.FileShareItem{
+		{
+			FileShareProperties: &storage.FileShareProperties{
+				ShareQuota: to.Int32Ptr(100),
+			},
+		},
+		{
+			FileShareProperties: &storage.FileShareProperties{
+				ShareQuota: to.Int32Ptr(200),
+			},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		subsID           string
+		resourceGroup    string
+		accountName      string
+		fileShareItems   []storage.FileShareItem
+		listFileShareErr error
+		expectedQuota    int32
+		expectedShareNum int32
+		expectedErr      error
+	}{
+		{
+			name:             "GetTotalAccountQuota success",
+			expectedQuota:    0,
+			expectedShareNum: 0,
+		},
+		{
+			name:             "GetTotalAccountQuota success (with 2 file shares)",
+			fileShareItems:   fileShareItemsWithQuota,
+			expectedQuota:    300,
+			expectedShareNum: 2,
+		},
+		{
+			name:             "list file share error",
+			listFileShareErr: fmt.Errorf("list file share error"),
+			expectedQuota:    -1,
+			expectedShareNum: -1,
+			expectedErr:      fmt.Errorf("list file share error"),
+		},
+	}
+
+	for _, test := range tests {
+		mockFileClient := mockfileclient.NewMockInterface(ctrl)
+		d.cloud.FileClient = mockFileClient
+
+		mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
+		mockFileClient.EXPECT().ListFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.fileShareItems, test.listFileShareErr).AnyTimes()
+
+		quota, fileShareNum, err := d.GetTotalAccountQuota(context.TODO(), test.subsID, test.resourceGroup, test.accountName)
+		assert.Equal(t, test.expectedErr, err, test.name)
+		assert.Equal(t, test.expectedQuota, quota, test.name)
+		assert.Equal(t, test.expectedShareNum, fileShareNum, test.name)
 	}
 }

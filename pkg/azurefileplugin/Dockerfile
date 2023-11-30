@@ -12,14 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.15.1
+FROM registry.k8s.io/build-image/debian-base:bookworm-v1.0.0
 
 ARG ARCH=amd64
 ARG binary=./_output/${ARCH}/azurefileplugin
 COPY ${binary} /azurefileplugin
 
-RUN apk upgrade --available --no-cache && \
-    apk add --no-cache ca-certificates cifs-utils util-linux e2fsprogs-extra udev xfsprogs-extra nfs-utils
+RUN apt update && apt upgrade -y && apt-mark unhold libcap2 && clean-install ca-certificates cifs-utils util-linux e2fsprogs mount udev xfsprogs nfs-common netbase wget
+
+# install azcopy
+ARG azcopyURL=https://azcopyvnext.azureedge.net/releases/release-10.21.2-20231106/azcopy_linux_amd64_10.21.2.tar.gz
+RUN if [ "$ARCH" == "arm64" ] ; then \
+  azcopyURL=https://azcopyvnext.azureedge.net/releases/release-10.21.2-20231106/azcopy_linux_arm64_10.21.2.tar.gz; fi
+RUN wget -O azcopy.tar.gz ${azcopyURL} && \
+  tar xvzf azcopy.tar.gz -C . && rm azcopy.tar.gz && \
+  mv ./azcopy_linux_$ARCH_*/azcopy /usr/local/bin/azcopy && \
+  rm -rf ./azcopy_linux_$ARCH_*
+RUN chmod +x /usr/local/bin/azcopy
+RUN apt remove wget -y
 
 LABEL maintainers="andyzhangx"
 LABEL description="AzureFile CSI Driver"

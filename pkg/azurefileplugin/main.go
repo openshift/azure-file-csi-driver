@@ -59,6 +59,12 @@ var (
 	enableWindowsHostProcess               = flag.Bool("enable-windows-host-process", false, "enable windows host process")
 	appendClosetimeoOption                 = flag.Bool("append-closetimeo-option", false, "Whether appending closetimeo=0 option to smb mount command")
 	appendNoShareSockOption                = flag.Bool("append-nosharesock-option", true, "Whether appending nosharesock option to smb mount command")
+	appendNoResvPortOption                 = flag.Bool("append-noresvport-option", true, "Whether appending noresvport option to nfs mount command")
+	appendActimeoOption                    = flag.Bool("append-actimeo-option", true, "Whether appending actimeo=0 option to nfs mount command")
+	skipMatchingTagCacheExpireInMinutes    = flag.Int("skip-matching-tag-cache-expire-in-minutes", 30, "The cache expire time in minutes for skipMatchingTagCache")
+	volStatsCacheExpireInMinutes           = flag.Int("vol-stats-cache-expire-in-minutes", 10, "The cache expire time in minutes for volume stats cache")
+	printVolumeStatsCallLogs               = flag.Bool("print-volume-stats-call-logs", false, "Whether to print volume statfs call logs with log level 2")
+	sasTokenExpirationMinutes              = flag.Int("sas-token-expiration-minutes", 1440, "sas token expiration minutes during volume cloning")
 )
 
 func main() {
@@ -103,6 +109,12 @@ func handle() {
 		EnableWindowsHostProcess:               *enableWindowsHostProcess,
 		AppendClosetimeoOption:                 *appendClosetimeoOption,
 		AppendNoShareSockOption:                *appendNoShareSockOption,
+		AppendNoResvPortOption:                 *appendNoResvPortOption,
+		AppendActimeoOption:                    *appendActimeoOption,
+		SkipMatchingTagCacheExpireInMinutes:    *skipMatchingTagCacheExpireInMinutes,
+		VolStatsCacheExpireInMinutes:           *volStatsCacheExpireInMinutes,
+		PrintVolumeStatsCallLogs:               *printVolumeStatsCallLogs,
+		SasTokenExpirationMinutes:              *sasTokenExpirationMinutes,
 	}
 	driver := azurefile.NewDriver(&driverOptions)
 	if driver == nil {
@@ -123,7 +135,7 @@ func exportMetrics() {
 	serve(context.Background(), l, serveMetrics)
 }
 
-func serve(ctx context.Context, l net.Listener, serveFunc func(net.Listener) error) {
+func serve(_ context.Context, l net.Listener, serveFunc func(net.Listener) error) {
 	path := l.Addr().String()
 	klog.V(2).Infof("set up prometheus server on %v", path)
 	go func() {

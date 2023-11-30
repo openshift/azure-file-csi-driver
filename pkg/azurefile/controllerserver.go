@@ -26,6 +26,8 @@ import (
 
 	volumehelper "sigs.k8s.io/azurefile-csi-driver/pkg/util"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/service"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	"github.com/Azure/azure-storage-file-go/azfile"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -77,6 +79,7 @@ var (
 			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
 		},
 	}
+	skipMatchingTag = map[string]*string{azure.SkipMatchingTag: pointer.String("")}
 )
 
 // CreateVolume provisions an azure file
@@ -103,6 +106,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	if acquired := d.volumeLocks.TryAcquire(volName); !acquired {
+		// logging the job status if it's volume cloning
+		if req.GetVolumeContentSource() != nil {
+			jobState, percent, err := d.azcopy.GetAzcopyJob(volName)
+			klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
+		}
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volName)
 	}
 	defer d.volumeLocks.Release(volName)
@@ -123,6 +131,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	// store account key to k8s secret by default
 	storeAccountKey := true
 
+	var accountQuota int32
 	// Apply ProvisionerParameters (case-insensitive). We leave validation of
 	// the values to the cloud provider.
 	for k, v := range parameters {
@@ -245,6 +254,12 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid %s: %s in storage class", getLatestAccountKeyField, v))
 			}
 			getLatestAccountKey = value
+		case accountQuotaField:
+			value, err := strconv.ParseInt(v, 10, 32)
+			if err != nil || value < minimumAccountQuota {
+				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid accountQuota %s in storage class, minimum quota: %d", v, minimumAccountQuota))
+			}
+			accountQuota = int32(value)
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid parameter %q in storage class", k))
 		}
@@ -306,9 +321,9 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	enableHTTPSTrafficOnly := true
 	shareProtocol := storage.EnabledProtocolsSMB
-	createPrivateEndpoint := false
+	var createPrivateEndpoint *bool
 	if strings.EqualFold(networkEndpointType, privateEndpoint) {
-		createPrivateEndpoint = true
+		createPrivateEndpoint = pointer.BoolPtr(true)
 	}
 	var vnetResourceIDs []string
 	if fsType == nfs || protocol == nfs {
@@ -321,10 +336,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		shareProtocol = storage.EnabledProtocolsNFS
 		// NFS protocol does not need account key
 		storeAccountKey = false
-		// reset protocol field (compatble with "fsType: nfs")
+		// reset protocol field (compatible with "fsType: nfs")
 		setKeyValueInMap(parameters, protocolField, protocol)
 
-		if !createPrivateEndpoint {
+		if !pointer.BoolDeref(createPrivateEndpoint, false) {
 			// set VirtualNetworkResourceIDs for storage account firewall setting
 			vnetResourceID := d.getSubnetResourceID(vnetResourceGroup, vnetName, subnetName)
 			klog.V(2).Infof("set vnetResourceID(%s) for NFS protocol", vnetResourceID)
@@ -344,7 +359,22 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
+	if resourceGroup == "" {
+		resourceGroup = d.cloud.ResourceGroup
+	}
+
 	fileShareSize := int(requestGiB)
+
+	if account != "" && resourceGroup != "" && sku == "" && fileShareSize < minimumPremiumShareSize {
+		accountProperties, err := d.cloud.StorageAccountClient.GetProperties(ctx, subsID, resourceGroup, account)
+		if err != nil {
+			klog.Warningf("failed to get properties on storage account account(%s) rg(%s), error: %v", account, resourceGroup, err)
+		}
+		if accountProperties.Sku != nil {
+			sku = string(accountProperties.Sku.Name)
+		}
+	}
+
 	// account kind should be FileStorage for Premium File
 	accountKind := string(storage.KindStorageV2)
 	if strings.HasPrefix(strings.ToLower(sku), premium) {
@@ -370,10 +400,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			}
 		}
 		validFileShareName = getValidFileShareName(name)
-	}
-
-	if resourceGroup == "" {
-		resourceGroup = d.cloud.ResourceGroup
 	}
 
 	tags, err := ConvertTagsToMap(customTags)
@@ -420,6 +446,22 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		GetLatestAccountKey:                     getLatestAccountKey,
 	}
 
+	var volumeID string
+	requestName := "controller_create_volume"
+	if req.GetVolumeContentSource() != nil {
+		switch req.VolumeContentSource.Type.(type) {
+		case *csi.VolumeContentSource_Snapshot:
+			requestName = "controller_create_volume_from_snapshot"
+		case *csi.VolumeContentSource_Volume:
+			requestName = "controller_create_volume_from_volume"
+		}
+	}
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, requestName, d.cloud.ResourceGroup, subsID, d.Name)
+	isOperationSucceeded := false
+	defer func() {
+		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
+	}()
+
 	var accountKey, lockKey string
 	accountName := account
 	if len(req.GetSecrets()) == 0 && accountName == "" {
@@ -427,14 +469,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			accountName = v.(string)
 		} else {
 			lockKey = fmt.Sprintf("%s%s%s%s%s%s%s%v%v%v%v%v", sku, accountKind, resourceGroup, location, protocol, subsID, accountAccessTier,
-				createPrivateEndpoint, pointer.BoolDeref(allowBlobPublicAccess, false), pointer.BoolDeref(requireInfraEncryption, false),
+				pointer.BoolDeref(createPrivateEndpoint, false), pointer.BoolDeref(allowBlobPublicAccess, false), pointer.BoolDeref(requireInfraEncryption, false),
 				pointer.BoolDeref(enableLFS, false), pointer.BoolDeref(disableDeleteRetentionPolicy, false))
 			// search in cache first
 			cache, err := d.accountSearchCache.Get(lockKey, azcache.CacheReadTypeDefault)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, err.Error())
 			}
-			if cache != nil && !selectRandomMatchingAccount {
+			if cache != nil {
 				accountName = cache.(string)
 			} else {
 				d.volLockMap.LockEntry(lockKey)
@@ -452,6 +494,22 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 				if err != nil {
 					return nil, status.Errorf(codes.Internal, "failed to ensure storage account: %v", err)
 				}
+				if accountQuota > minimumAccountQuota {
+					totalQuotaGB, fileshareNum, err := d.GetTotalAccountQuota(ctx, subsID, resourceGroup, accountName)
+					if err != nil {
+						return nil, status.Errorf(codes.Internal, "failed to get total quota on account(%s), error: %v", accountName, err)
+					}
+					klog.V(2).Infof("total used quota on account(%s) is %d GB, file share number: %d", accountName, totalQuotaGB, fileshareNum)
+					if totalQuotaGB > accountQuota {
+						klog.Warningf("account(%s) used quota(%d GB) is over %d GB, skip matching current account", accountName, totalQuotaGB, accountQuota)
+						if rerr := d.cloud.AddStorageAccountTags(ctx, subsID, resourceGroup, accountName, skipMatchingTag); rerr != nil {
+							klog.Warningf("AddStorageAccountTags(%v) on account(%s) subsID(%s) rg(%s) failed with error: %v", tags, accountName, subsID, resourceGroup, rerr.Error())
+						}
+						// release volume lock first to prevent deadlock
+						d.volumeLocks.Release(volName)
+						return d.CreateVolume(ctx, req)
+					}
+				}
 				d.accountSearchCache.Set(lockKey, accountName)
 				d.volMap.Store(volName, accountName)
 				if accountKey != "" {
@@ -461,7 +519,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 	}
 
-	if createPrivateEndpoint {
+	if pointer.BoolDeref(createPrivateEndpoint, false) {
 		setKeyValueInMap(parameters, serverNameField, fmt.Sprintf("%s.privatelink.file.%s", accountName, storageEndpointSuffix))
 	}
 
@@ -491,38 +549,41 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		RootSquash: rootSquashType,
 	}
 
-	var volumeID string
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_create_volume", d.cloud.ResourceGroup, subsID, d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
-	}()
-
 	klog.V(2).Infof("begin to create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d) protocol(%s)", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, shareProtocol)
 	if err := d.CreateFileShare(ctx, accountOptions, shareOptions, secret); err != nil {
 		if strings.Contains(err.Error(), accountLimitExceedManagementAPI) || strings.Contains(err.Error(), accountLimitExceedDataPlaneAPI) {
 			klog.Warningf("create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d), error: %v, skip matching current account", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, err)
-			tags := map[string]*string{
-				azure.SkipMatchingTag: pointer.String(""),
-			}
-			if rerr := d.cloud.AddStorageAccountTags(ctx, subsID, resourceGroup, accountName, tags); rerr != nil {
+			if rerr := d.cloud.AddStorageAccountTags(ctx, subsID, resourceGroup, accountName, skipMatchingTag); rerr != nil {
 				klog.Warningf("AddStorageAccountTags(%v) on account(%s) subsID(%s) rg(%s) failed with error: %v", tags, accountName, subsID, resourceGroup, rerr.Error())
 			}
+			// do not remove skipMatchingTag in a period of time
+			d.skipMatchingTagCache.Set(accountName, "")
 			// release volume lock first to prevent deadlock
 			d.volumeLocks.Release(volName)
 			// clean search cache
 			if err := d.accountSearchCache.Delete(lockKey); err != nil {
 				return nil, status.Errorf(codes.Internal, err.Error())
 			}
-			// remove the volName from the volMap to stop it matching the same storage account
+			// remove the volName from the volMap to stop matching the same storage account
 			d.volMap.Delete(volName)
 			return d.CreateVolume(ctx, req)
 		}
 		return nil, status.Errorf(codes.Internal, "failed to create file share(%s) on account(%s) type(%s) subsID(%s) rg(%s) location(%s) size(%d), error: %v", validFileShareName, account, sku, subsID, resourceGroup, location, fileShareSize, err)
 	}
+	if req.GetVolumeContentSource() != nil {
+		accountKeyCopy, err := d.GetStorageAccesskey(ctx, accountOptions, req.GetSecrets(), secretName, secretNamespace)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to GetStorageAccesskey on account(%s) rg(%s), error: %v", accountOptions.Name, accountOptions.ResourceGroup, err)
+		}
+		if err := d.copyVolume(req, accountKeyCopy, shareOptions, storageEndpointSuffix); err != nil {
+			return nil, err
+		}
+		// storeAccountKey is not needed here since copy volume is only using SAS token
+		storeAccountKey = false
+	}
 	klog.V(2).Infof("create file share %s on storage account %s successfully", validFileShareName, accountName)
 
-	if isDiskFsType(fsType) && !strings.HasSuffix(diskName, vhdSuffix) {
+	if isDiskFsType(fsType) && !strings.HasSuffix(diskName, vhdSuffix) && req.GetVolumeContentSource() == nil {
 		if accountKey == "" {
 			if accountKey, err = d.GetStorageAccesskey(ctx, accountOptions, req.GetSecrets(), secretName, secretNamespace); err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to GetStorageAccesskey on account(%s) rg(%s), error: %v", accountOptions.Name, accountOptions.ResourceGroup, err)
@@ -596,6 +657,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			VolumeId:      volumeID,
 			CapacityBytes: capacityBytes,
 			VolumeContext: parameters,
+			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil
 }
@@ -663,6 +725,19 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
+// copyVolume copy an azure file
+func (d *Driver) copyVolume(req *csi.CreateVolumeRequest, accountKey string, shareOptions *fileclient.ShareOptions, storageEndpointSuffix string) error {
+	vs := req.VolumeContentSource
+	switch vs.Type.(type) {
+	case *csi.VolumeContentSource_Snapshot:
+		return status.Errorf(codes.InvalidArgument, "copy volume from volumeSnapshot is not supported")
+	case *csi.VolumeContentSource_Volume:
+		return d.copyFileShare(req, accountKey, shareOptions, storageEndpointSuffix)
+	default:
+		return status.Errorf(codes.InvalidArgument, "%v is not a proper volume source", vs)
+	}
+}
+
 // ControllerGetVolume get volume
 func (d *Driver) ControllerGetVolume(context.Context, *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
@@ -709,19 +784,19 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 }
 
 // ControllerGetCapabilities returns the capabilities of the Controller plugin
-func (d *Driver) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
+func (d *Driver) ControllerGetCapabilities(_ context.Context, _ *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
 	return &csi.ControllerGetCapabilitiesResponse{
 		Capabilities: d.Cap,
 	}, nil
 }
 
 // GetCapacity returns the capacity of the total available storage pool
-func (d *Driver) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
+func (d *Driver) GetCapacity(_ context.Context, _ *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // ListVolumes return all available volumes
-func (d *Driver) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
+func (d *Driver) ListVolumes(_ context.Context, _ *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
@@ -921,7 +996,11 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		itemSnapshotTime = properties.LastModified()
 		itemSnapshotQuota = properties.Quota()
 	} else {
-		snapshotShare, err := d.cloud.FileClient.WithSubscriptionID(subsID).CreateFileShare(ctx, rgName, accountName, &fileclient.ShareOptions{Name: fileShareName, RequestGiB: defaultAzureFileQuota, Metadata: map[string]*string{snapshotNameKey: &snapshotName}}, snapshotsExpand)
+		fileshare, err := d.cloud.FileClient.WithSubscriptionID(subsID).GetFileShare(ctx, rgName, accountName, fileShareName, "")
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "get fileshare from(%s) failed with %v, accountName: %q", sourceVolumeID, err, accountName)
+		}
+		snapshotShare, err := d.cloud.FileClient.WithSubscriptionID(subsID).CreateFileShare(ctx, rgName, accountName, &fileclient.ShareOptions{Name: fileShareName, RequestGiB: int(pointer.Int32Deref(fileshare.ShareQuota, defaultAzureFileQuota)), Metadata: map[string]*string{snapshotNameKey: &snapshotName}}, snapshotsExpand)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "create snapshot from(%s) failed with %v, accountName: %q", sourceVolumeID, err, accountName)
 		}
@@ -1005,7 +1084,7 @@ func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequ
 }
 
 // ListSnapshots list all snapshots (todo)
-func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+func (d *Driver) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
@@ -1039,6 +1118,16 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 		subsID = d.cloud.SubscriptionID
 	}
 
+	if accountName != "" {
+		cache, err := d.resizeFileShareFailureCache.Get(accountName, azcache.CacheReadTypeDefault)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "resizeFileShareFailureCache(%s) failed with error: %v", accountName, err)
+		}
+		if cache != nil {
+			return nil, status.Errorf(codes.Internal, "account(%s) is in %s, wait for a few minutes to retry", accountName, accountLimitExceedManagementAPI)
+		}
+	}
+
 	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_expand_volume", resourceGroupName, subsID, d.Name)
 	isOperationSucceeded := false
 	defer func() {
@@ -1060,6 +1149,11 @@ func (d *Driver) ControllerExpandVolume(ctx context.Context, req *csi.Controller
 	}
 
 	if err = d.ResizeFileShare(ctx, subsID, resourceGroupName, accountName, fileShareName, int(requestGiB), secrets); err != nil {
+		if strings.Contains(err.Error(), accountLimitExceedManagementAPI) || strings.Contains(err.Error(), accountLimitExceedDataPlaneAPI) {
+			if accountName != "" {
+				d.resizeFileShareFailureCache.Set(accountName, "")
+			}
+		}
 		return nil, status.Errorf(codes.Internal, "expand volume error: %v", err)
 	}
 
@@ -1204,4 +1298,28 @@ func isValidVolumeCapabilities(volCaps []*csi.VolumeCapability) error {
 		}
 	}
 	return nil
+}
+
+func generateSASToken(accountName, accountKey, storageEndpointSuffix string, expiryTime int) (string, error) {
+	credential, err := service.NewSharedKeyCredential(accountName, accountKey)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, fmt.Sprintf("failed to generate sas token in creating new shared key credential, accountName: %s, err: %s", accountName, err.Error()))
+	}
+	serviceClient, err := service.NewClientWithSharedKeyCredential(fmt.Sprintf("https://%s.file.%s/", accountName, storageEndpointSuffix), credential, nil)
+	if err != nil {
+		return "", status.Errorf(codes.Internal, fmt.Sprintf("failed to generate sas token in creating new client with shared key credential, accountName: %s, err: %s", accountName, err.Error()))
+	}
+	nowTime := time.Now()
+	sasURL, err := serviceClient.GetSASURL(
+		sas.AccountResourceTypes{Object: true, Service: true, Container: true},
+		sas.AccountPermissions{Read: true, List: true, Write: true},
+		time.Now().Add(time.Duration(expiryTime)*time.Minute), &service.GetSASURLOptions{StartTime: &nowTime})
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(sasURL)
+	if err != nil {
+		return "", err
+	}
+	return "?" + u.RawQuery, nil
 }

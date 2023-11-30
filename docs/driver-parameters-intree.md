@@ -1,5 +1,6 @@
 ## Driver Parameters
-in-tree [kubernetes.io/azure-file](https://kubernetes.io/docs/concepts/storage/volumes/#azurefile) driver parameters
+
+ - in-tree [kubernetes.io/azure-file](https://kubernetes.io/docs/concepts/storage/volumes/#azurefile) driver parameters
 
 ### Dynamic Provision
 
