@@ -4,3 +4,4 @@
 exclude:
   global:
     - vendor/**
+    - hack/boilerplate/boilerplate.py
