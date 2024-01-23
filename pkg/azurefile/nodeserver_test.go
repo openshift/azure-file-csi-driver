@@ -28,8 +28,6 @@ import (
 	"syscall"
 	"testing"
 
-	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
-
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -38,7 +36,7 @@ import (
 	mount "k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
-
+	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
@@ -525,7 +523,7 @@ func TestNodeStageVolume(t *testing.T) {
 		{
 			desc: "[Error] Volume operation in progress",
 			setup: func() {
-				d.volumeLocks.TryAcquire("vol_1##")
+				d.volumeLocks.TryAcquire(fmt.Sprintf("%s-%s", "vol_1##", sourceTest))
 			},
 			req: csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
 				VolumeCapability: &stdVolCap,
@@ -535,7 +533,7 @@ func TestNodeStageVolume(t *testing.T) {
 				DefaultError: status.Error(codes.Aborted, fmt.Sprintf(volumeOperationAlreadyExistsFmt, "vol_1##")),
 			},
 			cleanup: func() {
-				d.volumeLocks.Release("vol_1##")
+				d.volumeLocks.Release(fmt.Sprintf("%s-%s", "vol_1##", sourceTest))
 			},
 		},
 		{
@@ -784,14 +782,14 @@ func TestNodeUnstageVolume(t *testing.T) {
 		{
 			desc: "[Error] Volume operation in progress",
 			setup: func() {
-				d.volumeLocks.TryAcquire("vol_1")
+				d.volumeLocks.TryAcquire(fmt.Sprintf("%s-%s", "vol_1", targetFile))
 			},
 			req: csi.NodeUnstageVolumeRequest{StagingTargetPath: targetFile, VolumeId: "vol_1"},
 			expectedErr: testutil.TestError{
 				DefaultError: status.Error(codes.Aborted, fmt.Sprintf(volumeOperationAlreadyExistsFmt, "vol_1")),
 			},
 			cleanup: func() {
-				d.volumeLocks.Release("vol_1")
+				d.volumeLocks.Release(fmt.Sprintf("%s-%s", "vol_1", targetFile))
 			},
 		},
 		{
