@@ -26,8 +26,8 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 
 	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
@@ -172,7 +172,7 @@ users:
 			}
 			os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 		}
-		cloud, err := getCloudProvider(test.kubeconfig, "", "", "", test.userAgent, test.allowEmptyCloudConfig, false, 5, 10)
+		cloud, err := getCloudProvider(context.Background(), test.kubeconfig, "", "", "", test.userAgent, test.allowEmptyCloudConfig, false, 5, 10)
 		if !testutil.AssertError(err, &test.expectedErr) && !strings.Contains(err.Error(), test.expectedErr.DefaultError.Error()) {
 			t.Errorf("desc: %s,\n input: %q, getCloudProvider err: %v, expectedErr: %v", test.desc, test.kubeconfig, err, test.expectedErr)
 		}

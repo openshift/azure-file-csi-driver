@@ -59,6 +59,19 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	mountPermissions := d.mountPermissions
 	context := req.GetVolumeContext()
 	if context != nil {
+		// token request
+		if context[serviceAccountTokenField] != "" && getValueInMap(context, clientIDField) != "" {
+			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s", volumeID, target, getValueInMap(context, clientIDField))
+			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+				StagingTargetPath: target,
+				VolumeContext:     context,
+				VolumeCapability:  volCap,
+				VolumeId:          volumeID,
+			})
+			return &csi.NodePublishVolumeResponse{}, err
+		}
+
+		// ephemeral volume
 		if strings.EqualFold(context[ephemeralField], trueValue) {
 			setKeyValueInMap(context, secretNamespaceField, context[podNamespaceField])
 			if !d.allowInlineVolumeKeyAccessWithIdentity {
@@ -76,7 +89,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			return &csi.NodePublishVolumeResponse{}, err
 		}
 
-		if perm := context[mountPermissionsField]; perm != "" {
+		if perm := getValueInMap(context, mountPermissionsField); perm != "" {
 			var err error
 			if mountPermissions, err = strconv.ParseUint(perm, 8, 32); err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid mountPermissions %s", perm))
@@ -155,6 +168,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	volumeID := req.GetVolumeId()
 	context := req.GetVolumeContext()
+
+	if getValueInMap(context, clientIDField) != "" && context[serviceAccountTokenField] == "" {
+		klog.V(2).Infof("Skip NodeStageVolume for volume(%s) since clientID %s is provided but service account token is empty", volumeID, getValueInMap(context, clientIDField))
+		return &csi.NodeStageVolumeResponse{}, nil
+	}
+
 	mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
 	volumeMountGroup := req.GetVolumeCapability().GetMount().GetVolumeMountGroup()
 	gidPresent := checkGidPresentInMountFlags(mountFlags)
@@ -240,17 +259,14 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		return nil, status.Errorf(codes.InvalidArgument, "fsGroupChangePolicy(%s) is not supported, supported fsGroupChangePolicy list: %v", fsGroupChangePolicy, supportedFSGroupChangePolicyList)
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+	lockKey := fmt.Sprintf("%s-%s", volumeID, targetPath)
+	if acquired := d.volumeLocks.TryAcquire(lockKey); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
-	defer d.volumeLocks.Release(volumeID)
+	defer d.volumeLocks.Release(lockKey)
 
 	if strings.TrimSpace(storageEndpointSuffix) == "" {
-		if d.cloud.Environment.StorageEndpointSuffix != "" {
-			storageEndpointSuffix = d.cloud.Environment.StorageEndpointSuffix
-		} else {
-			storageEndpointSuffix = defaultStorageEndPointSuffix
-		}
+		storageEndpointSuffix = d.getStorageEndPointSuffix()
 	}
 
 	// replace pv/pvc name namespace metadata in fileShareName
@@ -393,10 +409,11 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+	lockKey := fmt.Sprintf("%s-%s", volumeID, stagingTargetPath)
+	if acquired := d.volumeLocks.TryAcquire(lockKey); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
-	defer d.volumeLocks.Release(volumeID)
+	defer d.volumeLocks.Release(lockKey)
 
 	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_unstage_volume", d.cloud.ResourceGroup, "", d.Name)
 	isOperationSucceeded := false

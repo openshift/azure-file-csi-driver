@@ -325,7 +325,48 @@ func TestSleepIfThrottled(t *testing.T) {
 	if elapsed.Seconds() < 10 {
 		t.Errorf("Expected sleep time(%d), Actual sleep time(%f)", 10, elapsed.Seconds())
 	}
+}
 
+func TestGetRetryAfterSeconds(t *testing.T) {
+	tests := []struct {
+		desc     string
+		err      error
+		expected int
+	}{
+		{
+			desc:     "nil error",
+			err:      nil,
+			expected: 0,
+		},
+		{
+			desc:     "no match",
+			err:      errors.New("no match"),
+			expected: 0,
+		},
+		{
+			desc:     "match",
+			err:      errors.New("RetryAfter: 10s"),
+			expected: 10,
+		},
+		{
+			desc:     "match error message",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 217s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: 217,
+		},
+		{
+			desc:     "match error message exceeds 1200s",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: maxThrottlingSleepSec,
+		},
+	}
+
+	for _, test := range tests {
+		result := getRetryAfterSeconds(test.err)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: err(%v), getRetryAfterSeconds returned with int(%d), not equal to expected(%d)",
+				test.desc, test.err, result, test.expected)
+		}
+	}
 }
 
 func TestUseDataPlaneAPI(t *testing.T) {
@@ -534,6 +575,52 @@ func TestSetKeyValueInMap(t *testing.T) {
 		setKeyValueInMap(test.m, test.key, test.value)
 		if !reflect.DeepEqual(test.m, test.expected) {
 			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, test.m, test.expected)
+		}
+	}
+}
+
+func TestGetValueInMap(t *testing.T) {
+	tests := []struct {
+		desc     string
+		m        map[string]string
+		key      string
+		expected string
+	}{
+		{
+			desc:     "nil map",
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "empty map",
+			m:        map[string]string{},
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "non-empty map",
+			m:        map[string]string{"k": "v"},
+			key:      "key",
+			expected: "",
+		},
+		{
+			desc:     "same key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subDir",
+			expected: "value2",
+		},
+		{
+			desc:     "case insensitive key already exists",
+			m:        map[string]string{"subDir": "value2"},
+			key:      "subdir",
+			expected: "value2",
+		},
+	}
+
+	for _, test := range tests {
+		result := getValueInMap(test.m, test.key)
+		if result != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expected)
 		}
 	}
 }

@@ -30,6 +30,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	"github.com/Azure/azure-storage-file-go/azfile"
+	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pborman/uuid"
 	"github.com/rubiojr/go-vhd/vhd"
@@ -116,6 +117,9 @@ const (
 	fsGroupChangePolicyField          = "fsgroupchangepolicy"
 	ephemeralField                    = "csi.storage.k8s.io/ephemeral"
 	podNamespaceField                 = "csi.storage.k8s.io/pod.namespace"
+	serviceAccountTokenField          = "csi.storage.k8s.io/serviceAccount.tokens"
+	clientIDField                     = "clientID"
+	tenantIDField                     = "tenantID"
 	mountOptionsField                 = "mountoptions"
 	mountPermissionsField             = "mountpermissions"
 	falseValue                        = "false"
@@ -139,6 +143,7 @@ const (
 	shareNamePrefixField              = "sharenameprefix"
 	requireInfraEncryptionField       = "requireinfraencryption"
 	enableMultichannelField           = "enablemultichannel"
+	standard                          = "standard"
 	premium                           = "premium"
 	selectRandomMatchingAccountField  = "selectrandommatchingaccount"
 	accountQuotaField                 = "accountquota"
@@ -159,6 +164,7 @@ const (
 	// define different sleep time when hit throttling
 	accountOpThrottlingSleepSec = 16
 	fileOpThrottlingSleepSec    = 180
+	maxThrottlingSleepSec       = 1200
 
 	defaultAccountNamePrefix = "f"
 
@@ -180,8 +186,7 @@ const (
 
 	FSGroupChangeNone = "None"
 
-	waitForCopyInterval = 5 * time.Second
-	waitForCopyTimeout  = 3 * time.Minute
+	waitForAzCopyInterval = 2 * time.Second
 )
 
 var (
@@ -220,6 +225,7 @@ type DriverOptions struct {
 	VolStatsCacheExpireInMinutes           int
 	PrintVolumeStatsCallLogs               bool
 	SasTokenExpirationMinutes              int
+	WaitForAzCopyTimeoutMinutes            int
 }
 
 // Driver implements all interfaces of CSI drivers
@@ -275,6 +281,8 @@ type Driver struct {
 	volStatsCache azcache.Resource
 	// sas expiry time for azcopy in volume clone
 	sasTokenExpirationMinutes int
+	// azcopy timeout for volume clone and snapshot restore
+	waitForAzCopyTimeoutMinutes int
 	// azcopy for provide exec mock for ut
 	azcopy *fileutil.Azcopy
 }
@@ -307,6 +315,7 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.appendActimeoOption = options.AppendActimeoOption
 	driver.printVolumeStatsCallLogs = options.PrintVolumeStatsCallLogs
 	driver.sasTokenExpirationMinutes = options.SasTokenExpirationMinutes
+	driver.waitForAzCopyTimeoutMinutes = options.WaitForAzCopyTimeoutMinutes
 	driver.volLockMap = newLockMap()
 	driver.subnetLockMap = newLockMap()
 	driver.volumeLocks = newVolumeLocks()
@@ -362,14 +371,15 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 
 	userAgent := GetUserAgent(d.Name, d.customUserAgent, d.userAgentSuffix)
 	klog.V(2).Infof("driver userAgent: %s", userAgent)
-	d.cloud, err = getCloudProvider(kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.enableWindowsHostProcess, d.kubeAPIQPS, d.kubeAPIBurst)
+	d.cloud, err = getCloudProvider(context.Background(), kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.enableWindowsHostProcess, d.kubeAPIQPS, d.kubeAPIBurst)
 	if err != nil {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
 	klog.V(2).Infof("cloud: %s, location: %s, rg: %s, VnetName: %s, VnetResourceGroup: %s, SubnetName: %s", d.cloud.Cloud, d.cloud.Location, d.cloud.ResourceGroup, d.cloud.VnetName, d.cloud.VnetResourceGroup, d.cloud.SubnetName)
 
 	// todo: set backoff from cloud provider config
-	d.fileClient = newAzureFileClient(&d.cloud.Environment, &retry.Backoff{Steps: 1})
+	env := d.getCloudEnvironment()
+	d.fileClient = newAzureFileClient(&env, &retry.Backoff{Steps: 1})
 
 	d.mounter, err = mounter.NewSafeMounter(d.enableWindowsHostProcess)
 	if err != nil {
@@ -710,6 +720,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 	var protocol, accountKey, secretName, pvcNamespace string
 	// getAccountKeyFromSecret indicates whether get account key only from k8s secret
 	var getAccountKeyFromSecret, getLatestAccountKey bool
+	var clientID, tenantID, serviceAccountToken string
 
 	for k, v := range reqContext {
 		switch strings.ToLower(k) {
@@ -739,9 +750,18 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			if getLatestAccountKey, err = strconv.ParseBool(v); err != nil {
 				return rgName, accountName, accountKey, fileShareName, diskName, subsID, fmt.Errorf("invalid %s: %s in volume context", getLatestAccountKeyField, v)
 			}
+		case strings.ToLower(clientIDField):
+			clientID = v
+		case strings.ToLower(tenantIDField):
+			tenantID = v
+		case strings.ToLower(serviceAccountTokenField):
+			serviceAccountToken = v
 		}
 	}
 
+	if tenantID == "" {
+		tenantID = d.cloud.TenantID
+	}
 	if rgName == "" {
 		rgName = d.cloud.ResourceGroup
 	}
@@ -761,8 +781,16 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		}
 	}
 
+	// if client id is specified, we only use service account token to get account key
+	if clientID != "" {
+		klog.V(2).Infof("clientID(%s) is specified, use service account token to get account key", clientID)
+		accountKey, err := d.cloud.GetStorageAccesskeyFromServiceAccountToken(ctx, subsID, accountName, rgName, clientID, tenantID, serviceAccountToken)
+		return rgName, accountName, accountKey, fileShareName, diskName, subsID, err
+	}
+
 	if len(secrets) == 0 {
-		// read account key from cache first
+		// if request context does not contain secrets, get secrets in the following order:
+		// 1. get account key from cache first
 		cache, errCache := d.accountCacheMap.Get(accountName, azcache.CacheReadTypeDefault)
 		if errCache != nil {
 			return rgName, accountName, accountKey, fileShareName, diskName, subsID, errCache
@@ -775,11 +803,13 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			}
 			if secretName != "" {
 				var name string
+				// 2. if not found in cache, get account key from kubernetes secret
 				name, accountKey, err = d.GetStorageAccountFromSecret(ctx, secretName, secretNamespace)
 				if name != "" {
 					accountName = name
 				}
 				if err != nil {
+					// 3. if failed to get account key from kubernetes secret, use cluster identity to get account key
 					klog.Warningf("GetStorageAccountFromSecret(%s, %s) failed with error: %v", secretName, secretNamespace, err)
 					if !getAccountKeyFromSecret && d.cloud.StorageAccountClient != nil && accountName != "" {
 						klog.V(2).Infof("use cluster identity to get account key from (%s, %s, %s)", subsID, rgName, accountName)
@@ -791,7 +821,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 				}
 			}
 		}
-	} else {
+	} else { // if request context contains secrets, get account name and key directly
 		var account string
 		account, accountKey, err = getStorageAccount(secrets)
 		if account != "" {
@@ -973,8 +1003,8 @@ func (d *Driver) copyFileShare(req *csi.CreateVolumeRequest, accountKey string, 
 		return genErr
 	}
 
-	timeAfter := time.After(waitForCopyTimeout)
-	timeTick := time.Tick(waitForCopyInterval)
+	timeAfter := time.After(time.Duration(d.waitForAzCopyTimeoutMinutes) * time.Minute)
+	timeTick := time.Tick(waitForAzCopyInterval)
 	srcPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, srcFileShareName, accountSasToken)
 	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, dstFileShareName, accountSasToken)
 
@@ -1025,6 +1055,9 @@ func (d *Driver) GetTotalAccountQuota(ctx context.Context, subsID, resourceGroup
 
 // RemoveStorageAccountTag remove tag from storage account
 func (d *Driver) RemoveStorageAccountTag(ctx context.Context, subsID, resourceGroup, account, key string) error {
+	if d.cloud == nil {
+		return fmt.Errorf("cloud is nil")
+	}
 	// search in cache first
 	cache, err := d.skipMatchingTagCache.Get(account, azcache.CacheReadTypeDefault)
 	if err != nil {
@@ -1166,4 +1199,18 @@ func (d *Driver) SetAzureCredentials(ctx context.Context, accountName, accountKe
 		return "", fmt.Errorf("couldn't create secret %v", err)
 	}
 	return secretName, err
+}
+
+func (d *Driver) getStorageEndPointSuffix() string {
+	if d.cloud == nil || d.cloud.Environment.StorageEndpointSuffix == "" {
+		return defaultStorageEndPointSuffix
+	}
+	return d.cloud.Environment.StorageEndpointSuffix
+}
+
+func (d *Driver) getCloudEnvironment() azure2.Environment {
+	if d.cloud == nil {
+		return azure2.PublicCloud
+	}
+	return d.cloud.Environment
 }
