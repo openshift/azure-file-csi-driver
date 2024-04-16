@@ -26,6 +26,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
 	"k8s.io/utils/pointer"
@@ -321,20 +322,6 @@ func isNodeInVMSSVMCache(nodeName string, vmssVMCache azcache.Resource) bool {
 	return isInCache
 }
 
-func extractVmssVMName(name string) (string, string, error) {
-	split := strings.SplitAfter(name, consts.VMSSNameSeparator)
-	if len(split) < 2 {
-		klog.V(3).Infof("Failed to extract vmssVMName %q", name)
-		return "", "", ErrorNotVmssInstance
-	}
-
-	ssName := strings.Join(split[0:len(split)-1], "")
-	// removing the trailing `vmssNameSeparator` since we used SplitAfter
-	ssName = ssName[:len(ssName)-1]
-	instanceID := split[len(split)-1]
-	return ssName, instanceID, nil
-}
-
 // isServiceDualStack checks if a Service is dual-stack or not.
 func isServiceDualStack(svc *v1.Service) bool {
 	return len(svc.Spec.IPFamilies) == 2
@@ -403,7 +390,7 @@ func setServiceLoadBalancerIP(service *v1.Service, ip string) {
 	}
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
-		klog.Warning("setServiceLoadBalancerIP: IP %q is not valid for Service", ip, service.Name)
+		klog.Warningf("setServiceLoadBalancerIP: IP %q is not valid for Service %q", ip, service.Name)
 		return
 	}
 
@@ -426,6 +413,14 @@ func getServicePIPName(service *v1.Service, isIPv6 bool) string {
 	return service.Annotations[consts.ServiceAnnotationPIPNameDualStack[isIPv6]]
 }
 
+func getServicePIPNames(service *v1.Service) []string {
+	var ips []string
+	for _, ipVersion := range []bool{IPVersionIPv4, IPVersionIPv6} {
+		ips = append(ips, getServicePIPName(service, ipVersion))
+	}
+	return ips
+}
+
 func getServicePIPPrefixID(service *v1.Service, isIPv6 bool) string {
 	if service == nil {
 		return ""
@@ -444,14 +439,14 @@ func getServicePIPPrefixID(service *v1.Service, isIPv6 bool) string {
 // the old PIPs will be recreated.
 func getResourceByIPFamily(resource string, isDualStack, isIPv6 bool) string {
 	if isDualStack && isIPv6 {
-		return fmt.Sprintf("%s-%s", resource, v6Suffix)
+		return fmt.Sprintf("%s-%s", resource, consts.IPVersionIPv6String)
 	}
 	return resource
 }
 
 // isFIPIPv6 checks if the frontend IP configuration is of IPv6.
 // NOTICE: isFIPIPv6 assumes the FIP is owned by the Service and it is the primary Service.
-func (az *Cloud) isFIPIPv6(service *v1.Service, pipRG string, fip *network.FrontendIPConfiguration) (bool, error) {
+func (az *Cloud) isFIPIPv6(service *v1.Service, _ string, fip *network.FrontendIPConfiguration) (bool, error) {
 	isDualStack := isServiceDualStack(service)
 	if !isDualStack {
 		return service.Spec.IPFamilies[0] == v1.IPv6Protocol, nil
@@ -466,24 +461,6 @@ func getResourceIDPrefix(id string) string {
 		return id // Should not happen
 	}
 	return id[:idx]
-}
-
-// fillSubnet fills subnet value into the variable.
-func (az *Cloud) fillSubnet(subnet *network.Subnet, subnetName string) error {
-	if subnet == nil {
-		return fmt.Errorf("subnet is nil, should not happen")
-	}
-	if subnet.ID == nil {
-		curSubnet, existsSubnet, err := az.getSubnet(az.VnetName, subnetName)
-		if err != nil {
-			return err
-		}
-		if !existsSubnet {
-			return fmt.Errorf("failed to get subnet: %s/%s", az.VnetName, subnetName)
-		}
-		*subnet = curSubnet
-	}
-	return nil
 }
 
 func getLBNameFromBackendPoolID(backendPoolID string) (string, error) {
@@ -538,4 +515,75 @@ func stringSlice(s *[]string) []string {
 		return *s
 	}
 	return nil
+}
+
+// IntInSlice checks if an int is in a list
+func IntInSlice(i int, list []int) bool {
+	for _, item := range list {
+		if item == i {
+			return true
+		}
+	}
+	return false
+}
+
+func safeAddKeyToStringsSet(set sets.Set[string], key string) sets.Set[string] {
+	if set != nil {
+		set.Insert(key)
+	} else {
+		set = sets.New[string](key)
+	}
+
+	return set
+}
+
+func safeRemoveKeyFromStringsSet(set sets.Set[string], key string) (sets.Set[string], bool) {
+	var has bool
+	if set != nil {
+		if set.Has(key) {
+			has = true
+		}
+		set.Delete(key)
+	}
+
+	return set, has
+}
+
+func setToStrings(set sets.Set[string]) []string {
+	var res []string
+	for key := range set {
+		res = append(res, key)
+	}
+	return res
+}
+
+func isLocalService(service *v1.Service) bool {
+	return service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyLocal
+}
+
+func getServiceIPFamily(service *v1.Service) string {
+	if len(service.Spec.IPFamilies) > 1 {
+		return consts.IPVersionDualStackString
+	}
+	for _, ipFamily := range service.Spec.IPFamilies {
+		if ipFamily == v1.IPv6Protocol {
+			return consts.IPVersionIPv6String
+		}
+	}
+	return consts.IPVersionIPv4String
+}
+
+// getResourceGroupAndNameFromNICID parses the ip configuration ID to get the resource group and nic name.
+func getResourceGroupAndNameFromNICID(ipConfigurationID string) (string, string, error) {
+	matches := nicIDRE.FindStringSubmatch(ipConfigurationID)
+	if len(matches) != 3 {
+		klog.V(4).Infof("Can not extract nic name from ipConfigurationID (%s)", ipConfigurationID)
+		return "", "", fmt.Errorf("invalid ip config ID %s", ipConfigurationID)
+	}
+
+	nicResourceGroup, nicName := matches[1], matches[2]
+	if nicResourceGroup == "" || nicName == "" {
+		return "", "", fmt.Errorf("invalid ip config ID %s", ipConfigurationID)
+	}
+	return nicResourceGroup, nicName, nil
 }

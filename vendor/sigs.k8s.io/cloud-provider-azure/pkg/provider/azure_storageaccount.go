@@ -19,11 +19,13 @@ package provider
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
 	"github.com/Azure/azure-sdk-for-go/services/privatedns/mgmt/2018-09-01/privatedns"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
@@ -31,6 +33,9 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/cache"
+	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/consts"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
 )
@@ -39,12 +44,14 @@ import (
 const SkipMatchingTag = "skip-matching"
 const LocationGlobal = "global"
 const privateDNSZoneNameFmt = "privatelink.%s.%s"
+const DefaultTokenAudience = "api://AzureADTokenExchange" //nolint:gosec // G101 ignore this!
 
 type StorageType string
 
 const (
 	StorageTypeBlob StorageType = "blob"
 	StorageTypeFile StorageType = "file"
+	blobNameSuffix              = "-blob"
 )
 
 // AccountOptions contains the fields which are used to create storage account.
@@ -54,7 +61,7 @@ type AccountOptions struct {
 	EnableHTTPSTrafficOnly                    bool
 	// indicate whether create new account when Name is empty or when account does not exists
 	CreateAccount                           bool
-	CreatePrivateEndpoint                   bool
+	CreatePrivateEndpoint                   *bool
 	StorageType                             StorageType
 	StorageEndpointSuffix                   string
 	DisableFileServiceDeleteRetentionPolicy *bool
@@ -124,6 +131,62 @@ func (az *Cloud) getStorageAccounts(ctx context.Context, accountOptions *Account
 		}
 	}
 	return accounts, nil
+}
+
+// serviceAccountToken represents the service account token sent from NodePublishVolume Request.
+// ref: https://kubernetes-csi.github.io/docs/token-requests.html
+type serviceAccountToken struct {
+	APIAzureADTokenExchange struct {
+		Token               string    `json:"token"`
+		ExpirationTimestamp time.Time `json:"expirationTimestamp"`
+	} `json:"api://AzureADTokenExchange"`
+}
+
+// parseServiceAccountToken parses the bound service account token from the token passed from NodePublishVolume Request.
+func parseServiceAccountToken(tokenStr string) (string, error) {
+	if len(tokenStr) == 0 {
+		return "", fmt.Errorf("service account token is empty")
+	}
+	token := serviceAccountToken{}
+	if err := json.Unmarshal([]byte(tokenStr), &token); err != nil {
+		return "", fmt.Errorf("failed to unmarshal service account tokens, error: %w", err)
+	}
+	if token.APIAzureADTokenExchange.Token == "" {
+		return "", fmt.Errorf("token for audience %s not found", DefaultTokenAudience)
+	}
+	return token.APIAzureADTokenExchange.Token, nil
+}
+
+func (az *Cloud) GetStorageAccesskeyFromServiceAccountToken(ctx context.Context, subsID, accountName, rgName, clientID, tenantID, serviceAccountToken string) (string, error) {
+	cred, err := azidentity.NewClientAssertionCredential(tenantID, clientID, func(context.Context) (string, error) {
+		return parseServiceAccountToken(serviceAccountToken)
+	}, &azidentity.ClientAssertionCredentialOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to create client assertion credential, error: %w", err)
+	}
+
+	client, err := accountclient.New(subsID, cred, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create storage account client, error: %w", err)
+	}
+
+	keys, err := client.ListKeys(ctx, rgName, accountName)
+	if err != nil {
+		return "", fmt.Errorf("failed to list keys, error: %w", err)
+	}
+
+	for _, k := range keys {
+		if k != nil && k.Value != nil && *k.Value != "" {
+			v := *k.Value
+			if ind := strings.LastIndex(v, " "); ind >= 0 {
+				v = v[(ind + 1):]
+			}
+			// get first key
+			return v, nil
+		}
+	}
+
+	return "", fmt.Errorf("failed to list keys, found no key")
 }
 
 // GetStorageAccesskey gets the storage account access key
@@ -214,7 +277,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 	}
 
 	var privateDNSZoneName string
-	if accountOptions.CreatePrivateEndpoint {
+	if pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) {
 		if accountOptions.StorageType == "" {
 			klog.V(2).Info("set StorageType as file when not specified")
 			accountOptions.StorageType = StorageTypeFile
@@ -280,7 +343,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 		}
 	}
 
-	if accountOptions.CreatePrivateEndpoint {
+	if pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) {
 		if _, err := az.privatednsclient.Get(ctx, vnetResourceGroup, privateDNSZoneName); err != nil {
 			klog.V(2).Infof("get private dns zone %s returned with %v", privateDNSZoneName, err.Error())
 			// Create DNS zone first, this could make sure driver has write permission on vnetResourceGroup
@@ -318,7 +381,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 			}
 		}
 
-		if accountOptions.CreatePrivateEndpoint {
+		if pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) {
 			networkRuleSet = &storage.NetworkRuleSet{
 				DefaultAction: storage.DefaultActionDeny,
 			}
@@ -469,7 +532,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 		}
 	}
 
-	if accountOptions.CreatePrivateEndpoint {
+	if pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) {
 		// Get properties of the storageAccount
 		storageAccount, err := az.StorageAccountClient.GetProperties(ctx, subsID, resourceGroup, accountName)
 		if err != nil {
@@ -479,7 +542,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 		// Create private endpoint
 		privateEndpointName := accountName + "-pvtendpoint"
 		if accountOptions.StorageType == StorageTypeBlob {
-			privateEndpointName = privateEndpointName + "-blob"
+			privateEndpointName = privateEndpointName + blobNameSuffix
 		}
 		if err := az.createPrivateEndpoint(ctx, accountName, storageAccount.ID, privateEndpointName, vnetResourceGroup, vnetName, subnetName, location, accountOptions.StorageType); err != nil {
 			return "", "", fmt.Errorf("create private endpoint for storage account(%s), resourceGroup(%s): %w", accountName, vnetResourceGroup, err)
@@ -488,7 +551,7 @@ func (az *Cloud) EnsureStorageAccount(ctx context.Context, accountOptions *Accou
 		// Create dns zone group
 		dnsZoneGroupName := accountName + "-dnszonegroup"
 		if accountOptions.StorageType == StorageTypeBlob {
-			dnsZoneGroupName = dnsZoneGroupName + "-blob"
+			dnsZoneGroupName = dnsZoneGroupName + blobNameSuffix
 		}
 		if err := az.createPrivateDNSZoneGroup(ctx, dnsZoneGroupName, privateEndpointName, vnetResourceGroup, vnetName, privateDNSZoneName); err != nil {
 			return "", "", fmt.Errorf("create private DNS zone group - privateEndpoint(%s), vNetName(%s), resourceGroup(%s): %w", privateEndpointName, vnetName, vnetResourceGroup, err)
@@ -524,7 +587,7 @@ func (az *Cloud) createPrivateEndpoint(ctx context.Context, accountName string, 
 	//Create private endpoint
 	privateLinkServiceConnectionName := accountName + "-pvtsvcconn"
 	if storageType == StorageTypeBlob {
-		privateLinkServiceConnectionName = privateLinkServiceConnectionName + "-blob"
+		privateLinkServiceConnectionName = privateLinkServiceConnectionName + blobNameSuffix
 	}
 	privateLinkServiceConnection := network.PrivateLinkServiceConnection{
 		Name: &privateLinkServiceConnectionName,
@@ -586,16 +649,53 @@ func (az *Cloud) createPrivateDNSZoneGroup(ctx context.Context, dnsZoneGroupName
 	return az.privatednszonegroupclient.CreateOrUpdate(ctx, vnetResourceGroup, privateEndpointName, dnsZoneGroupName, privateDNSZoneGroup, "", false).Error()
 }
 
+func (az *Cloud) newStorageAccountCache() (azcache.Resource, error) {
+	getter := func(key string) (interface{}, error) { return nil, nil }
+	return azcache.NewTimedCache(time.Minute, getter, az.Config.DisableAPICallCache)
+}
+
+func (az *Cloud) getStorageAccountWithCache(ctx context.Context, subsID, resourceGroup, account string) (storage.Account, *retry.Error) {
+	if az.StorageAccountClient == nil {
+		return storage.Account{}, retry.NewError(false, fmt.Errorf("StorageAccountClient is nil"))
+	}
+
+	if az.storageAccountCache == nil {
+		return storage.Account{}, retry.NewError(false, fmt.Errorf("storageAccountCache is nil"))
+	}
+
+	// search in cache first
+	cache, err := az.storageAccountCache.Get(account, cache.CacheReadTypeDefault)
+	if err != nil {
+		return storage.Account{}, retry.NewError(false, err)
+	}
+	var result storage.Account
+	if cache != nil {
+		result = cache.(storage.Account)
+		klog.V(2).Infof("Get storage account(%s) from cache", account)
+	} else {
+		var rerr *retry.Error
+		result, rerr = az.StorageAccountClient.GetProperties(ctx, subsID, resourceGroup, account)
+		if rerr != nil {
+			return storage.Account{}, rerr
+		}
+		az.storageAccountCache.Set(account, result)
+	}
+
+	return result, nil
+}
+
 // AddStorageAccountTags add tags to storage account
 func (az *Cloud) AddStorageAccountTags(ctx context.Context, subsID, resourceGroup, account string, tags map[string]*string) *retry.Error {
-	if az.StorageAccountClient == nil {
-		return retry.NewError(false, fmt.Errorf("StorageAccountClient is nil"))
-	}
-	result, rerr := az.StorageAccountClient.GetProperties(ctx, subsID, resourceGroup, account)
+	// add lock to avoid concurrent update on the cache
+	az.lockMap.LockEntry(account)
+	defer az.lockMap.UnlockEntry(account)
+
+	result, rerr := az.getStorageAccountWithCache(ctx, subsID, resourceGroup, account)
 	if rerr != nil {
 		return rerr
 	}
 
+	originalLen := len(result.Tags)
 	newTags := result.Tags
 	if newTags == nil {
 		newTags = make(map[string]*string)
@@ -606,16 +706,23 @@ func (az *Cloud) AddStorageAccountTags(ctx context.Context, subsID, resourceGrou
 		newTags[k] = v
 	}
 
-	updateParams := storage.AccountUpdateParameters{Tags: newTags}
-	return az.StorageAccountClient.Update(ctx, subsID, resourceGroup, account, updateParams)
+	if len(newTags) > originalLen {
+		// only update when newTags is different from old tags
+		_ = az.storageAccountCache.Delete(account) // clean cache
+		updateParams := storage.AccountUpdateParameters{Tags: newTags}
+		klog.V(2).Infof("update storage account(%s) with tags(%+v)", account, newTags)
+		return az.StorageAccountClient.Update(ctx, subsID, resourceGroup, account, updateParams)
+	}
+	return nil
 }
 
 // RemoveStorageAccountTag remove tag from storage account
 func (az *Cloud) RemoveStorageAccountTag(ctx context.Context, subsID, resourceGroup, account, key string) *retry.Error {
-	if az.StorageAccountClient == nil {
-		return retry.NewError(false, fmt.Errorf("StorageAccountClient is nil"))
-	}
-	result, rerr := az.StorageAccountClient.GetProperties(ctx, subsID, resourceGroup, account)
+	// add lock to avoid concurrent update on the cache
+	az.lockMap.LockEntry(account)
+	defer az.lockMap.UnlockEntry(account)
+
+	result, rerr := az.getStorageAccountWithCache(ctx, subsID, resourceGroup, account)
 	if rerr != nil {
 		return rerr
 	}
@@ -627,6 +734,8 @@ func (az *Cloud) RemoveStorageAccountTag(ctx context.Context, subsID, resourceGr
 	originalLen := len(result.Tags)
 	delete(result.Tags, key)
 	if originalLen != len(result.Tags) {
+		// only update when newTags is different from old tags
+		_ = az.storageAccountCache.Delete(account) // clean cache
 		updateParams := storage.AccountUpdateParameters{Tags: result.Tags}
 		return az.StorageAccountClient.Update(ctx, subsID, resourceGroup, account, updateParams)
 	}
@@ -732,10 +841,15 @@ func isEnableNfsV3PropertyEqual(account storage.Account, accountOptions *Account
 }
 
 func isPrivateEndpointAsExpected(account storage.Account, accountOptions *AccountOptions) bool {
-	if accountOptions.CreatePrivateEndpoint && account.PrivateEndpointConnections != nil && len(*account.PrivateEndpointConnections) > 0 {
+	if accountOptions.CreatePrivateEndpoint == nil {
+		// CreatePrivateEndpoint is not set, match current account
 		return true
 	}
-	if !accountOptions.CreatePrivateEndpoint && (account.PrivateEndpointConnections == nil || len(*account.PrivateEndpointConnections) == 0) {
+
+	if pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) && account.PrivateEndpointConnections != nil && len(*account.PrivateEndpointConnections) > 0 {
+		return true
+	}
+	if !pointer.BoolDeref(accountOptions.CreatePrivateEndpoint, false) && (account.PrivateEndpointConnections == nil || len(*account.PrivateEndpointConnections) == 0) {
 		return true
 	}
 	return false

@@ -76,7 +76,7 @@ func (az *Cloud) ListLB(service *v1.Service) ([]network.LoadBalancer, error) {
 
 // ListManagedLBs invokes az.LoadBalancerClient.List and filter out
 // those that are not managed by cloud provider azure or not associated to a managed VMSet.
-func (az *Cloud) ListManagedLBs(service *v1.Service, nodes []*v1.Node, clusterName string) ([]network.LoadBalancer, error) {
+func (az *Cloud) ListManagedLBs(service *v1.Service, nodes []*v1.Node, clusterName string) (*[]network.LoadBalancer, error) {
 	allLBs, err := az.ListLB(service)
 	if err != nil {
 		return nil, err
@@ -93,7 +93,7 @@ func (az *Cloud) ListManagedLBs(service *v1.Service, nodes []*v1.Node, clusterNa
 		// return early if wantLb=false
 		if nodes == nil {
 			klog.V(4).Infof("ListManagedLBs: return all LBs in the resource group %s, including unmanaged LBs", az.getLoadBalancerResourceGroup())
-			return allLBs, nil
+			return &allLBs, nil
 		}
 
 		agentPoolVMSetNamesMap := make(map[string]bool)
@@ -127,7 +127,7 @@ func (az *Cloud) ListManagedLBs(service *v1.Service, nodes []*v1.Node, clusterNa
 		}
 	}
 
-	return managedLBs, nil
+	return &managedLBs, nil
 }
 
 // CreateOrUpdateLB invokes az.LoadBalancerClient.CreateOrUpdate with exponential backoff retry
@@ -303,7 +303,7 @@ func (az *Cloud) MigrateToIPBasedBackendPoolAndWaitForCompletion(
 			}
 
 			if countIPsOnBackendPool(bp) != nicsCount {
-				klog.V(4).Infof("MigrateToIPBasedBackendPoolAndWaitForCompletion: Expected IPs %s, current IPs %d, will retry in 5s", nicsCount, countIPsOnBackendPool(bp))
+				klog.V(4).Infof("MigrateToIPBasedBackendPoolAndWaitForCompletion: Expected IPs %d, current IPs %d, will retry in 5s", nicsCount, countIPsOnBackendPool(bp))
 				return false, nil
 			}
 			succeeded[bpName] = true
@@ -386,4 +386,13 @@ func isBackendPoolOnSameLB(newBackendPoolID string, existingBackendPools []strin
 	}
 
 	return true, "", nil
+}
+
+func (az *Cloud) serviceOwnsRule(service *v1.Service, rule string) bool {
+	if !strings.EqualFold(string(service.Spec.ExternalTrafficPolicy), string(v1.ServiceExternalTrafficPolicyTypeLocal)) &&
+		rule == consts.SharedProbeName {
+		return true
+	}
+	prefix := az.getRulePrefix(service)
+	return strings.HasPrefix(strings.ToUpper(rule), strings.ToUpper(prefix))
 }
