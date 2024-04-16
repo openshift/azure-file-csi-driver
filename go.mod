@@ -40,17 +40,9 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.5.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azfile v0.1.0
 	github.com/jongio/azidext/go/azidext v0.5.0
-<<<<<<< HEAD
-	github.com/onsi/ginkgo/v2 v2.13.0
-	golang.org/x/sys v0.15.0
-||||||| 4f98c74f7
-	github.com/onsi/ginkgo/v2 v2.13.0
-	golang.org/x/sys v0.14.0
-=======
 	github.com/onsi/ginkgo/v2 v2.15.0
 	go.uber.org/mock v0.4.0
 	golang.org/x/sys v0.17.0
->>>>>>> v1.29.4
 	k8s.io/pod-security-admission v0.27.4
 	sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader v0.0.0-20240218020800-ba9f211f36bf
 )
@@ -149,30 +141,12 @@ require (
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.19.0 // indirect
-<<<<<<< HEAD
-	golang.org/x/crypto v0.17.0 // indirect
-	golang.org/x/exp v0.0.0-20220722155223-a9213eeb770e // indirect
-	golang.org/x/mod v0.12.0 // indirect
-||||||| 4f98c74f7
-	golang.org/x/crypto v0.14.0 // indirect
-	golang.org/x/exp v0.0.0-20220722155223-a9213eeb770e // indirect
-	golang.org/x/mod v0.12.0 // indirect
-=======
 	golang.org/x/crypto v0.19.0 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
 	golang.org/x/mod v0.14.0 // indirect
->>>>>>> v1.29.4
 	golang.org/x/oauth2 v0.11.0 // indirect
-<<<<<<< HEAD
-	golang.org/x/sync v0.4.0 // indirect
-	golang.org/x/term v0.15.0 // indirect
-||||||| 4f98c74f7
-	golang.org/x/sync v0.4.0 // indirect
-	golang.org/x/term v0.13.0 // indirect
-=======
 	golang.org/x/sync v0.6.0 // indirect
 	golang.org/x/term v0.17.0 // indirect
->>>>>>> v1.29.4
 	golang.org/x/text v0.14.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.16.1 // indirect
@@ -199,34 +173,6 @@ require (
 )
 
 replace (
-<<<<<<< HEAD
-	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.28.4
-	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.28.4
-	k8s.io/cri-api => k8s.io/cri-api v0.28.4
-	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.28.4
-	k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.28.4
-	k8s.io/endpointslice => k8s.io/endpointslice v0.28.4
-	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.28.4
-	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.28.4
-	k8s.io/kube-proxy => k8s.io/kube-proxy v0.28.4
-	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.28.4
-	k8s.io/kubectl => k8s.io/kubectl v0.28.4
-	k8s.io/kubelet => k8s.io/kubelet v0.28.4
-	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.28.4
-||||||| 4f98c74f7
-	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.28.4
-	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.28.4
-	k8s.io/cri-api => k8s.io/cri-api v0.28.4
-	k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.28.4
-	k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.28.4
-	k8s.io/kube-aggregator => k8s.io/kube-aggregator v0.28.4
-	k8s.io/kube-controller-manager => k8s.io/kube-controller-manager v0.28.4
-	k8s.io/kube-proxy => k8s.io/kube-proxy v0.28.4
-	k8s.io/kube-scheduler => k8s.io/kube-scheduler v0.28.4
-	k8s.io/kubectl => k8s.io/kubectl v0.28.4
-	k8s.io/kubelet => k8s.io/kubelet v0.28.4
-	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.28.4
-=======
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.29.0
 	k8s.io/cluster-bootstrap => k8s.io/cluster-bootstrap v0.29.0
 	k8s.io/cri-api => k8s.io/cri-api v0.29.0
@@ -239,7 +185,6 @@ replace (
 	k8s.io/kubectl => k8s.io/kubectl v0.29.0
 	k8s.io/kubelet => k8s.io/kubelet v0.29.0
 	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.29.0
->>>>>>> v1.29.4
 	k8s.io/mount-utils => k8s.io/mount-utils v0.0.0-20231116185301-00b898b94b20
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.29.0
 )
