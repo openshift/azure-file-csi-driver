@@ -57,6 +57,7 @@ var (
 	kubeAPIBurst                           = flag.Int("kube-api-burst", 50, "Burst to use while communicating with the kubernetes apiserver.")
 	appendMountErrorHelpLink               = flag.Bool("append-mount-error-help-link", true, "Whether to include a link for help with mount errors when a mount error occurs.")
 	enableWindowsHostProcess               = flag.Bool("enable-windows-host-process", false, "enable windows host process")
+	removeSMBMountOnWindows                = flag.Bool("remove-smb-mount-on-windows", true, "remove smb global mapping on windows during unmount")
 	appendClosetimeoOption                 = flag.Bool("append-closetimeo-option", false, "Whether appending closetimeo=0 option to smb mount command")
 	appendNoShareSockOption                = flag.Bool("append-nosharesock-option", true, "Whether appending nosharesock option to smb mount command")
 	appendNoResvPortOption                 = flag.Bool("append-noresvport-option", true, "Whether appending noresvport option to nfs mount command")
@@ -65,6 +66,7 @@ var (
 	volStatsCacheExpireInMinutes           = flag.Int("vol-stats-cache-expire-in-minutes", 10, "The cache expire time in minutes for volume stats cache")
 	printVolumeStatsCallLogs               = flag.Bool("print-volume-stats-call-logs", false, "Whether to print volume statfs call logs with log level 2")
 	sasTokenExpirationMinutes              = flag.Int("sas-token-expiration-minutes", 1440, "sas token expiration minutes during volume cloning")
+	waitForAzCopyTimeoutMinutes            = flag.Int("wait-for-azcopy-timeout-minutes", 18, "timeout in minutes for waiting for azcopy to finish")
 )
 
 func main() {
@@ -107,6 +109,7 @@ func handle() {
 		KubeAPIQPS:                             *kubeAPIQPS,
 		KubeAPIBurst:                           *kubeAPIBurst,
 		EnableWindowsHostProcess:               *enableWindowsHostProcess,
+		RemoveSMBMountOnWindows:                *removeSMBMountOnWindows,
 		AppendClosetimeoOption:                 *appendClosetimeoOption,
 		AppendNoShareSockOption:                *appendNoShareSockOption,
 		AppendNoResvPortOption:                 *appendNoResvPortOption,
@@ -115,6 +118,7 @@ func handle() {
 		VolStatsCacheExpireInMinutes:           *volStatsCacheExpireInMinutes,
 		PrintVolumeStatsCallLogs:               *printVolumeStatsCallLogs,
 		SasTokenExpirationMinutes:              *sasTokenExpirationMinutes,
+		WaitForAzCopyTimeoutMinutes:            *waitForAzCopyTimeoutMinutes,
 	}
 	driver := azurefile.NewDriver(&driverOptions)
 	if driver == nil {
