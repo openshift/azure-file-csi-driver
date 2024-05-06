@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	"github.com/Azure/azure-storage-file-go/azfile"
+	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pborman/uuid"
 	"github.com/rubiojr/go-vhd/vhd"
@@ -116,6 +118,9 @@ const (
 	fsGroupChangePolicyField          = "fsgroupchangepolicy"
 	ephemeralField                    = "csi.storage.k8s.io/ephemeral"
 	podNamespaceField                 = "csi.storage.k8s.io/pod.namespace"
+	serviceAccountTokenField          = "csi.storage.k8s.io/serviceAccount.tokens"
+	clientIDField                     = "clientID"
+	tenantIDField                     = "tenantID"
 	mountOptionsField                 = "mountoptions"
 	mountPermissionsField             = "mountpermissions"
 	falseValue                        = "false"
@@ -139,6 +144,7 @@ const (
 	shareNamePrefixField              = "sharenameprefix"
 	requireInfraEncryptionField       = "requireinfraencryption"
 	enableMultichannelField           = "enablemultichannel"
+	standard                          = "standard"
 	premium                           = "premium"
 	selectRandomMatchingAccountField  = "selectrandommatchingaccount"
 	accountQuotaField                 = "accountquota"
@@ -159,6 +165,7 @@ const (
 	// define different sleep time when hit throttling
 	accountOpThrottlingSleepSec = 16
 	fileOpThrottlingSleepSec    = 180
+	maxThrottlingSleepSec       = 1200
 
 	defaultAccountNamePrefix = "f"
 
@@ -180,8 +187,7 @@ const (
 
 	FSGroupChangeNone = "None"
 
-	waitForCopyInterval = 5 * time.Second
-	waitForCopyTimeout  = 3 * time.Minute
+	waitForAzCopyInterval = 2 * time.Second
 )
 
 var (
@@ -191,6 +197,8 @@ var (
 	supportedFSGroupChangePolicyList = []string{FSGroupChangeNone, string(v1.FSGroupChangeAlways), string(v1.FSGroupChangeOnRootMismatch)}
 
 	retriableErrors = []string{accountNotProvisioned, tooManyRequests, shareBeingDeleted, clientThrottled}
+
+	defaultAzcopyCopyOptions = []string{"--recursive", "--check-length=false"}
 )
 
 // DriverOptions defines driver parameters specified in driver deployment
@@ -212,6 +220,7 @@ type DriverOptions struct {
 	KubeAPIQPS                             float64
 	KubeAPIBurst                           int
 	EnableWindowsHostProcess               bool
+	RemoveSMBMountOnWindows                bool
 	AppendClosetimeoOption                 bool
 	AppendNoShareSockOption                bool
 	AppendNoResvPortOption                 bool
@@ -220,6 +229,7 @@ type DriverOptions struct {
 	VolStatsCacheExpireInMinutes           int
 	PrintVolumeStatsCallLogs               bool
 	SasTokenExpirationMinutes              int
+	WaitForAzCopyTimeoutMinutes            int
 }
 
 // Driver implements all interfaces of CSI drivers
@@ -241,6 +251,7 @@ type Driver struct {
 	kubeAPIQPS                             float64
 	kubeAPIBurst                           int
 	enableWindowsHostProcess               bool
+	removeSMBMountOnWindows                bool
 	appendClosetimeoOption                 bool
 	appendNoShareSockOption                bool
 	appendNoResvPortOption                 bool
@@ -273,8 +284,12 @@ type Driver struct {
 	resizeFileShareFailureCache azcache.Resource
 	// a timed cache storing volume stats <volumeID, volumeStats>
 	volStatsCache azcache.Resource
+	// a timed cache storing account which should use sastoken for azcopy based volume cloning
+	azcopySasTokenCache azcache.Resource
 	// sas expiry time for azcopy in volume clone
 	sasTokenExpirationMinutes int
+	// azcopy timeout for volume clone and snapshot restore
+	waitForAzCopyTimeoutMinutes int
 	// azcopy for provide exec mock for ut
 	azcopy *fileutil.Azcopy
 }
@@ -301,12 +316,14 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.kubeAPIQPS = options.KubeAPIQPS
 	driver.kubeAPIBurst = options.KubeAPIBurst
 	driver.enableWindowsHostProcess = options.EnableWindowsHostProcess
+	driver.removeSMBMountOnWindows = options.RemoveSMBMountOnWindows
 	driver.appendClosetimeoOption = options.AppendClosetimeoOption
 	driver.appendNoShareSockOption = options.AppendNoShareSockOption
 	driver.appendNoResvPortOption = options.AppendNoResvPortOption
 	driver.appendActimeoOption = options.AppendActimeoOption
 	driver.printVolumeStatsCallLogs = options.PrintVolumeStatsCallLogs
 	driver.sasTokenExpirationMinutes = options.SasTokenExpirationMinutes
+	driver.waitForAzCopyTimeoutMinutes = options.WaitForAzCopyTimeoutMinutes
 	driver.volLockMap = newLockMap()
 	driver.subnetLockMap = newLockMap()
 	driver.volumeLocks = newVolumeLocks()
@@ -338,6 +355,10 @@ func NewDriver(options *DriverOptions) *Driver {
 		klog.Fatalf("%v", err)
 	}
 
+	if driver.azcopySasTokenCache, err = azcache.NewTimedCache(15*time.Minute, getter, false); err != nil {
+		klog.Fatalf("%v", err)
+	}
+
 	if driver.resizeFileShareFailureCache, err = azcache.NewTimedCache(3*time.Minute, getter, false); err != nil {
 		klog.Fatalf("%v", err)
 	}
@@ -362,14 +383,15 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 
 	userAgent := GetUserAgent(d.Name, d.customUserAgent, d.userAgentSuffix)
 	klog.V(2).Infof("driver userAgent: %s", userAgent)
-	d.cloud, err = getCloudProvider(kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.enableWindowsHostProcess, d.kubeAPIQPS, d.kubeAPIBurst)
+	d.cloud, err = getCloudProvider(context.Background(), kubeconfig, d.NodeID, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, userAgent, d.allowEmptyCloudConfig, d.enableWindowsHostProcess, d.kubeAPIQPS, d.kubeAPIBurst)
 	if err != nil {
 		klog.Fatalf("failed to get Azure Cloud Provider, error: %v", err)
 	}
 	klog.V(2).Infof("cloud: %s, location: %s, rg: %s, VnetName: %s, VnetResourceGroup: %s, SubnetName: %s", d.cloud.Cloud, d.cloud.Location, d.cloud.ResourceGroup, d.cloud.VnetName, d.cloud.VnetResourceGroup, d.cloud.SubnetName)
 
 	// todo: set backoff from cloud provider config
-	d.fileClient = newAzureFileClient(&d.cloud.Environment, &retry.Backoff{Steps: 1})
+	env := d.getCloudEnvironment()
+	d.fileClient = newAzureFileClient(&env, &retry.Backoff{Steps: 1})
 
 	d.mounter, err = mounter.NewSafeMounter(d.enableWindowsHostProcess)
 	if err != nil {
@@ -383,6 +405,7 @@ func (d *Driver) Run(endpoint, kubeconfig string, testBool bool) {
 			csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 			csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 			csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+			csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		})
 	d.AddVolumeCapabilityAccessModes([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
@@ -710,6 +733,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 	var protocol, accountKey, secretName, pvcNamespace string
 	// getAccountKeyFromSecret indicates whether get account key only from k8s secret
 	var getAccountKeyFromSecret, getLatestAccountKey bool
+	var clientID, tenantID, serviceAccountToken string
 
 	for k, v := range reqContext {
 		switch strings.ToLower(k) {
@@ -739,9 +763,18 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			if getLatestAccountKey, err = strconv.ParseBool(v); err != nil {
 				return rgName, accountName, accountKey, fileShareName, diskName, subsID, fmt.Errorf("invalid %s: %s in volume context", getLatestAccountKeyField, v)
 			}
+		case strings.ToLower(clientIDField):
+			clientID = v
+		case strings.ToLower(tenantIDField):
+			tenantID = v
+		case strings.ToLower(serviceAccountTokenField):
+			serviceAccountToken = v
 		}
 	}
 
+	if tenantID == "" {
+		tenantID = d.cloud.TenantID
+	}
 	if rgName == "" {
 		rgName = d.cloud.ResourceGroup
 	}
@@ -761,8 +794,16 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		}
 	}
 
+	// if client id is specified, we only use service account token to get account key
+	if clientID != "" {
+		klog.V(2).Infof("clientID(%s) is specified, use service account token to get account key", clientID)
+		accountKey, err := d.cloud.GetStorageAccesskeyFromServiceAccountToken(ctx, subsID, accountName, rgName, clientID, tenantID, serviceAccountToken)
+		return rgName, accountName, accountKey, fileShareName, diskName, subsID, err
+	}
+
 	if len(secrets) == 0 {
-		// read account key from cache first
+		// if request context does not contain secrets, get secrets in the following order:
+		// 1. get account key from cache first
 		cache, errCache := d.accountCacheMap.Get(accountName, azcache.CacheReadTypeDefault)
 		if errCache != nil {
 			return rgName, accountName, accountKey, fileShareName, diskName, subsID, errCache
@@ -775,11 +816,13 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			}
 			if secretName != "" {
 				var name string
+				// 2. if not found in cache, get account key from kubernetes secret
 				name, accountKey, err = d.GetStorageAccountFromSecret(ctx, secretName, secretNamespace)
 				if name != "" {
 					accountName = name
 				}
 				if err != nil {
+					// 3. if failed to get account key from kubernetes secret, use cluster identity to get account key
 					klog.Warningf("GetStorageAccountFromSecret(%s, %s) failed with error: %v", secretName, secretNamespace, err)
 					if !getAccountKeyFromSecret && d.cloud.StorageAccountClient != nil && accountName != "" {
 						klog.V(2).Infof("use cluster identity to get account key from (%s, %s, %s)", subsID, rgName, accountName)
@@ -791,7 +834,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 				}
 			}
 		}
-	} else {
+	} else { // if request context contains secrets, get account name and key directly
 		var account string
 		account, accountKey, err = getStorageAccount(secrets)
 		if account != "" {
@@ -950,7 +993,7 @@ func (d *Driver) ResizeFileShare(ctx context.Context, subsID, resourceGroup, acc
 }
 
 // copyFileShare copies a fileshare in the same storage account
-func (d *Driver) copyFileShare(req *csi.CreateVolumeRequest, accountKey string, shareOptions *fileclient.ShareOptions, storageEndpointSuffix string) error {
+func (d *Driver) copyFileShare(ctx context.Context, req *csi.CreateVolumeRequest, accountSASToken string, authAzcopyEnv []string, secretName, secretNamespace string, secrets map[string]string, shareOptions *fileclient.ShareOptions, accountOptions *azure.AccountOptions, storageEndpointSuffix string) error {
 	if shareOptions.Protocol == storage.EnabledProtocolsNFS {
 		return fmt.Errorf("protocol nfs is not supported for volume cloning")
 	}
@@ -967,18 +1010,12 @@ func (d *Driver) copyFileShare(req *csi.CreateVolumeRequest, accountKey string, 
 		return fmt.Errorf("srcFileShareName(%s) or dstFileShareName(%s) is empty", srcFileShareName, dstFileShareName)
 	}
 
-	klog.V(2).Infof("generate sas token for account(%s)", accountName)
-	accountSasToken, genErr := generateSASToken(accountName, accountKey, storageEndpointSuffix, d.sasTokenExpirationMinutes)
-	if genErr != nil {
-		return genErr
-	}
+	timeAfter := time.After(time.Duration(d.waitForAzCopyTimeoutMinutes) * time.Minute)
+	timeTick := time.Tick(waitForAzCopyInterval)
+	srcPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, srcFileShareName, accountSASToken)
+	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, dstFileShareName, accountSASToken)
 
-	timeAfter := time.After(waitForCopyTimeout)
-	timeTick := time.Tick(waitForCopyInterval)
-	srcPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, srcFileShareName, accountSasToken)
-	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", accountName, storageEndpointSuffix, dstFileShareName, accountSasToken)
-
-	jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName)
+	jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName, authAzcopyEnv)
 	klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
 	if jobState == fileutil.AzcopyJobError || jobState == fileutil.AzcopyJobCompleted {
 		return err
@@ -987,14 +1024,29 @@ func (d *Driver) copyFileShare(req *csi.CreateVolumeRequest, accountKey string, 
 	for {
 		select {
 		case <-timeTick:
-			jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName)
+			jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName, authAzcopyEnv)
 			klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
 			switch jobState {
 			case fileutil.AzcopyJobError, fileutil.AzcopyJobCompleted:
 				return err
 			case fileutil.AzcopyJobNotFound:
 				klog.V(2).Infof("copy fileshare %s to %s", srcFileShareName, dstFileShareName)
-				out, copyErr := exec.Command("azcopy", "copy", srcPath, dstPath, "--recursive", "--check-length=false").CombinedOutput()
+				cmd := exec.Command("azcopy", "copy", srcPath, dstPath)
+				cmd.Args = append(cmd.Args, defaultAzcopyCopyOptions...)
+				if len(authAzcopyEnv) > 0 {
+					cmd.Env = append(os.Environ(), authAzcopyEnv...)
+				}
+				out, copyErr := cmd.CombinedOutput()
+				if accountSASToken == "" && strings.Contains(string(out), authorizationPermissionMismatch) && copyErr != nil {
+					klog.Warningf("azcopy list failed with AuthorizationPermissionMismatch error, should assign \"Storage File Data SMB Share Elevated Contributor\" role to controller identity, fall back to use sas token, original output: %v", string(out))
+					var sasToken string
+					if sasToken, _, err = d.getAzcopyAuth(ctx, accountName, "", storageEndpointSuffix, accountOptions, secrets, secretName, secretNamespace, true); err != nil {
+						return err
+					}
+					cmd := exec.Command("azcopy", "copy", srcPath+sasToken, dstPath+sasToken)
+					cmd.Args = append(cmd.Args, defaultAzcopyCopyOptions...)
+					out, copyErr = cmd.CombinedOutput()
+				}
 				if copyErr != nil {
 					klog.Warningf("CopyFileShare(%s, %s, %s) failed with error(%v): %v", resourceGroupName, accountName, dstFileShareName, copyErr, string(out))
 				} else {
@@ -1025,6 +1077,9 @@ func (d *Driver) GetTotalAccountQuota(ctx context.Context, subsID, resourceGroup
 
 // RemoveStorageAccountTag remove tag from storage account
 func (d *Driver) RemoveStorageAccountTag(ctx context.Context, subsID, resourceGroup, account, key string) error {
+	if d.cloud == nil || d.cloud.StorageAccountClient == nil {
+		return fmt.Errorf("cloud or StorageAccountClient is nil")
+	}
 	// search in cache first
 	cache, err := d.skipMatchingTagCache.Get(account, azcache.CacheReadTypeDefault)
 	if err != nil {
@@ -1166,4 +1221,18 @@ func (d *Driver) SetAzureCredentials(ctx context.Context, accountName, accountKe
 		return "", fmt.Errorf("couldn't create secret %v", err)
 	}
 	return secretName, err
+}
+
+func (d *Driver) getStorageEndPointSuffix() string {
+	if d.cloud == nil || d.cloud.Environment.StorageEndpointSuffix == "" {
+		return defaultStorageEndPointSuffix
+	}
+	return d.cloud.Environment.StorageEndpointSuffix
+}
+
+func (d *Driver) getCloudEnvironment() azure2.Environment {
+	if d.cloud == nil {
+		return azure2.PublicCloud
+	}
+	return d.cloud.Environment
 }

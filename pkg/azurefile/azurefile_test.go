@@ -31,8 +31,8 @@ import (
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient/mockfileclient"
@@ -52,8 +52,9 @@ var (
 
 func NewFakeDriver() *Driver {
 	driverOptions := DriverOptions{
-		NodeID:     fakeNodeID,
-		DriverName: DefaultDriverName,
+		NodeID:                      fakeNodeID,
+		DriverName:                  DefaultDriverName,
+		WaitForAzCopyTimeoutMinutes: 1,
 	}
 	driver := NewDriver(&driverOptions)
 	driver.Name = fakeDriverName
@@ -1392,5 +1393,90 @@ func TestGetTotalAccountQuota(t *testing.T) {
 		assert.Equal(t, test.expectedErr, err, test.name)
 		assert.Equal(t, test.expectedQuota, quota, test.name)
 		assert.Equal(t, test.expectedShareNum, fileShareNum, test.name)
+	}
+}
+
+func TestGetStorageEndPointSuffix(t *testing.T) {
+	d := NewFakeDriver()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name           string
+		cloud          *azure.Cloud
+		expectedSuffix string
+	}{
+		{
+			name:           "nil cloud",
+			cloud:          nil,
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name:           "empty cloud",
+			cloud:          &azure.Cloud{},
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name: "cloud with storage endpoint suffix",
+			cloud: &azure.Cloud{
+				Environment: azure2.Environment{
+					StorageEndpointSuffix: "suffix",
+				},
+			},
+			expectedSuffix: "suffix",
+		},
+		{
+			name: "public cloud",
+			cloud: &azure.Cloud{
+				Environment: azure2.PublicCloud,
+			},
+			expectedSuffix: "core.windows.net",
+		},
+		{
+			name: "china cloud",
+			cloud: &azure.Cloud{
+				Environment: azure2.ChinaCloud,
+			},
+			expectedSuffix: "core.chinacloudapi.cn",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		suffix := d.getStorageEndPointSuffix()
+		assert.Equal(t, test.expectedSuffix, suffix, test.name)
+	}
+}
+
+func TestGetCloudEnvironment(t *testing.T) {
+	d := NewFakeDriver()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name        string
+		cloud       *azure.Cloud
+		expectedEnv azure2.Environment
+	}{
+		{
+			name:        "nil cloud",
+			cloud:       nil,
+			expectedEnv: azure2.PublicCloud,
+		},
+		{
+			name: "cloud with environment",
+			cloud: &azure.Cloud{
+				Environment: azure2.ChinaCloud,
+			},
+			expectedEnv: azure2.ChinaCloud,
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		env := d.getCloudEnvironment()
+		assert.Equal(t, test.expectedEnv, env, test.name)
 	}
 }

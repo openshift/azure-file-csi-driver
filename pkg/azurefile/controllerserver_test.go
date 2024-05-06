@@ -29,18 +29,19 @@ import (
 	"time"
 
 	"sigs.k8s.io/azurefile-csi-driver/pkg/util"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2022-08-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -51,7 +52,6 @@ import (
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient/mockfileclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient/mockstorageaccountclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmclient/mockvmclient"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
 )
@@ -259,6 +259,29 @@ func TestCreateVolume(t *testing.T) {
 				d := NewFakeDriver()
 
 				expectedErr := status.Errorf(codes.InvalidArgument, "protocol(test_protocol) is not supported, supported protocol list: [smb nfs]")
+				_, err := d.CreateVolume(ctx, req)
+				if !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "nfs protocol only supports premium storage",
+			testFunc: func(t *testing.T) {
+				allParam := map[string]string{
+					protocolField: "nfs",
+					skuNameField:  "Standard_LRS",
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name:               "random-vol-name-nfs-protocol-standard-sku",
+					CapacityRange:      stdCapRange,
+					VolumeCapabilities: stdVolCap,
+					Parameters:         allParam,
+				}
+
+				d := NewFakeDriver()
+				expectedErr := status.Errorf(codes.InvalidArgument, "nfs protocol only supports premium storage, current account type: Standard_LRS")
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -583,6 +606,33 @@ func TestCreateVolume(t *testing.T) {
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "invalid privateEndpoint and subnetName combination",
+			testFunc: func(t *testing.T) {
+				allParam := map[string]string{
+					networkEndpointTypeField: "privateendpoint",
+					subnetNameField:          "subnet1,subnet2",
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name:               "invalid-privateEndpoint-and-subnetName-combination",
+					CapacityRange:      stdCapRange,
+					VolumeCapabilities: stdVolCap,
+					Parameters:         allParam,
+				}
+
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{},
+				}
+
+				expectedErr := status.Errorf(codes.InvalidArgument, "subnetName(subnet1,subnet2) can only contain one subnet for private endpoint")
+				_, err := d.CreateVolume(ctx, req)
+				if !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected error: %v, expected error: %v", err, expectedErr)
 				}
 			},
 		},
@@ -1240,11 +1290,10 @@ func TestCreateVolume(t *testing.T) {
 				}
 
 				d := NewFakeDriver()
-				d.cloud = &azure.Cloud{}
-				_ = azure.InitDiskControllers(d.cloud)
 				d.cloud.KubeClient = fake.NewSimpleClientset()
 				ctrl := gomock.NewController(t)
 				defer ctrl.Finish()
+				d.cloud = azure.GetTestCloud(ctrl)
 
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
 				d.cloud.FileClient = mockFileClient
@@ -1585,8 +1634,7 @@ func TestDeleteVolume(t *testing.T) {
 				ctrl := gomock.NewController(t)
 				defer ctrl.Finish()
 				mockFileClient := mockfileclient.NewMockInterface(ctrl)
-				d.cloud = &azure.Cloud{}
-				_ = azure.InitDiskControllers(d.cloud)
+				d.cloud = azure.GetTestCloud(ctrl)
 				d.cloud.FileClient = mockFileClient
 				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
 				mockFileClient.EXPECT().DeleteFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
@@ -1645,10 +1693,13 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+
 				d := NewFakeDriver()
+				ctx := context.Background()
 
 				expectedErr := status.Errorf(codes.InvalidArgument, "copy volume from volumeSnapshot is not supported")
-				err := d.copyVolume(req, "", nil, "core.windows.net")
+				err := d.copyVolume(ctx, req, "", []string{}, "", "", secret, nil, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1677,10 +1728,13 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+
 				d := NewFakeDriver()
+				ctx := context.Background()
 
 				expectedErr := fmt.Errorf("protocol nfs is not supported for volume cloning")
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{Protocol: storage.EnabledProtocolsNFS}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "", []string{}, "", "", secret, &fileclient.ShareOptions{Protocol: storage.EnabledProtocolsNFS}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1709,10 +1763,13 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+
 				d := NewFakeDriver()
+				ctx := context.Background()
 
 				expectedErr := status.Errorf(codes.NotFound, "error parsing volume id: \"unit-test\", should at least contain two #")
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{Name: "dstFileshare"}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1741,10 +1798,13 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+
 				d := NewFakeDriver()
+				ctx := context.Background()
 
 				expectedErr := fmt.Errorf("srcFileShareName() or dstFileShareName(dstFileshare) is empty")
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{Name: "dstFileshare"}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1773,10 +1833,13 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+
 				d := NewFakeDriver()
+				ctx := context.Background()
 
 				expectedErr := fmt.Errorf("srcFileShareName(fileshare) or dstFileShareName() is empty")
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "", []string{}, "", "", secret, &fileclient.ShareOptions{}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1805,12 +1868,15 @@ func TestCopyVolume(t *testing.T) {
 					VolumeContentSource: &volumecontensource,
 				}
 
+				secret := map[string]string{}
+				ctx := context.Background()
+
 				ctrl := gomock.NewController(t)
 				defer ctrl.Finish()
 
 				m := util.NewMockEXEC(ctrl)
 				listStr := "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: Completed\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false"
-				m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3")).Return(listStr, nil)
+				m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3"), gomock.Any()).Return(listStr, nil)
 				// if test.enableShow {
 				// 	m.EXPECT().RunCommand(gomock.Not("azcopy jobs list | grep dstContainer -B 3")).Return(test.showStr, test.showErr)
 				// }
@@ -1818,7 +1884,7 @@ func TestCopyVolume(t *testing.T) {
 				d.azcopy.ExecCmd = m
 
 				var expectedErr error
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{Name: "dstFileshare"}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "sastoken", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -1846,6 +1912,8 @@ func TestCopyVolume(t *testing.T) {
 					Parameters:          mp,
 					VolumeContentSource: &volumecontensource,
 				}
+				secret := map[string]string{}
+				ctx := context.Background()
 
 				ctrl := gomock.NewController(t)
 				defer ctrl.Finish()
@@ -1853,15 +1921,15 @@ func TestCopyVolume(t *testing.T) {
 				m := util.NewMockEXEC(ctrl)
 				listStr1 := "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: InProgress\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false"
 				listStr2 := "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: Completed\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false"
-				o1 := m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3")).Return(listStr1, nil).Times(1)
-				m.EXPECT().RunCommand(gomock.Not("azcopy jobs list | grep dstFileshare -B 3")).Return("Percent Complete (approx): 50.0", nil)
-				o2 := m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3")).Return(listStr2, nil)
+				o1 := m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3"), gomock.Any()).Return(listStr1, nil).Times(1)
+				m.EXPECT().RunCommand(gomock.Not("azcopy jobs list | grep dstFileshare -B 3"), gomock.Any()).Return("Percent Complete (approx): 50.0", nil)
+				o2 := m.EXPECT().RunCommand(gomock.Eq("azcopy jobs list | grep dstFileshare -B 3"), gomock.Any()).Return(listStr2, nil)
 				gomock.InOrder(o1, o2)
 
 				d.azcopy.ExecCmd = m
 
 				var expectedErr error
-				err := d.copyVolume(req, "", &fileclient.ShareOptions{Name: "dstFileshare"}, "core.windows.net")
+				err := d.copyVolume(ctx, req, "sastoken", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
 				}
@@ -2036,225 +2104,6 @@ func TestValidateVolumeCapabilities(t *testing.T) {
 		_, err := d.ValidateVolumeCapabilities(context.TODO(), &test.req)
 		if !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedErr)
-		}
-	}
-}
-
-func TestControllerPublishVolume(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	d := NewFakeDriver()
-	d.cloud = azure.GetTestCloud(ctrl)
-	d.cloud.Location = "centralus"
-	d.cloud.ResourceGroup = "rg"
-	d.dataPlaneAPIAccountCache, _ = azcache.NewTimedCache(10*time.Minute, func(key string) (interface{}, error) { return nil, nil }, false)
-	nodeName := "vm1"
-	instanceID := fmt.Sprintf("/subscriptions/subscription/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/%s", nodeName)
-	vm := compute.VirtualMachine{
-		Name:     &nodeName,
-		ID:       &instanceID,
-		Location: &d.cloud.Location,
-	}
-	value := base64.StdEncoding.EncodeToString([]byte("acc_key"))
-	key := storage.AccountListKeysResult{
-		Keys: &[]storage.AccountKey{
-			{Value: &value},
-		},
-	}
-	clientSet := fake.NewSimpleClientset()
-
-	stdVolCap := csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{},
-		},
-		AccessMode: &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-		},
-	}
-	multiWriterVolCap := csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{},
-		},
-		AccessMode: &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
-		},
-	}
-	readOnlyVolCap := csi.VolumeCapability{
-		AccessType: &csi.VolumeCapability_Mount{
-			Mount: &csi.VolumeCapability_MountVolume{},
-		},
-		AccessMode: &csi.VolumeCapability_AccessMode{
-			Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY,
-		},
-	}
-
-	tests := []struct {
-		desc        string
-		req         *csi.ControllerPublishVolumeRequest
-		expectedErr error
-	}{
-		{
-			desc:        "Volume ID missing",
-			req:         &csi.ControllerPublishVolumeRequest{},
-			expectedErr: status.Error(codes.InvalidArgument, "Volume ID not provided"),
-		},
-		{
-			desc: "Volume capability missing",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId: "vol_1",
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "Volume capability not provided"),
-		},
-		{
-			desc: "Node ID missing",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_1",
-				VolumeCapability: &stdVolCap,
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "Node ID not provided"),
-		},
-		{
-			desc: "Valid request disk name empty",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_1",
-				VolumeCapability: &stdVolCap,
-				NodeId:           "vm3",
-				VolumeContext: map[string]string{
-					useDataPlaneAPIField: "true",
-				},
-			},
-			expectedErr: nil,
-		},
-		{
-			desc: "Get account info returns error",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_2#f5713de20cde511e8ba4900#fileshare#diskname.vhd",
-				VolumeCapability: &stdVolCap,
-				NodeId:           "vm3",
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "GetAccountInfo(vol_2#f5713de20cde511e8ba4900#fileshare#diskname.vhd) failed with error: Retriable: false, RetryAfter: 0s, HTTPStatusCode: 502, RawError: instance not found"),
-		},
-		{
-			desc: "Unsupported access mode",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_1#f5713de20cde511e8ba4900#fileshare#diskname.vhd",
-				VolumeCapability: &multiWriterVolCap,
-				NodeId:           "vm3",
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "unsupported AccessMode(mode:MULTI_NODE_MULTI_WRITER ) for volume(vol_1#f5713de20cde511e8ba4900#fileshare#diskname.vhd)"),
-		},
-		{
-			desc: "Read only access mode",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_1#f5713de20cde511e8ba4900#fileshare#diskname.vhd",
-				VolumeCapability: &readOnlyVolCap,
-				NodeId:           "vm3",
-			},
-			expectedErr: nil,
-		},
-		{
-			desc: "parse fileURLTemplate error",
-			req: &csi.ControllerPublishVolumeRequest{
-				VolumeId:         "vol_1#^f5713de20cde511e8ba4900#fileshare#diskname.vhd",
-				VolumeCapability: &stdVolCap,
-				NodeId:           "vm3",
-			},
-			expectedErr: status.Error(codes.Internal, fmt.Sprintf("getFileURL(^f5713de20cde511e8ba4900,abc,fileshare,diskname.vhd) returned with error: %v", fmt.Errorf("parse fileURLTemplate error: %v", &url.Error{Op: "parse", URL: "https://^f5713de20cde511e8ba4900.file.abc/fileshare/diskname.vhd", Err: url.InvalidHostError("^")}))),
-		},
-	}
-
-	for _, test := range tests {
-		d.cloud.VirtualMachinesClient = mockvmclient.NewMockInterface(ctrl)
-		mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
-		mockVMsClient := d.cloud.VirtualMachinesClient.(*mockvmclient.MockInterface)
-		d.cloud.StorageAccountClient = mockStorageAccountsClient
-		d.cloud.KubeClient = clientSet
-		d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "vol_2", gomock.Any()).Return(key, &retry.Error{HTTPStatusCode: http.StatusBadGateway, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "vol_1", gomock.Any()).Return(key, nil).AnyTimes()
-		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm1", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusNotFound, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
-		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm2", gomock.Any()).Return(compute.VirtualMachine{}, &retry.Error{HTTPStatusCode: http.StatusBadGateway, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
-		mockVMsClient.EXPECT().Get(gomock.Any(), d.cloud.ResourceGroup, "vm3", gomock.Any()).Return(vm, nil).AnyTimes()
-		mockVMsClient.EXPECT().Update(gomock.Any(), d.cloud.ResourceGroup, gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
-
-		_, err := d.ControllerPublishVolume(context.Background(), test.req)
-		if !reflect.DeepEqual(err, test.expectedErr) {
-			t.Errorf("Unexpected error: %v", err)
-		}
-	}
-}
-
-func TestControllerUnpublishVolume(t *testing.T) {
-	d := NewFakeDriver()
-	d.cloud = &azure.Cloud{}
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	value := base64.StdEncoding.EncodeToString([]byte("acc_key"))
-	key := storage.AccountListKeysResult{
-		Keys: &[]storage.AccountKey{
-			{Value: &value},
-		},
-	}
-	clientSet := fake.NewSimpleClientset()
-
-	tests := []struct {
-		desc        string
-		req         *csi.ControllerUnpublishVolumeRequest
-		expectedErr error
-	}{
-		{
-			desc:        "Volume ID missing",
-			req:         &csi.ControllerUnpublishVolumeRequest{},
-			expectedErr: status.Error(codes.InvalidArgument, "Volume ID not provided"),
-		},
-		{
-			desc: "Node ID missing",
-			req: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: "vol_1",
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "Node ID not provided"),
-		},
-		{
-			desc: "Disk name empty",
-			req: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: "vol_1#f5713de20cde511e8ba4900#fileshare#",
-				NodeId:   fakeNodeID,
-				Secrets:  map[string]string{},
-			},
-			expectedErr: nil,
-		},
-		{
-			desc: "Get account info returns error",
-			req: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: "vol_2#f5713de20cde511e8ba4901#fileshare#diskname.vhd#",
-				NodeId:   fakeNodeID,
-				Secrets:  map[string]string{},
-			},
-			expectedErr: status.Error(codes.InvalidArgument, "GetAccountInfo(vol_2#f5713de20cde511e8ba4901#fileshare#diskname.vhd#) failed with error: Retriable: false, RetryAfter: 0s, HTTPStatusCode: 502, RawError: instance not found"),
-		},
-		{
-			desc: "parse fileURLTemplate error",
-			req: &csi.ControllerUnpublishVolumeRequest{
-				VolumeId: "vol_1#^f5713de20cde511e8ba4900#fileshare#diskname.vhd#",
-				NodeId:   fakeNodeID,
-				Secrets:  map[string]string{},
-			},
-			expectedErr: status.Error(codes.Internal, fmt.Sprintf("getFileURL(^f5713de20cde511e8ba4900,abc,fileshare,diskname.vhd) returned with error: %v", fmt.Errorf("parse fileURLTemplate error: %v", &url.Error{Op: "parse", URL: "https://^f5713de20cde511e8ba4900.file.abc/fileshare/diskname.vhd", Err: url.InvalidHostError("^")}))),
-		},
-	}
-
-	for _, test := range tests {
-		mockStorageAccountsClient := mockstorageaccountclient.NewMockInterface(ctrl)
-		d.cloud.StorageAccountClient = mockStorageAccountsClient
-		d.cloud.KubeClient = clientSet
-		d.cloud.Environment = azure2.Environment{StorageEndpointSuffix: "abc"}
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "vol_2", gomock.Any()).Return(key, &retry.Error{HTTPStatusCode: http.StatusBadGateway, RawError: cloudprovider.InstanceNotFound}).AnyTimes()
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), "vol_1", gomock.Any()).Return(key, nil).AnyTimes()
-
-		_, err := d.ControllerUnpublishVolume(context.Background(), test.req)
-		if !reflect.DeepEqual(err, test.expectedErr) {
-			t.Errorf("Unexpected error: %v", err)
 		}
 	}
 }
@@ -2868,6 +2717,7 @@ func TestSetAzureCredentials(t *testing.T) {
 }
 
 func TestGenerateSASToken(t *testing.T) {
+	d := NewFakeDriver()
 	storageEndpointSuffix := "core.windows.net"
 	tests := []struct {
 		name        string
@@ -2893,7 +2743,7 @@ func TestGenerateSASToken(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sas, err := generateSASToken(tt.accountName, tt.accountKey, storageEndpointSuffix, 30)
+			sas, err := d.generateSASToken(tt.accountName, tt.accountKey, storageEndpointSuffix, 30)
 			if !reflect.DeepEqual(err, tt.expectedErr) {
 				t.Errorf("generateSASToken error = %v, expectedErr %v, sas token = %v, want %v", err, tt.expectedErr, sas, tt.want)
 				return
@@ -2902,5 +2752,189 @@ func TestGenerateSASToken(t *testing.T) {
 				t.Errorf("sas token = %v, want %v", sas, tt.want)
 			}
 		})
+	}
+}
+
+func TestAuthorizeAzcopyWithIdentity(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "use service principal to authorize azcopy",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{
+						AzureAuthConfig: config.AzureAuthConfig{
+							ARMClientConfig: azclient.ARMClientConfig{
+								TenantID: "TenantID",
+							},
+							AzureAuthConfig: azclient.AzureAuthConfig{
+								AADClientID:     "AADClientID",
+								AADClientSecret: "AADClientSecret",
+							},
+						},
+					},
+				}
+				expectedAuthAzcopyEnv := []string{
+					fmt.Sprintf(azcopyAutoLoginType + "=SPN"),
+					fmt.Sprintf(azcopySPAApplicationID + "=AADClientID"),
+					fmt.Sprintf(azcopySPAClientSecret + "=AADClientSecret"),
+					fmt.Sprintf(azcopyTenantID + "=TenantID"),
+				}
+				var expectedErr error
+				authAzcopyEnv, err := d.authorizeAzcopyWithIdentity()
+				if !reflect.DeepEqual(authAzcopyEnv, expectedAuthAzcopyEnv) || !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected authAzcopyEnv: %v, Unexpected error: %v", authAzcopyEnv, err)
+				}
+			},
+		},
+		{
+			name: "use service principal to authorize azcopy but client id is empty",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{
+						AzureAuthConfig: config.AzureAuthConfig{
+							ARMClientConfig: azclient.ARMClientConfig{
+								TenantID: "TenantID",
+							},
+							AzureAuthConfig: azclient.AzureAuthConfig{
+								AADClientSecret: "AADClientSecret",
+							},
+						},
+					},
+				}
+				expectedAuthAzcopyEnv := []string{}
+				expectedErr := fmt.Errorf("AADClientID and TenantID must be set when use service principal")
+				authAzcopyEnv, err := d.authorizeAzcopyWithIdentity()
+				if !reflect.DeepEqual(authAzcopyEnv, expectedAuthAzcopyEnv) || !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected authAzcopyEnv: %v, Unexpected error: %v", authAzcopyEnv, err)
+				}
+			},
+		},
+		{
+			name: "use user assigned managed identity to authorize azcopy",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{
+						AzureAuthConfig: config.AzureAuthConfig{
+							AzureAuthConfig: azclient.AzureAuthConfig{
+								UseManagedIdentityExtension: true,
+								UserAssignedIdentityID:      "UserAssignedIdentityID",
+							},
+						},
+					},
+				}
+				expectedAuthAzcopyEnv := []string{
+					fmt.Sprintf(azcopyAutoLoginType + "=MSI"),
+					fmt.Sprintf(azcopyMSIClientID + "=UserAssignedIdentityID"),
+				}
+				var expectedErr error
+				authAzcopyEnv, err := d.authorizeAzcopyWithIdentity()
+				if !reflect.DeepEqual(authAzcopyEnv, expectedAuthAzcopyEnv) || !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected authAzcopyEnv: %v, Unexpected error: %v", authAzcopyEnv, err)
+				}
+			},
+		},
+		{
+			name: "use system assigned managed identity to authorize azcopy",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{
+						AzureAuthConfig: config.AzureAuthConfig{
+							AzureAuthConfig: azclient.AzureAuthConfig{
+								UseManagedIdentityExtension: true,
+							},
+						},
+					},
+				}
+				expectedAuthAzcopyEnv := []string{
+					fmt.Sprintf(azcopyAutoLoginType + "=MSI"),
+				}
+				var expectedErr error
+				authAzcopyEnv, err := d.authorizeAzcopyWithIdentity()
+				if !reflect.DeepEqual(authAzcopyEnv, expectedAuthAzcopyEnv) || !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected authAzcopyEnv: %v, Unexpected error: %v", authAzcopyEnv, err)
+				}
+			},
+		},
+		{
+			name: "AADClientSecret be nil and useManagedIdentityExtension is false",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{
+						AzureAuthConfig: config.AzureAuthConfig{},
+					},
+				}
+				expectedAuthAzcopyEnv := []string{}
+				expectedErr := fmt.Errorf("neither the service principal nor the managed identity has been set")
+				authAzcopyEnv, err := d.authorizeAzcopyWithIdentity()
+				if !reflect.DeepEqual(authAzcopyEnv, expectedAuthAzcopyEnv) || !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected authAzcopyEnv: %v, Unexpected error: %v", authAzcopyEnv, err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestGetAzcopyAuth(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "failed to get accountKey in secrets",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{},
+				}
+				secrets := map[string]string{
+					defaultSecretAccountName: "accountName",
+				}
+
+				ctx := context.Background()
+				expectedAccountSASToken := ""
+				expectedErr := fmt.Errorf("could not find accountkey or azurestorageaccountkey field in secrets")
+				accountSASToken, authAzcopyEnv, err := d.getAzcopyAuth(ctx, "accountName", "", "core.windows.net", &azure.AccountOptions{}, secrets, "secretsName", "secretsNamespace", false)
+				if !reflect.DeepEqual(err, expectedErr) || authAzcopyEnv != nil || !reflect.DeepEqual(accountSASToken, expectedAccountSASToken) {
+					t.Errorf("Unexpected accountSASToken: %s, Unexpected authAzcopyEnv: %v, Unexpected error: %v", accountSASToken, authAzcopyEnv, err)
+				}
+			},
+		},
+		{
+			name: "generate SAS token failed for illegal account key",
+			testFunc: func(t *testing.T) {
+				d := NewFakeDriver()
+				d.cloud = &azure.Cloud{
+					Config: azure.Config{},
+				}
+				secrets := map[string]string{
+					defaultSecretAccountName: "accountName",
+					defaultSecretAccountKey:  "fakeValue",
+				}
+
+				ctx := context.Background()
+				expectedAccountSASToken := ""
+				expectedErr := status.Errorf(codes.Internal, fmt.Sprintf("failed to generate sas token in creating new shared key credential, accountName: %s, err: %s", "accountName", "decode account key: illegal base64 data at input byte 8"))
+				accountSASToken, authAzcopyEnv, err := d.getAzcopyAuth(ctx, "accountName", "", "core.windows.net", &azure.AccountOptions{}, secrets, "secretsName", "secretsNamespace", false)
+				if !reflect.DeepEqual(err, expectedErr) || authAzcopyEnv != nil || !reflect.DeepEqual(accountSASToken, expectedAccountSASToken) {
+					t.Errorf("Unexpected accountSASToken: %s, Unexpected authAzcopyEnv: %v, Unexpected error: %v", accountSASToken, authAzcopyEnv, err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
 	}
 }
