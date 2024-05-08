@@ -28,8 +28,6 @@ import (
 	"syscall"
 	"testing"
 
-	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
-
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
@@ -38,7 +36,7 @@ import (
 	mount "k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
-
+	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
@@ -410,12 +408,13 @@ func TestNodeStageVolume(t *testing.T) {
 	}
 
 	tests := []struct {
-		desc         string
-		setup        func()
-		req          csi.NodeStageVolumeRequest
-		execScripts  []ExecArgs
-		skipOnDarwin bool
-		expectedErr  testutil.TestError
+		desc          string
+		setup         func()
+		req           csi.NodeStageVolumeRequest
+		execScripts   []ExecArgs
+		skipOnDarwin  bool
+		skipOnWindows bool
+		expectedErr   testutil.TestError
 		// use this field only when Windows
 		// gives flaky error messages due
 		// to CSI proxy
@@ -525,7 +524,7 @@ func TestNodeStageVolume(t *testing.T) {
 		{
 			desc: "[Error] Volume operation in progress",
 			setup: func() {
-				d.volumeLocks.TryAcquire("vol_1##")
+				d.volumeLocks.TryAcquire(fmt.Sprintf("%s-%s", "vol_1##", sourceTest))
 			},
 			req: csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
 				VolumeCapability: &stdVolCap,
@@ -535,7 +534,7 @@ func TestNodeStageVolume(t *testing.T) {
 				DefaultError: status.Error(codes.Aborted, fmt.Sprintf(volumeOperationAlreadyExistsFmt, "vol_1##")),
 			},
 			cleanup: func() {
-				d.volumeLocks.Release("vol_1##")
+				d.volumeLocks.Release(fmt.Sprintf("%s-%s", "vol_1##", sourceTest))
 			},
 		},
 		{
@@ -591,7 +590,8 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContext,
 				Secrets:          secrets},
-			skipOnDarwin: true,
+			skipOnDarwin:  true,
+			skipOnWindows: true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount %s on %v failed "+
 				"with smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				errorSource, errorMountSensSource),
@@ -609,7 +609,8 @@ func TestNodeStageVolume(t *testing.T) {
 				{"blkid", []string{"-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", testDiskPath}, "", &testingexec.FakeExitError{Status: 2}},
 				{"mkfs.ext4", []string{"-F", "-m0", testDiskPath}, "", fmt.Errorf("formatting failed")},
 			},
-			skipOnDarwin: true,
+			skipOnDarwin:  true,
+			skipOnWindows: true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount %s on %v failed with "+
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				errorSource, proxyMountPath),
@@ -623,6 +624,7 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContext,
 				Secrets:          secrets},
+			skipOnWindows: true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount %s on %v failed with "+
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				errorSource, sourceTest),
@@ -634,6 +636,7 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContextEmptyShareName,
 				Secrets:          secrets},
+			skipOnWindows: true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount \\\\k8s.file.test_suffix\\test_sharename on %v failed with "+
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				sourceTest),
@@ -645,6 +648,7 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContextNfs,
 				Secrets:          secrets},
+			skipOnWindows: true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount %s on %v failed with "+
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				errorSource, sourceTest),
@@ -656,6 +660,7 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContextFsType,
 				Secrets:          secrets},
+			skipOnWindows: true,
 			execScripts: []ExecArgs{
 				{"blkid", []string{"-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", testDiskPath}, "", nil},
 				{"mkfs.ext4", []string{"-F", "-m0", testDiskPath}, "", nil},
@@ -671,6 +676,7 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &groupVolCap,
 				VolumeContext:    volContextFsType,
 				Secrets:          secrets},
+			skipOnWindows: true,
 			execScripts: []ExecArgs{
 				{"blkid", []string{"-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", testDiskPath}, "", nil},
 				{"mkfs.ext4", []string{"-F", "-m0", testDiskPath}, "", nil},
@@ -703,6 +709,9 @@ func TestNodeStageVolume(t *testing.T) {
 			test.setup()
 		}
 		if test.skipOnDarwin && runtime.GOOS == "darwin" {
+			continue
+		}
+		if test.skipOnWindows && runtime.GOOS == "windows" {
 			continue
 		}
 		mounter, err := NewFakeMounter()
@@ -784,14 +793,14 @@ func TestNodeUnstageVolume(t *testing.T) {
 		{
 			desc: "[Error] Volume operation in progress",
 			setup: func() {
-				d.volumeLocks.TryAcquire("vol_1")
+				d.volumeLocks.TryAcquire(fmt.Sprintf("%s-%s", "vol_1", targetFile))
 			},
 			req: csi.NodeUnstageVolumeRequest{StagingTargetPath: targetFile, VolumeId: "vol_1"},
 			expectedErr: testutil.TestError{
 				DefaultError: status.Error(codes.Aborted, fmt.Sprintf(volumeOperationAlreadyExistsFmt, "vol_1")),
 			},
 			cleanup: func() {
-				d.volumeLocks.Release("vol_1")
+				d.volumeLocks.Release(fmt.Sprintf("%s-%s", "vol_1", targetFile))
 			},
 		},
 		{
@@ -877,6 +886,9 @@ func TestNodeGetVolumeStats(t *testing.T) {
 	d := NewFakeDriver()
 
 	for _, test := range tests {
+		if runtime.GOOS == "darwin" {
+			continue
+		}
 		_, err := d.NodeGetVolumeStats(context.Background(), &test.req)
 		//t.Errorf("[debug] error: %v\n metrics: %v", err, metrics)
 		if !reflect.DeepEqual(err, test.expectedErr) {

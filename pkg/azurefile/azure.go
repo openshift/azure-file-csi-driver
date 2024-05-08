@@ -27,13 +27,13 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
-
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
-
+	"k8s.io/utils/pointer"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
@@ -48,20 +48,14 @@ var (
 )
 
 // getCloudProvider get Azure Cloud Provider
-func getCloudProvider(kubeconfig, nodeID, secretName, secretNamespace, userAgent string, allowEmptyCloudConfig, enableWindowsHostProcess bool, kubeAPIQPS float64, kubeAPIBurst int) (*azure.Cloud, error) {
+func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secretNamespace, userAgent string, allowEmptyCloudConfig, enableWindowsHostProcess bool, kubeAPIQPS float64, kubeAPIBurst int) (*azure.Cloud, error) {
 	var (
 		config     *azure.Config
 		kubeClient *clientset.Clientset
 		fromSecret bool
 	)
 
-	az := &azure.Cloud{
-		InitSecretConfig: azure.InitSecretConfig{
-			SecretName:      secretName,
-			SecretNamespace: secretNamespace,
-			CloudConfigKey:  "cloud-config",
-		},
-	}
+	az := &azure.Cloud{}
 
 	kubeCfg, err := getKubeConfig(kubeconfig, enableWindowsHostProcess)
 	if err == nil && kubeCfg != nil {
@@ -80,19 +74,25 @@ func getCloudProvider(kubeconfig, nodeID, secretName, secretNamespace, userAgent
 	}
 
 	if kubeClient != nil {
-		klog.V(2).Infof("reading cloud config from secret %s/%s", az.SecretNamespace, az.SecretName)
-		az.KubeClient = kubeClient
-		config, err = az.GetConfigFromSecret()
+		klog.V(2).Infof("reading cloud config from secret %s/%s", secretNamespace, secretName)
+		config, err = configloader.Load[azure.Config](ctx, &configloader.K8sSecretLoaderConfig{
+			K8sSecretConfig: configloader.K8sSecretConfig{
+				SecretName:      secretName,
+				SecretNamespace: secretNamespace,
+				CloudConfigKey:  "cloud-config",
+			},
+			KubeClient: kubeClient,
+		}, nil)
+		if err != nil {
+			klog.V(2).Infof("InitializeCloudFromSecret: failed to get cloud config from secret %s/%s: %v", secretNamespace, secretName, err)
+		}
 		if err == nil && config != nil {
 			fromSecret = true
-		}
-		if err != nil {
-			klog.V(2).Infof("InitializeCloudFromSecret: failed to get cloud config from secret %s/%s: %v", az.SecretNamespace, az.SecretName, err)
 		}
 	}
 
 	if config == nil {
-		klog.V(2).Infof("could not read cloud config from secret %s/%s", az.SecretNamespace, az.SecretName)
+		klog.V(2).Infof("could not read cloud config from secret %s/%s", secretNamespace, secretName)
 		credFile, ok := os.LookupEnv(DefaultAzureCredentialFileEnv)
 		if ok && strings.TrimSpace(credFile) != "" {
 			klog.V(2).Infof("%s env var set as %v", DefaultAzureCredentialFileEnv, credFile)
@@ -104,16 +104,11 @@ func getCloudProvider(kubeconfig, nodeID, secretName, secretNamespace, userAgent
 			}
 			klog.V(2).Infof("use default %s env var: %v", DefaultAzureCredentialFileEnv, credFile)
 		}
-
-		credFileConfig, err := os.Open(credFile)
+		config, err = configloader.Load[azure.Config](ctx, nil, &configloader.FileLoaderConfig{
+			FilePath: credFile,
+		})
 		if err != nil {
-			klog.Warningf("load azure config from file(%s) failed with %v", credFile, err)
-		} else {
-			defer credFileConfig.Close()
-			klog.V(2).Infof("read cloud config from file: %s successfully", credFile)
-			if config, err = azure.ParseConfig(credFileConfig); err != nil {
-				klog.Warningf("parse config file(%s) failed with error: %v", credFile, err)
-			}
+			klog.V(2).Infof("InitializeCloudFromSecret: failed to get cloud config from file %s: %v", credFile, err)
 		}
 	}
 
@@ -125,7 +120,18 @@ func getCloudProvider(kubeconfig, nodeID, secretName, secretNamespace, userAgent
 		}
 	} else {
 		config.UserAgent = userAgent
-		if err = az.InitializeCloudFromConfig(context.TODO(), config, fromSecret, false); err != nil {
+		// these environment variables are injected by workload identity webhook
+		if tenantID := os.Getenv("AZURE_TENANT_ID"); tenantID != "" {
+			config.TenantID = tenantID
+		}
+		if clientID := os.Getenv("AZURE_CLIENT_ID"); clientID != "" {
+			config.AADClientID = clientID
+		}
+		if federatedTokenFile := os.Getenv("AZURE_FEDERATED_TOKEN_FILE"); federatedTokenFile != "" {
+			config.AADFederatedTokenFile = federatedTokenFile
+			config.UseFederatedWorkloadIdentityExtension = true
+		}
+		if err = az.InitializeCloudFromConfig(ctx, config, fromSecret, false); err != nil {
 			klog.Warningf("InitializeCloudFromConfig failed with error: %v", err)
 		}
 	}
@@ -211,7 +217,7 @@ func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceG
 	}
 	serviceEndpoints := *subnet.SubnetPropertiesFormat.ServiceEndpoints
 	for _, v := range serviceEndpoints {
-		if v.Service != nil && *v.Service == storageService {
+		if strings.HasPrefix(pointer.StringDeref(v.Service, ""), storageService) {
 			storageServiceExists = true
 			klog.V(4).Infof("serviceEndpoint(%s) is already in subnet(%s)", storageService, subnetName)
 			break

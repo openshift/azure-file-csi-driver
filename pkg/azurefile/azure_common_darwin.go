@@ -20,10 +20,18 @@ limitations under the License.
 package azurefile
 
 import (
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	mount "k8s.io/mount-utils"
 )
 
 func SMBMount(m *mount.SafeFormatAndMount, source, target, fsType string, options, sensitiveMountOptions []string) error {
+	return nil
+}
+
+func SMBUnmount(m *mount.SafeFormatAndMount, target string, _, _ bool) error {
 	return nil
 }
 
@@ -37,4 +45,9 @@ func preparePublishPath(path string, m *mount.SafeFormatAndMount) error {
 
 func prepareStagePath(path string, m *mount.SafeFormatAndMount) error {
 	return nil
+}
+
+// GetVolumeStats returns volume stats based on the given path.
+func GetVolumeStats(path string, enableWindowsHostProcess bool) (*csi.NodeGetVolumeStatsResponse, error) {
+	return nil, status.Errorf(codes.Internal, "GetVolumeStats is not supported on darwin")
 }

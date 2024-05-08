@@ -16,7 +16,7 @@
 ### install a specific version
 ```console
 helm repo add azurefile-csi-driver https://raw.githubusercontent.com/kubernetes-sigs/azurefile-csi-driver/master/charts
-helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version v1.28.1
+helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version v1.29.5
 ```
 
 ### install on RedHat/CentOS
@@ -47,6 +47,7 @@ The following table lists the configurable parameters of the latest Azure File C
 
 | Parameter                                         | Description                                                | Default                                                           |
 |---------------------------------------------------|------------------------------------------------------------|-------------------------------------------------------------------|
+| `azureCredentialFileConfigMap`                    | alternative ConfigMap name for the credentials file        | `azure-cred-file` |
 | `driver.name`                                     | alternative driver name                                    | `file.csi.azure.com` |
 | `driver.customUserAgent`                          | custom userAgent               | `` |
 | `driver.userAgentSuffix`                          | userAgent suffix               | `OSS-helm` |
@@ -128,10 +129,10 @@ The following table lists the configurable parameters of the latest Azure File C
 | `node.logLevel`                                   | node driver log level                                                          |`5`                                                           |
 | `snapshot.enabled`                                | whether enable snapshot feature                            | `false`                                                        |
 | `snapshot.image.csiSnapshotter.repository`        | csi-snapshotter docker image                               | `/oss/kubernetes-csi/csi-snapshotter`         |
-| `snapshot.image.csiSnapshotter.tag`               | csi-snapshotter docker image tag                           | `v6.2.1`                                                       |
+| `snapshot.image.csiSnapshotter.tag`               | csi-snapshotter docker image tag                           | `v6.3.1`                                                       |
 | `snapshot.image.csiSnapshotter.pullPolicy`        | csi-snapshotter image pull policy                          | `IfNotPresent`                                                 |
 | `snapshot.image.csiSnapshotController.repository` | snapshot-controller docker image                           | `/oss/kubernetes-csi/snapshot-controller`     |
-| `snapshot.image.csiSnapshotController.tag`        | snapshot-controller docker image tag                       | `v6.2.1`                                                       |
+| `snapshot.image.csiSnapshotController.tag`        | snapshot-controller docker image tag                       | `v6.3.1`                                                       |
 | `snapshot.image.csiSnapshotController.pullPolicy` | snapshot-controller image pull policy                      | `IfNotPresent`                                                 |
 | `snapshot.snapshotController.name`                | snapshot controller name                                   | `csi-snapshot-controller`                                                           |
 | `snapshot.snapshotController.replicas`            | the replicas of snapshot-controller                        | `2`                                                          |

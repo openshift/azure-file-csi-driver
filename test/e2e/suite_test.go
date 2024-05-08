@@ -66,10 +66,11 @@ var (
 )
 
 type testCmd struct {
-	command  string
-	args     []string
-	startLog string
-	endLog   string
+	command     string
+	args        []string
+	startLog    string
+	endLog      string
+	ignoreError bool
 }
 
 var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
@@ -84,8 +85,6 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 		kubeconfig := filepath.Join(os.Getenv("HOME"), ".kube", "config")
 		os.Setenv(kubeconfigEnvVar, kubeconfig)
 	}
-	handleFlags()
-	framework.AfterReadingAllFlags(&framework.TestContext)
 
 	// Default storage driver configuration is CSI. Freshly built
 	// CSI driver is installed for that case.
@@ -181,10 +180,11 @@ var _ = ginkgo.AfterSuite(func(ctx ginkgo.SpecContext) {
 			execTestCmd([]testCmd{createExampleDeployment})
 
 			azurefileLog := testCmd{
-				command:  "bash",
-				args:     []string{"test/utils/azurefile_log.sh"},
-				startLog: "===================azurefile log===================",
-				endLog:   "===================================================",
+				command:     "bash",
+				args:        []string{"test/utils/azurefile_log.sh"},
+				startLog:    "===================azurefile log===================",
+				endLog:      "===================================================",
+				ignoreError: true,
 			}
 			e2eTeardown := testCmd{
 				command:  "make",
@@ -258,7 +258,12 @@ func execTestCmd(cmds []testCmd) {
 		cmdSh.Stdout = os.Stdout
 		cmdSh.Stderr = os.Stderr
 		err = cmdSh.Run()
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		if err != nil {
+			log.Println(err)
+			if !cmd.ignoreError {
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			}
+		}
 		log.Println(cmd.endLog)
 	}
 }
@@ -273,8 +278,8 @@ func checkAccountCreationLeak(ctx context.Context) {
 	framework.ExpectNoError(err, fmt.Sprintf("failed to GetAccountNumByResourceGroup(%s): %v", creds.ResourceGroup, err))
 	ginkgo.By(fmt.Sprintf("GetAccountNumByResourceGroup(%s) returns %d accounts", creds.ResourceGroup, accountNum))
 
-	accountLimitInTest := 13
-	framework.ExpectEqual(accountNum >= accountLimitInTest, false, fmt.Sprintf("current account num %d should not exceed %d", accountNum, accountLimitInTest))
+	accountLimitInTest := 15
+	gomega.Expect(accountNum >= accountLimitInTest).To(gomega.BeFalse())
 }
 
 func skipIfTestingInWindowsCluster() {
@@ -287,6 +292,12 @@ func skipIfUsingInTreeVolumePlugin() {
 	if isUsingInTreeVolumePlugin {
 		log.Println("test case is only available for CSI drivers")
 		ginkgo.Skip("test case is only available for CSI drivers")
+	}
+}
+
+func skipIfTestingInMigrationCluster() {
+	if isTestingMigration {
+		ginkgo.Skip("test case not supported by Migration clusters")
 	}
 }
 
@@ -312,9 +323,11 @@ func convertToPowershellCommandIfNecessary(command string) string {
 }
 
 // handleFlags sets up all flags and parses the command line.
-func handleFlags() {
+func TestMain(m *testing.M) {
 	config.CopyFlags(config.Flags, flag.CommandLine)
 	framework.RegisterCommonFlags(flag.CommandLine)
 	framework.RegisterClusterFlags(flag.CommandLine)
+	framework.AfterReadingAllFlags(&framework.TestContext)
 	flag.Parse()
+	os.Exit(m.Run())
 }

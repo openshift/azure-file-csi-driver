@@ -58,21 +58,17 @@ if [[ -z "$(command -v jq)" ]]; then
 fi
 
 # install yq
-pip install --ignore-installed --require-hashes -r ${PKG_ROOT}/hack/requirements.txt
+pip install --break-system-packages --ignore-installed --require-hashes -r ${PKG_ROOT}/hack/requirements.txt
 
 # Extract images from csi-azurefile-controller.yaml
 expected_csi_provisioner_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[0].image | head -n 1)"
-expected_csi_attacher_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[1].image | head -n 1)"
-expected_csi_snapshotter_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[2].image | head -n 1)"
-expected_csi_resizer_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[3].image | head -n 1)"
-expected_liveness_probe_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[4].image | head -n 1)"
-expected_azurefile_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[5].image | head -n 1)"
+expected_csi_snapshotter_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[1].image | head -n 1)"
+expected_csi_resizer_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[2].image | head -n 1)"
+expected_liveness_probe_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[3].image | head -n 1)"
+expected_azurefile_image="$(cat ${PKG_ROOT}/deploy/csi-azurefile-controller.yaml | yq -r .spec.template.spec.containers[4].image | head -n 1)"
 
 csi_provisioner_image="$(get_image_from_helm_chart ".image.csiProvisioner")"
 validate_image "${expected_csi_provisioner_image}" "${csi_provisioner_image}"
-
-csi_attacher_image="$(get_image_from_helm_chart ".image.csiAttacher")"
-validate_image "${expected_csi_attacher_image}" "${csi_attacher_image}"
 
 csi_snapshotter_image="$(get_image_from_helm_chart ".snapshot.image.csiSnapshotter")"
 validate_image "${expected_csi_snapshotter_image}" "${csi_snapshotter_image}"

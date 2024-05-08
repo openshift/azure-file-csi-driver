@@ -29,13 +29,15 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"golang.org/x/net/context"
+
+	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
+	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
 )
 
 // NodePublishVolume mount the volume from staging to target path
@@ -57,6 +59,19 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	mountPermissions := d.mountPermissions
 	context := req.GetVolumeContext()
 	if context != nil {
+		// token request
+		if context[serviceAccountTokenField] != "" && getValueInMap(context, clientIDField) != "" {
+			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s", volumeID, target, getValueInMap(context, clientIDField))
+			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
+				StagingTargetPath: target,
+				VolumeContext:     context,
+				VolumeCapability:  volCap,
+				VolumeId:          volumeID,
+			})
+			return &csi.NodePublishVolumeResponse{}, err
+		}
+
+		// ephemeral volume
 		if strings.EqualFold(context[ephemeralField], trueValue) {
 			setKeyValueInMap(context, secretNamespaceField, context[podNamespaceField])
 			if !d.allowInlineVolumeKeyAccessWithIdentity {
@@ -74,7 +89,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			return &csi.NodePublishVolumeResponse{}, err
 		}
 
-		if perm := context[mountPermissionsField]; perm != "" {
+		if perm := getValueInMap(context, mountPermissionsField); perm != "" {
 			var err error
 			if mountPermissions, err = strconv.ParseUint(perm, 8, 32); err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("invalid mountPermissions %s", perm))
@@ -118,7 +133,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 }
 
 // NodeUnpublishVolume unmount the volume from the target path
-func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
@@ -153,9 +168,21 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	volumeID := req.GetVolumeId()
 	context := req.GetVolumeContext()
+
+	if getValueInMap(context, clientIDField) != "" && context[serviceAccountTokenField] == "" {
+		klog.V(2).Infof("Skip NodeStageVolume for volume(%s) since clientID %s is provided but service account token is empty", volumeID, getValueInMap(context, clientIDField))
+		return &csi.NodeStageVolumeResponse{}, nil
+	}
+
 	mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
 	volumeMountGroup := req.GetVolumeCapability().GetMount().GetVolumeMountGroup()
 	gidPresent := checkGidPresentInMountFlags(mountFlags)
+
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_stage_volume", d.cloud.ResourceGroup, "", d.Name)
+	isOperationSucceeded := false
+	defer func() {
+		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
+	}()
 
 	_, accountName, accountKey, fileShareName, diskName, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), context)
 	if err != nil {
@@ -232,17 +259,14 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		return nil, status.Errorf(codes.InvalidArgument, "fsGroupChangePolicy(%s) is not supported, supported fsGroupChangePolicy list: %v", fsGroupChangePolicy, supportedFSGroupChangePolicyList)
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+	lockKey := fmt.Sprintf("%s-%s", volumeID, targetPath)
+	if acquired := d.volumeLocks.TryAcquire(lockKey); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
-	defer d.volumeLocks.Release(volumeID)
+	defer d.volumeLocks.Release(lockKey)
 
 	if strings.TrimSpace(storageEndpointSuffix) == "" {
-		if d.cloud.Environment.StorageEndpointSuffix != "" {
-			storageEndpointSuffix = d.cloud.Environment.StorageEndpointSuffix
-		} else {
-			storageEndpointSuffix = defaultStorageEndPointSuffix
-		}
+		storageEndpointSuffix = d.getStorageEndPointSuffix()
 	}
 
 	// replace pv/pvc name namespace metadata in fileShareName
@@ -278,6 +302,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	var mountOptions, sensitiveMountOptions []string
 	if protocol == nfs {
 		mountOptions = util.JoinMountOptions(mountFlags, []string{"vers=4,minorversion=1,sec=sys"})
+		mountOptions = appendDefaultNfsMountOptions(mountOptions, d.appendNoResvPortOption, d.appendActimeoOption)
 	} else {
 		if accountName == "" || accountKey == "" {
 			return nil, status.Errorf(codes.Internal, "accountName(%s) or accountKey is empty", accountName)
@@ -294,7 +319,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			if ephemeralVol {
 				cifsMountFlags = util.JoinMountOptions(cifsMountFlags, strings.Split(ephemeralVolMountOptions, ","))
 			}
-			mountOptions = appendDefaultMountOptions(cifsMountFlags, d.appendNoShareSockOption, d.appendClosetimeoOption)
+			mountOptions = appendDefaultCifsMountOptions(cifsMountFlags, d.appendNoShareSockOption, d.appendClosetimeoOption)
 		}
 	}
 
@@ -368,11 +393,13 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			}
 		}
 	}
+
+	isOperationSucceeded = true
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 // NodeUnstageVolume unmount the volume from the staging path
-func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
@@ -382,47 +409,90 @@ func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolu
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+	lockKey := fmt.Sprintf("%s-%s", volumeID, stagingTargetPath)
+	if acquired := d.volumeLocks.TryAcquire(lockKey); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
-	defer d.volumeLocks.Release(volumeID)
+	defer d.volumeLocks.Release(lockKey)
 
-	klog.V(2).Infof("NodeUnstageVolume: CleanupMountPoint volume %s on %s", volumeID, stagingTargetPath)
-	if err := CleanupMountPoint(d.mounter, stagingTargetPath, true /*extensiveMountPointCheck*/); err != nil {
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_unstage_volume", d.cloud.ResourceGroup, "", d.Name)
+	isOperationSucceeded := false
+	defer func() {
+		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
+	}()
+
+	klog.V(2).Infof("NodeUnstageVolume: unmount volume %s on %s", volumeID, stagingTargetPath)
+	if err := SMBUnmount(d.mounter, stagingTargetPath, true /*extensiveMountPointCheck*/, d.removeSMBMountOnWindows); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to unmount staging target %s: %v", stagingTargetPath, err)
 	}
 
-	targetPath := filepath.Join(filepath.Dir(stagingTargetPath), proxyMount)
-	klog.V(2).Infof("NodeUnstageVolume: CleanupMountPoint volume %s on %s", volumeID, targetPath)
-	if err := CleanupMountPoint(d.mounter, targetPath, false); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unmount staging target %s: %v", targetPath, err)
+	if runtime.GOOS != "windows" {
+		targetPath := filepath.Join(filepath.Dir(stagingTargetPath), proxyMount)
+		klog.V(2).Infof("NodeUnstageVolume: CleanupMountPoint volume %s on %s", volumeID, targetPath)
+		if err := CleanupMountPoint(d.mounter, targetPath, false); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to unmount staging target %s: %v", targetPath, err)
+		}
 	}
 	klog.V(2).Infof("NodeUnstageVolume: unmount volume %s on %s successfully", volumeID, stagingTargetPath)
 
+	isOperationSucceeded = true
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 // NodeGetCapabilities return the capabilities of the Node plugin
-func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (d *Driver) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: d.NSCap,
 	}, nil
 }
 
 // NodeGetInfo return info of the node on which this plugin is running
-func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+func (d *Driver) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	return &csi.NodeGetInfoResponse{
 		NodeId: d.NodeID,
 	}, nil
 }
 
 // NodeGetVolumeStats get volume stats
-func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+func (d *Driver) NodeGetVolumeStats(_ context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	if len(req.VolumeId) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "NodeGetVolumeStats volume ID was empty")
 	}
 	if len(req.VolumePath) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "NodeGetVolumeStats volume path was empty")
+	}
+
+	// check if the volume stats is cached
+	cache, err := d.volStatsCache.Get(req.VolumeId, azcache.CacheReadTypeDefault)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+	if cache != nil {
+		resp := cache.(csi.NodeGetVolumeStatsResponse)
+		klog.V(6).Infof("NodeGetVolumeStats: volume stats for volume %s path %s is cached", req.VolumeId, req.VolumePath)
+		return &resp, nil
+	}
+
+	// fileShareName in volumeID may contain subPath, e.g. csi-shared-config/ASCP01/certs
+	// get the file share name without subPath from volumeID and check the cache again using new volumeID
+	var newVolID string
+	if _, accountName, fileShareName, _, secretNamespace, _, err := GetFileShareInfo(req.VolumeId); err == nil {
+		if splitStr := strings.Split(fileShareName, "/"); len(splitStr) > 1 {
+			fileShareName = splitStr[0]
+		}
+		// get new volumeID
+		if accountName != "" && fileShareName != "" {
+			newVolID = fmt.Sprintf(volumeIDTemplate, "", accountName, fileShareName, "", "", secretNamespace)
+		}
+	}
+
+	if cache, err = d.volStatsCache.Get(newVolID, azcache.CacheReadTypeDefault); err != nil {
+		return nil, status.Errorf(codes.Internal, err.Error())
+	}
+	if cache != nil {
+		resp := cache.(csi.NodeGetVolumeStatsResponse)
+		klog.V(6).Infof("NodeGetVolumeStats: volume stats for volume %s path %s is cached", req.VolumeId, req.VolumePath)
+		return &resp, nil
 	}
 
 	if _, err := os.Lstat(req.VolumePath); err != nil {
@@ -432,58 +502,39 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 		return nil, status.Errorf(codes.Internal, "failed to stat file %s: %v", req.VolumePath, err)
 	}
 
-	volumeMetrics, err := volume.NewMetricsStatFS(req.VolumePath).GetMetrics()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get metrics: %v", err)
+	if d.printVolumeStatsCallLogs {
+		klog.V(2).Infof("NodeGetVolumeStats: begin to get VolumeStats on volume %s path %s", req.VolumeId, req.VolumePath)
+	} else {
+		klog.V(6).Infof("NodeGetVolumeStats: begin to get VolumeStats on volume %s path %s", req.VolumeId, req.VolumePath)
 	}
 
-	available, ok := volumeMetrics.Available.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform volume available size(%v)", volumeMetrics.Available)
-	}
-	capacity, ok := volumeMetrics.Capacity.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform volume capacity size(%v)", volumeMetrics.Capacity)
-	}
-	used, ok := volumeMetrics.Used.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform volume used size(%v)", volumeMetrics.Used)
-	}
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_get_volume_stats", d.cloud.ResourceGroup, "", d.Name)
+	mc.LogLevel = 6 // change log level
+	isOperationSucceeded := false
+	defer func() {
+		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, req.VolumeId)
+	}()
 
-	inodesFree, ok := volumeMetrics.InodesFree.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform disk inodes free(%v)", volumeMetrics.InodesFree)
+	resp, err := GetVolumeStats(req.VolumePath, d.enableWindowsHostProcess)
+	if err == nil && resp != nil {
+		if d.printVolumeStatsCallLogs {
+			klog.V(2).Infof("NodeGetVolumeStats: volume stats for volume %s path %s is %v", req.VolumeId, req.VolumePath, resp)
+		} else {
+			klog.V(6).Infof("NodeGetVolumeStats: volume stats for volume %s path %s is %v", req.VolumeId, req.VolumePath, resp)
+		}
+		// cache the volume stats per volume
+		d.volStatsCache.Set(req.VolumeId, *resp)
+		if newVolID != "" {
+			d.volStatsCache.Set(newVolID, *resp)
+		}
 	}
-	inodes, ok := volumeMetrics.Inodes.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform disk inodes(%v)", volumeMetrics.Inodes)
-	}
-	inodesUsed, ok := volumeMetrics.InodesUsed.AsInt64()
-	if !ok {
-		return nil, status.Errorf(codes.Internal, "failed to transform disk inodes used(%v)", volumeMetrics.InodesUsed)
-	}
-
-	return &csi.NodeGetVolumeStatsResponse{
-		Usage: []*csi.VolumeUsage{
-			{
-				Unit:      csi.VolumeUsage_BYTES,
-				Available: available,
-				Total:     capacity,
-				Used:      used,
-			},
-			{
-				Unit:      csi.VolumeUsage_INODES,
-				Available: inodesFree,
-				Total:     inodes,
-				Used:      inodesUsed,
-			},
-		},
-	}, nil
+	isOperationSucceeded = true
+	return resp, err
 }
 
 // NodeExpandVolume node expand volume
 // N/A for azure file
-func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (d *Driver) NodeExpandVolume(_ context.Context, _ *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
 }
 
