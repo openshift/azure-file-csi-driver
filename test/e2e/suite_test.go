@@ -62,7 +62,8 @@ var (
 		"csi.storage.k8s.io/provisioner-secret-namespace": "default",
 		"csi.storage.k8s.io/node-stage-secret-namespace":  "default",
 	}
-	supportZRSwithNFS bool
+	supportZRSwithNFS      bool
+	supportSnapshotwithNFS bool
 )
 
 type testCmd struct {
@@ -104,6 +105,14 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 			}
 		}
 
+		// check whether current region supports snapshot with NFS protocol
+		supportedRegions = []string{"canadacentral", "uksouth", "francesouth", "francecentral", "germanywestcentral"}
+		for _, region := range supportedRegions {
+			if creds.Location == region {
+				supportSnapshotwithNFS = true
+			}
+		}
+
 		// Install Azure File CSI Driver on cluster from project root
 		e2eBootstrap := testCmd{
 			command:  "make",
@@ -135,11 +144,14 @@ var _ = ginkgo.BeforeSuite(func(ctx ginkgo.SpecContext) {
 		driverOptions := azurefile.DriverOptions{
 			NodeID:     os.Getenv("nodeid"),
 			DriverName: azurefile.DefaultDriverName,
+			Endpoint:   fmt.Sprintf("unix:///tmp/csi-%s.sock", uuid.NewUUID().String()),
+			KubeConfig: kubeconfig,
 		}
 		azurefileDriver = azurefile.NewDriver(&driverOptions)
 		go func() {
 			os.Setenv("AZURE_CREDENTIAL_FILE", credentials.TempAzureCredentialFilePath)
-			azurefileDriver.Run(fmt.Sprintf("unix:///tmp/csi-%s.sock", uuid.NewUUID().String()), kubeconfig, false)
+			err := azurefileDriver.Run(context.Background())
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		}()
 	}
 })

@@ -17,7 +17,7 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 REGISTRY ?= andyzhangx
 REGISTRY_NAME ?= $(shell echo $(REGISTRY) | sed "s/.azurecr.io//g")
 IMAGE_NAME ?= azurefile-csi
-IMAGE_VERSION ?= v1.29.5
+IMAGE_VERSION ?= v1.30.3
 # Use a custom version for E2E tests if we are testing in CI
 ifdef CI
 ifndef PUBLISH
@@ -81,10 +81,6 @@ unit-test:
 .PHONY: sanity-test
 sanity-test: azurefile
 	go test -v -timeout=10m ./test/sanity
-
-.PHONY: integration-test
-integration-test: azurefile
-	go test -v -timeout=10m ./test/integration
 
 .PHONY: e2e-test
 e2e-test:

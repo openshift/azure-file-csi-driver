@@ -7,7 +7,6 @@
 package file
 
 import (
-	"encoding/binary"
 	"errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/exported"
@@ -34,6 +33,13 @@ type SMBProperties = exported.SMBProperties
 // The subset of attributes is listed at: https://learn.microsoft.com/en-us/rest/api/storageservices/set-file-properties#file-system-attributes.
 type NTFSFileAttributes = exported.NTFSFileAttributes
 
+// ParseNTFSFileAttributes parses the file attributes from *string to *NTFSFileAttributes.
+// It can be used to convert the file attributes to *NTFSFileAttributes where it is returned as *string type in the response.
+// It returns an error for any unknown file attribute.
+func ParseNTFSFileAttributes(attributes *string) (*NTFSFileAttributes, error) {
+	return exported.ParseNTFSFileAttributes(attributes)
+}
+
 // Permissions contains the optional parameters for the permissions on the file.
 type Permissions = exported.Permissions
 
@@ -48,7 +54,7 @@ type SourceModifiedAccessConditions = generated.SourceModifiedAccessConditions
 
 // HTTPRange defines a range of bytes within an HTTP resource, starting at offset and
 // ending at offset+count. A zero-value HTTPRange indicates the entire resource. An HTTPRange
-// which has an offset but no zero value count indicates from the offset to the resource's end.
+// which has an offset and zero value count indicates from the offset to the resource's end.
 type HTTPRange = exported.HTTPRange
 
 // ShareFileRangeList - The list of file ranges.
@@ -59,6 +65,12 @@ type ClearRange = generated.ClearRange
 
 // ShareFileRange - An Azure Storage file range.
 type ShareFileRange = generated.FileRange
+
+// SourceLeaseAccessConditions contains optional parameters to access the source directory.
+type SourceLeaseAccessConditions = generated.SourceLeaseAccessConditions
+
+// DestinationLeaseAccessConditions contains optional parameters to access the destination directory.
+type DestinationLeaseAccessConditions = generated.DestinationLeaseAccessConditions
 
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -74,28 +86,31 @@ type CreateOptions struct {
 	Metadata map[string]*string
 }
 
-func (o *CreateOptions) format() (fileAttributes string, fileCreationTime string, fileLastWriteTime string,
-	createOptions *generated.FileClientCreateOptions, fileHTTPHeaders *generated.ShareFileHTTPHeaders, leaseAccessConditions *LeaseAccessConditions) {
+func (o *CreateOptions) format() (*generated.FileClientCreateOptions, *generated.ShareFileHTTPHeaders, *LeaseAccessConditions) {
 	if o == nil {
-		return shared.FileAttributesNone, shared.DefaultCurrentTimeString, shared.DefaultCurrentTimeString, &generated.FileClientCreateOptions{
-			FilePermission: to.Ptr(shared.DefaultFilePermissionString),
+		return &generated.FileClientCreateOptions{
+			FileAttributes:    to.Ptr(shared.FileAttributesNone),
+			FileCreationTime:  to.Ptr(shared.DefaultCurrentTimeString),
+			FileLastWriteTime: to.Ptr(shared.DefaultCurrentTimeString),
+			FilePermission:    to.Ptr(shared.DefaultFilePermissionString),
 		}, nil, nil
 	}
 
-	fileAttributes, fileCreationTime, fileLastWriteTime = o.SMBProperties.Format(false, shared.FileAttributesNone, shared.DefaultCurrentTimeString)
+	fileAttributes, fileCreationTime, fileLastWriteTime, fileChangeTime := exported.FormatSMBProperties(o.SMBProperties, to.Ptr(shared.FileAttributesNone), to.Ptr(shared.DefaultCurrentTimeString), false)
 
-	permission, permissionKey := o.Permissions.Format(shared.DefaultFilePermissionString)
+	permission, permissionKey := exported.FormatPermissions(o.Permissions, to.Ptr(shared.DefaultFilePermissionString))
 
-	createOptions = &generated.FileClientCreateOptions{
+	createOptions := &generated.FileClientCreateOptions{
+		FileAttributes:    fileAttributes,
+		FileChangeTime:    fileChangeTime,
+		FileCreationTime:  fileCreationTime,
+		FileLastWriteTime: fileLastWriteTime,
 		FilePermission:    permission,
 		FilePermissionKey: permissionKey,
 		Metadata:          o.Metadata,
 	}
 
-	fileHTTPHeaders = o.HTTPHeaders
-	leaseAccessConditions = o.LeaseAccessConditions
-
-	return
+	return createOptions, o.HTTPHeaders, o.LeaseAccessConditions
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -111,6 +126,63 @@ func (o *DeleteOptions) format() (*generated.FileClientDeleteOptions, *generated
 		return nil, nil
 	}
 	return nil, o.LeaseAccessConditions
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+
+// RenameOptions contains the optional parameters for the Client.Rename method.
+type RenameOptions struct {
+	// SMBProperties contains the optional parameters regarding the SMB/NTFS properties for a file.
+	SMBProperties *SMBProperties
+	// Permissions contains the optional parameters for the permissions on the file.
+	Permissions *Permissions
+	// ContentType sets the content type of the file.
+	ContentType *string
+	// IgnoreReadOnly specifies whether the ReadOnly attribute on a pre-existing destination file should be respected.
+	// If true, rename will succeed, otherwise, a previous file at the destination with the ReadOnly attribute set will cause rename to fail.
+	IgnoreReadOnly *bool
+	// A name-value pair to associate with a file storage object.
+	Metadata map[string]*string
+	// ReplaceIfExists specifies that if the destination file already exists, whether this request will overwrite the file or not.
+	// If true, rename will succeed and will overwrite the destination file. If not provided or if false and the destination file does exist,
+	// the request will not overwrite the destination file.
+	// If provided and the destination file does not exist, rename will succeed.
+	ReplaceIfExists *bool
+	// SourceLeaseAccessConditions contains optional parameters to access the source directory.
+	SourceLeaseAccessConditions *SourceLeaseAccessConditions
+	// DestinationLeaseAccessConditions contains optional parameters to access the destination directory.
+	DestinationLeaseAccessConditions *DestinationLeaseAccessConditions
+}
+
+func (o *RenameOptions) format() (*generated.FileClientRenameOptions, *generated.SourceLeaseAccessConditions, *generated.DestinationLeaseAccessConditions, *generated.CopyFileSMBInfo, *generated.ShareFileHTTPHeaders) {
+	if o == nil {
+		return nil, nil, nil, nil, nil
+	}
+
+	fileAttributes, fileCreationTime, fileLastWriteTime, fileChangeTime := exported.FormatSMBProperties(o.SMBProperties, nil, nil, false)
+
+	permission, permissionKey := exported.FormatPermissions(o.Permissions, nil)
+
+	renameOpts := &generated.FileClientRenameOptions{
+		FilePermission:    permission,
+		FilePermissionKey: permissionKey,
+		IgnoreReadOnly:    o.IgnoreReadOnly,
+		Metadata:          o.Metadata,
+		ReplaceIfExists:   o.ReplaceIfExists,
+	}
+
+	smbInfo := &generated.CopyFileSMBInfo{
+		FileAttributes:    fileAttributes,
+		FileChangeTime:    fileChangeTime,
+		FileCreationTime:  fileCreationTime,
+		FileLastWriteTime: fileLastWriteTime,
+	}
+
+	fileHTTPHeaders := &generated.ShareFileHTTPHeaders{
+		ContentType: o.ContentType,
+	}
+
+	return renameOpts, o.SourceLeaseAccessConditions, o.DestinationLeaseAccessConditions, smbInfo, fileHTTPHeaders
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -149,28 +221,31 @@ type SetHTTPHeadersOptions struct {
 	LeaseAccessConditions *LeaseAccessConditions
 }
 
-func (o *SetHTTPHeadersOptions) format() (fileAttributes string, fileCreationTime string, fileLastWriteTime string,
-	opts *generated.FileClientSetHTTPHeadersOptions, fileHTTPHeaders *generated.ShareFileHTTPHeaders, leaseAccessConditions *LeaseAccessConditions) {
+func (o *SetHTTPHeadersOptions) format() (*generated.FileClientSetHTTPHeadersOptions, *generated.ShareFileHTTPHeaders, *LeaseAccessConditions) {
 	if o == nil {
-		return shared.DefaultPreserveString, shared.DefaultPreserveString, shared.DefaultPreserveString, &generated.FileClientSetHTTPHeadersOptions{
-			FilePermission: to.Ptr(shared.DefaultPreserveString),
+		return &generated.FileClientSetHTTPHeadersOptions{
+			FileAttributes:    to.Ptr(shared.DefaultPreserveString),
+			FileCreationTime:  to.Ptr(shared.DefaultPreserveString),
+			FileLastWriteTime: to.Ptr(shared.DefaultPreserveString),
+			FilePermission:    to.Ptr(shared.DefaultPreserveString),
 		}, nil, nil
 	}
 
-	fileAttributes, fileCreationTime, fileLastWriteTime = o.SMBProperties.Format(false, shared.DefaultPreserveString, shared.DefaultPreserveString)
+	fileAttributes, fileCreationTime, fileLastWriteTime, fileChangeTime := exported.FormatSMBProperties(o.SMBProperties, to.Ptr(shared.DefaultPreserveString), to.Ptr(shared.DefaultPreserveString), false)
 
-	permission, permissionKey := o.Permissions.Format(shared.DefaultPreserveString)
+	permission, permissionKey := exported.FormatPermissions(o.Permissions, to.Ptr(shared.DefaultPreserveString))
 
-	opts = &generated.FileClientSetHTTPHeadersOptions{
+	opts := &generated.FileClientSetHTTPHeadersOptions{
+		FileAttributes:    fileAttributes,
+		FileChangeTime:    fileChangeTime,
+		FileCreationTime:  fileCreationTime,
+		FileLastWriteTime: fileLastWriteTime,
 		FileContentLength: o.FileContentLength,
 		FilePermission:    permission,
 		FilePermissionKey: permissionKey,
 	}
 
-	fileHTTPHeaders = o.HTTPHeaders
-	leaseAccessConditions = o.LeaseAccessConditions
-
-	return
+	return opts, o.HTTPHeaders, o.LeaseAccessConditions
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -227,14 +302,28 @@ func (o *StartCopyFromURLOptions) format() (*generated.FileClientStartCopyOption
 
 // CopyFileSMBInfo contains a group of parameters for the FileClient.StartCopy method.
 type CopyFileSMBInfo struct {
-	// Specifies either the option to copy file attributes from a source file(source) to a target file or a list of attributes
-	// to set on a target file.
+	// Specifies either the option to copy file attributes from a source file(source) to a target file or a list of attributes to set on a target file.
+	// CopyFileAttributes is an interface and its underlying implementation are:
+	//   - SourceCopyFileAttributes - specifies to copy file attributes from a source file to a target file.
+	//   - DestinationCopyFileAttributes - specifies a list of attributes to set on a target file.
 	Attributes CopyFileAttributes
+	// Specifies either the option to copy file change time from a source file(source) to a target file or a time value in
+	// ISO 8601 format to set as change time on a target file.
+	// CopyFileChangeTime is an interface and its underlying implementation are:
+	//   - SourceCopyFileChangeTime - specifies to copy file change time from a source file to a target file.
+	//   - DestinationCopyFileChangeTime - specifies a time value in ISO 8601 format to set as change time on a target file.
+	ChangeTime CopyFileChangeTime
 	// Specifies either the option to copy file creation time from a source file(source) to a target file or a time value in ISO
 	// 8601 format to set as creation time on a target file.
+	// CopyFileCreationTime is an interface and its underlying implementation are:
+	//   - SourceCopyFileCreationTime - specifies to copy file creation time from a source file to a target file.
+	//   - DestinationCopyFileCreationTime - specifies a time value in ISO 8601 format to set as creation time on a target file.
 	CreationTime CopyFileCreationTime
 	// Specifies either the option to copy file last write time from a source file(source) to a target file or a time value in
 	// ISO 8601 format to set as last write time on a target file.
+	// CopyFileLastWriteTime is an interface and its underlying implementation are:
+	//   - SourceCopyFileLastWriteTime - specifies to copy file last write time from a source file to a target file.
+	//   - DestinationCopyFileLastWriteTime - specifies a time value in ISO 8601 format to set as last write time on a target file.
 	LastWriteTime CopyFileLastWriteTime
 	// Specifies the option to copy file security descriptor from source file or to set it using the value which is defined by
 	// the header value of x-ms-file-permission or x-ms-file-permission-key.
@@ -266,6 +355,9 @@ func (c *CopyFileSMBInfo) format() *generated.CopyFileSMBInfo {
 	if c.LastWriteTime != nil {
 		opts.FileLastWriteTime = c.LastWriteTime.FormatLastWriteTime()
 	}
+	if c.ChangeTime != nil {
+		opts.FileChangeTime = c.ChangeTime.FormatChangeTime()
+	}
 
 	return opts
 }
@@ -279,6 +371,16 @@ type SourceCopyFileAttributes = exported.SourceCopyFileAttributes
 
 // DestinationCopyFileAttributes specifies a list of attributes to set on a target file.
 type DestinationCopyFileAttributes = exported.DestinationCopyFileAttributes
+
+// CopyFileChangeTime specifies either the option to copy file change time from a source file(source) to a target file or
+// a time value in ISO 8601 format to set as change time on a target file.
+type CopyFileChangeTime = exported.CopyFileChangeTime
+
+// SourceCopyFileChangeTime specifies to copy file change time from a source file(source) to a target file.
+type SourceCopyFileChangeTime = exported.SourceCopyFileChangeTime
+
+// DestinationCopyFileChangeTime specifies a time value in ISO 8601 format to set as change time on a target file.
+type DestinationCopyFileChangeTime = exported.DestinationCopyFileChangeTime
 
 // CopyFileCreationTime specifies either the option to copy file creation time from a source file(source) to a target file or
 // a time value in ISO 8601 format to set as creation time on a target file.
@@ -437,20 +539,17 @@ type ResizeOptions struct {
 	LeaseAccessConditions *LeaseAccessConditions
 }
 
-func (o *ResizeOptions) format(contentLength int64) (fileAttributes string, fileCreationTime string, fileLastWriteTime string,
-	opts *generated.FileClientSetHTTPHeadersOptions, leaseAccessConditions *LeaseAccessConditions) {
-	fileAttributes, fileCreationTime, fileLastWriteTime = shared.DefaultPreserveString, shared.DefaultPreserveString, shared.DefaultPreserveString
-
-	opts = &generated.FileClientSetHTTPHeadersOptions{
+func (o *ResizeOptions) format(contentLength int64) (*generated.FileClientSetHTTPHeadersOptions, *LeaseAccessConditions) {
+	opts := &generated.FileClientSetHTTPHeadersOptions{
 		FileContentLength: &contentLength,
-		FilePermission:    to.Ptr(shared.DefaultPreserveString),
 	}
 
+	var leaseAccessConditions *LeaseAccessConditions = nil
 	if o != nil {
 		leaseAccessConditions = o.LeaseAccessConditions
 	}
 
-	return
+	return opts, leaseAccessConditions
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -462,6 +561,8 @@ type UploadRangeOptions struct {
 	TransactionalValidation TransferValidationType
 	// LeaseAccessConditions contains optional parameters to access leased entity.
 	LeaseAccessConditions *LeaseAccessConditions
+	// LastWrittenMode specifies if the file last write time should be preserved or overwritten.
+	LastWrittenMode *LastWrittenMode
 }
 
 func (o *UploadRangeOptions) format(offset int64, body io.ReadSeekCloser) (string, int64, *generated.FileClientUploadRangeOptions, *generated.LeaseAccessConditions, error) {
@@ -492,6 +593,7 @@ func (o *UploadRangeOptions) format(offset int64, body io.ReadSeekCloser) (strin
 
 	if o != nil {
 		leaseAccessConditions = o.LeaseAccessConditions
+		uploadRangeOptions.FileLastWrittenMode = o.LastWrittenMode
 	}
 	if o != nil && o.TransactionalValidation != nil {
 		_, err = o.TransactionalValidation.Apply(body, uploadRangeOptions)
@@ -530,10 +632,15 @@ func (o *ClearRangeOptions) format(contentRange HTTPRange) (string, *generated.L
 type UploadRangeFromURLOptions struct {
 	// Only Bearer type is supported. Credentials should be a valid OAuth access token to copy source.
 	CopySourceAuthorization *string
-	// Specify the crc64 calculated for the range of bytes that must be read from the copy source.
-	SourceContentCRC64             uint64
+	// SourceContentValidation contains the validation mechanism used on the range of bytes read from the source.
+	SourceContentValidation        SourceContentValidationType
 	SourceModifiedAccessConditions *SourceModifiedAccessConditions
 	LeaseAccessConditions          *LeaseAccessConditions
+	// LastWrittenMode specifies if the file last write time should be preserved or overwritten.
+	LastWrittenMode *LastWrittenMode
+
+	// Deprecated: Specify the crc64 calculated for the range of bytes that must be read from the copy source.
+	SourceContentCRC64 uint64
 }
 
 func (o *UploadRangeFromURLOptions) format(sourceOffset int64, destinationOffset int64, count int64) (string, *generated.FileClientUploadRangeFromURLOptions, *generated.SourceModifiedAccessConditions, *generated.LeaseAccessConditions, error) {
@@ -557,12 +664,16 @@ func (o *UploadRangeFromURLOptions) format(sourceOffset int64, destinationOffset
 
 	if o != nil {
 		opts.CopySourceAuthorization = o.CopySourceAuthorization
+		opts.FileLastWrittenMode = o.LastWrittenMode
 		sourceModifiedAccessConditions = o.SourceModifiedAccessConditions
 		leaseAccessConditions = o.LeaseAccessConditions
 
-		buf := make([]byte, 8)
-		binary.LittleEndian.PutUint64(buf, o.SourceContentCRC64)
-		opts.SourceContentCRC64 = buf
+		if o.SourceContentValidation != nil {
+			err := o.SourceContentValidation.apply(opts)
+			if err != nil {
+				return "", nil, nil, nil, err
+			}
+		}
 	}
 
 	return destRange, opts, sourceModifiedAccessConditions, leaseAccessConditions, nil

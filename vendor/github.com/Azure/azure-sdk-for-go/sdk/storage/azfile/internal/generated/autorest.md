@@ -7,7 +7,7 @@ go: true
 clear-output-folder: false
 version: "^3.0.0"
 license-header: MICROSOFT_MIT_NO_VERSION
-input-file: "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/bbea558ac43d6ebec72455233c84b0158c89fcda/specification/storage/data-plane/Microsoft.FileStorage/preview/2020-10-02/file.json"
+input-file: "https://raw.githubusercontent.com/Azure/azure-rest-api-specs/4bafbf3ab1532e390ad5757433679e9ebb5cbf38/specification/storage/data-plane/Microsoft.FileStorage/preview/2023-08-03/file.json"
 credential-scope: "https://storage.azure.com/.default"
 output-folder: ../generated
 file-prefix: "zz_"
@@ -19,7 +19,23 @@ modelerfour:
   seal-single-value-enum-by-default: true
   lenient-model-deduplication: true
 export-clients: true
-use: "@autorest/go@4.0.0-preview.45"
+use: "@autorest/go@4.0.0-preview.61"
+```
+
+### Updating service version to 2023-11-03
+
+```yaml
+directive:
+- from: 
+  - zz_directory_client.go
+  - zz_file_client.go
+  - zz_share_client.go
+  - zz_service_client.go
+  where: $
+  transform: >-
+    return $.
+      replaceAll(`[]string{"2023-08-03"}`, `[]string{ServiceVersion}`).
+      replaceAll(`2023-08-03`, `2023-11-03`);
 ```
 
 ### Don't include share name, directory, or file name in path - we have direct URIs
@@ -141,8 +157,10 @@ directive:
 ``` yaml
 directive:
 - from:
+  - zz_directory_client.go
   - zz_file_client.go
   - zz_models.go
+  - zz_options.go
   where: $
   transform: >-
     return $.
@@ -257,6 +275,10 @@ directive:
   where: $.parameters.FileLastWriteTime
   transform: >
     $.format = "str";
+- from: swagger-document
+  where: $.parameters.FileChangeTime
+  transform: >
+    $.format = "str";
 ```
 
 ### Remove pager methods and export various generated methods in directory client
@@ -306,4 +328,45 @@ directive:
     transform: >-
       return $.
         replace(/ShareUsageBytes\s+\*int32/g, `ShareUsageBytes *int64`);
+```
+
+### Convert StringEncoded to string type
+
+``` yaml
+directive:
+  - from: zz_models.go
+    where: $
+    transform: >-
+      return $.
+        replace(/\*StringEncoded/g, `*string`);
+```
+
+### Removing UnmarshalXML for Handle to create custom UnmarshalXML function
+
+``` yaml
+directive:
+- from: swagger-document
+  where: $.definitions
+  transform: >
+    $.Handle["x-ms-go-omit-serde-methods"] = true;
+```
+
+### Convert FileAttributes to an optional parameter
+
+``` yaml
+directive:
+- from: swagger-document
+  where: $.parameters.FileAttributes
+  transform: >
+    $.required = false;
+```
+
+### Rename ProvisionedBandwidthMiBps response field
+
+``` yaml
+directive:
+- from: swagger-document
+  where: $["x-ms-paths"]["/{shareName}?restype=share"]
+  transform: >
+    $.get.responses["200"].headers["x-ms-share-provisioned-bandwidth-mibps"]["x-ms-client-name"] = "ProvisionedBandwidthMiBps"
 ```

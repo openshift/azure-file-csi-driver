@@ -7,6 +7,8 @@
 package exported
 
 import (
+	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/generated"
 	"strings"
 	"time"
@@ -21,33 +23,46 @@ type SMBProperties struct {
 	CreationTime *time.Time
 	// The Coordinated Universal Time (UTC) last write time for the file/directory. Default value is 'now'.
 	LastWriteTime *time.Time
+	// The Coordinated Universal Time (UTC) change time for the file/directory. Default value is 'now'.
+	ChangeTime *time.Time
 }
 
+// Deprecated: Internal implementation; use FormatSMBProperties instead.
 // Format returns file attributes, creation time and last write time.
 func (sp *SMBProperties) Format(isDir bool, defaultFileAttributes string, defaultCurrentTimeString string) (fileAttributes string, creationTime string, lastWriteTime string) {
+	return
+}
+
+// FormatSMBProperties returns file attributes, creation time, last write time and change time.
+func FormatSMBProperties(sp *SMBProperties, defaultAttributes *string, defaultCurrentTime *string, isDir bool) (fileAttributes *string, creationTime *string, lastWriteTime *string, changeTime *string) {
 	if sp == nil {
-		return defaultFileAttributes, defaultCurrentTimeString, defaultCurrentTimeString
+		return defaultAttributes, defaultCurrentTime, defaultCurrentTime, nil
 	}
 
-	fileAttributes = defaultFileAttributes
+	fileAttributes = defaultAttributes
 	if sp.Attributes != nil {
-		fileAttributes = sp.Attributes.String()
-		if fileAttributes == "" {
-			fileAttributes = defaultFileAttributes
-		} else if isDir && strings.ToLower(fileAttributes) != "none" {
+		fileAttributes = to.Ptr(sp.Attributes.String())
+		if isDir && fileAttributes != nil && strings.ToLower(*fileAttributes) != "none" {
 			// Directories need to have this attribute included, if setting any attributes.
-			fileAttributes += "|Directory"
+			*fileAttributes += "|Directory"
 		}
+		*fileAttributes = strings.TrimPrefix(*fileAttributes, "|")
+		*fileAttributes = strings.TrimSuffix(*fileAttributes, "|")
 	}
 
-	creationTime = defaultCurrentTimeString
+	creationTime = defaultCurrentTime
 	if sp.CreationTime != nil {
-		creationTime = sp.CreationTime.UTC().Format(generated.ISO8601)
+		creationTime = to.Ptr(sp.CreationTime.UTC().Format(generated.ISO8601))
 	}
 
-	lastWriteTime = defaultCurrentTimeString
+	lastWriteTime = defaultCurrentTime
 	if sp.LastWriteTime != nil {
-		lastWriteTime = sp.LastWriteTime.UTC().Format(generated.ISO8601)
+		lastWriteTime = to.Ptr(sp.LastWriteTime.UTC().Format(generated.ISO8601))
+	}
+
+	changeTime = nil
+	if sp.ChangeTime != nil {
+		changeTime = to.Ptr(sp.ChangeTime.UTC().Format(generated.ISO8601))
 	}
 
 	return
@@ -95,4 +110,45 @@ func (f *NTFSFileAttributes) String() string {
 
 	fileAttributes = strings.TrimSuffix(fileAttributes, "|")
 	return fileAttributes
+}
+
+// ParseNTFSFileAttributes parses the file attributes from *string to *NTFSFileAttributes.
+// It returns an error for any unknown file attribute.
+func ParseNTFSFileAttributes(attributes *string) (*NTFSFileAttributes, error) {
+	if attributes == nil {
+		return nil, nil
+	}
+
+	ntfsFileAttributes := NTFSFileAttributes{}
+	parts := strings.Split(*attributes, "|")
+
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		switch p {
+		case "readonly":
+			ntfsFileAttributes.ReadOnly = true
+		case "hidden":
+			ntfsFileAttributes.Hidden = true
+		case "system":
+			ntfsFileAttributes.System = true
+		case "directory":
+			ntfsFileAttributes.Directory = true
+		case "archive":
+			ntfsFileAttributes.Archive = true
+		case "none":
+			ntfsFileAttributes.None = true
+		case "temporary":
+			ntfsFileAttributes.Temporary = true
+		case "offline":
+			ntfsFileAttributes.Offline = true
+		case "notcontentindexed":
+			ntfsFileAttributes.NotContentIndexed = true
+		case "noscrubdata":
+			ntfsFileAttributes.NoScrubData = true
+		default:
+			return nil, fmt.Errorf("unknown file attribute %v", p)
+		}
+	}
+
+	return &ntfsFileAttributes, nil
 }
