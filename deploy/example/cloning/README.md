@@ -1,7 +1,12 @@
 # Volume Cloning Example
 ## Feature Status: Beta
 
-- supported from v1.29.1
+- supported from v1.28.6, v1.29.1
+- SMB file share is supported, NFS file share is not supported
+- use of private endpoints is not supported due to the 'DenyAll' default network rules in the storage account's VNet settings
+
+## Prerequisites
+- make sure that the virtual network hosting the driver controller pod is added to the list of allowed virtual networks in the storage account's VNet settings
 
 ## Create a Source PVC
 

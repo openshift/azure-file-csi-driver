@@ -8,6 +8,12 @@ package share
 
 import (
 	"context"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/directory"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/fileerror"
@@ -16,8 +22,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/generated"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/shared"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas"
-	"net/url"
-	"time"
 )
 
 // ClientOptions contains the optional parameters when creating a Client.
@@ -26,15 +30,47 @@ type ClientOptions base.ClientOptions
 // Client represents a URL to the Azure Storage share allowing you to manipulate its directories and files.
 type Client base.Client[generated.ShareClient]
 
+// NewClient creates an instance of Client with the specified values.
+//   - shareURL - the URL of the share e.g. https://<account>.file.core.windows.net/share
+//   - cred - an Azure AD credential, typically obtained via the azidentity module
+//   - options - client options; pass nil to accept the default values
+//
+// Note that the only share-level operations that support token credential authentication are CreatePermission and GetPermission.
+// Also note that ClientOptions.FileRequestIntent is currently required for token authentication.
+func NewClient(shareURL string, cred azcore.TokenCredential, options *ClientOptions) (*Client, error) {
+	audience := base.GetAudience((*base.ClientOptions)(options))
+	conOptions := shared.GetClientOptions(options)
+	authPolicy := runtime.NewBearerTokenPolicy(cred, []string{audience}, &policy.BearerTokenOptions{
+		InsecureAllowCredentialWithHTTP: conOptions.InsecureAllowCredentialWithHTTP,
+	})
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
+
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewShareClient(shareURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
+}
+
 // NewClientWithNoCredential creates an instance of Client with the specified values.
 // This is used to anonymously access a share or with a shared access signature (SAS) token.
 //   - shareURL - the URL of the share e.g. https://<account>.file.core.windows.net/share?<sas token>
 //   - options - client options; pass nil to accept the default values
 func NewClientWithNoCredential(shareURL string, options *ClientOptions) (*Client, error) {
 	conOptions := shared.GetClientOptions(options)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewShareClient(shareURL, pl, nil)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewShareClient(shareURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientWithSharedKeyCredential creates an instance of Client with the specified values.
@@ -44,10 +80,17 @@ func NewClientWithNoCredential(shareURL string, options *ClientOptions) (*Client
 func NewClientWithSharedKeyCredential(shareURL string, cred *SharedKeyCredential, options *ClientOptions) (*Client, error) {
 	authPolicy := exported.NewSharedKeyCredPolicy(cred)
 	conOptions := shared.GetClientOptions(options)
-	conOptions.PerRetryPolicies = append(conOptions.PerRetryPolicies, authPolicy)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewShareClient(shareURL, pl, cred)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewShareClient(shareURL, azClient, cred, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientFromConnectionString creates an instance of Client with the specified values.
@@ -80,6 +123,10 @@ func (s *Client) sharedKey() *SharedKeyCredential {
 	return base.SharedKey((*base.Client[generated.ShareClient])(s))
 }
 
+func (s *Client) getClientOptions() *base.ClientOptions {
+	return base.GetClientOptions((*base.Client[generated.ShareClient])(s))
+}
+
 // URL returns the URL endpoint used by the Client object.
 func (s *Client) URL() string {
 	return s.generated().Endpoint()
@@ -88,16 +135,16 @@ func (s *Client) URL() string {
 // NewDirectoryClient creates a new directory.Client object by concatenating directoryName to the end of this Client's URL.
 // The new directory.Client uses the same request policy pipeline as the Client.
 func (s *Client) NewDirectoryClient(directoryName string) *directory.Client {
-	directoryName = url.PathEscape(directoryName)
+	directoryName = url.PathEscape(strings.TrimRight(directoryName, "/"))
 	directoryURL := runtime.JoinPaths(s.URL(), directoryName)
-	return (*directory.Client)(base.NewDirectoryClient(directoryURL, s.generated().Pipeline(), s.sharedKey()))
+	return (*directory.Client)(base.NewDirectoryClient(directoryURL, s.generated().InternalClient().WithClientName(exported.ModuleName), s.sharedKey(), s.getClientOptions()))
 }
 
 // NewRootDirectoryClient creates a new directory.Client object for the root of the share using the Client's URL.
 // The new directory.Client uses the same request policy pipeline as the Client.
 func (s *Client) NewRootDirectoryClient() *directory.Client {
 	rootDirURL := s.URL()
-	return (*directory.Client)(base.NewDirectoryClient(rootDirURL, s.generated().Pipeline(), s.sharedKey()))
+	return (*directory.Client)(base.NewDirectoryClient(rootDirURL, s.generated().InternalClient().WithClientName(exported.ModuleName), s.sharedKey(), s.getClientOptions()))
 }
 
 // WithSnapshot creates a new Client object identical to the source but with the specified share snapshot timestamp.
@@ -108,8 +155,9 @@ func (s *Client) WithSnapshot(shareSnapshot string) (*Client, error) {
 		return nil, err
 	}
 	p.ShareSnapshot = shareSnapshot
+	clientOptions := base.GetClientOptions((*base.Client[generated.ShareClient])(s))
 
-	return (*Client)(base.NewShareClient(p.String(), s.generated().Pipeline(), s.sharedKey())), nil
+	return (*Client)(base.NewShareClient(p.String(), s.generated().InternalClient(), s.sharedKey(), clientOptions)), nil
 }
 
 // Create operation creates a new share within a storage account. If a share with the same name already exists, the operation fails.
@@ -241,7 +289,6 @@ func (s *Client) GetSASURL(permissions sas.SharePermissions, expiry time.Time, o
 
 	qps, err := sas.SignatureValues{
 		Version:      sas.Version,
-		Protocol:     sas.ProtocolHTTPS,
 		ShareName:    urlParts.ShareName,
 		SnapshotTime: t,
 		Permissions:  permissions.String(),

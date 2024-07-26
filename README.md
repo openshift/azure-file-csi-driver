@@ -3,6 +3,7 @@
 ![windows build status](https://github.com/kubernetes-sigs/azurefile-csi-driver/actions/workflows/windows.yaml/badge.svg)
 [![Coverage Status](https://coveralls.io/repos/github/kubernetes-sigs/azurefile-csi-driver/badge.svg?branch=master)](https://coveralls.io/github/kubernetes-sigs/azurefile-csi-driver?branch=master)
 [![FOSSA Status](https://app.fossa.io/api/projects/git%2Bgithub.com%2Fkubernetes-sigs%2Fazurefile-csi-driver.svg?type=shield)](https://app.fossa.io/projects/git%2Bgithub.com%2Fkubernetes-sigs%2Fazurefile-csi-driver?ref=badge_shield)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/azurefile-csi-driver)](https://artifacthub.io/packages/search?repo=azurefile-csi-driver)
 
 ### About
 This driver allows Kubernetes to access [Azure File](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-introduction) volume using smb and nfs protocols, csi plugin name: `file.csi.azure.com`
@@ -15,9 +16,9 @@ Disclaimer: Deploying this driver manually is not an officially supported Micros
 |Driver Version  |Image                                                      | supported k8s version |
 |----------------|---------------------------------------------------------- |-----------------------|
 |master branch   |mcr.microsoft.com/k8s/csi/azurefile-csi:latest             | 1.21+                 |
-|v1.29.5         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.29.5 | 1.21+                 |
-|v1.28.3         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.28.3 | 1.21+                 |
-|v1.27.3         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.27.3 | 1.21+                 |
+|v1.30.3         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.30.3 | 1.21+                 |
+|v1.29.2         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.29.2 | 1.21+                 |
+|v1.28.7         |mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.28.7 | 1.21+                 |
 
 ### Driver parameters
 Please refer to [driver parameters](./docs/driver-parameters.md)
@@ -50,10 +51,10 @@ This option does not depend on cloud provider config file, supports cross subscr
 ### Features
  - [Windows](./deploy/example/windows)
  - [NFS](./deploy/example/nfs)
- - [Snapshot](./deploy/example/snapshot)
- - [Resize](./deploy/example/resize)
+ - [Volume Snapshot](./deploy/example/snapshot)
+ - [Volume Expansion](./deploy/example/resize)
  - [Volume Cloning](./deploy/example/cloning)
- - [Workload identity](./docs/workload-identity.md)
+ - [Workload identity](./docs/workload-identity-static-pv-mount.md)
 
 ### Troubleshooting
  - [CSI driver troubleshooting guide](./docs/csi-debug.md) 

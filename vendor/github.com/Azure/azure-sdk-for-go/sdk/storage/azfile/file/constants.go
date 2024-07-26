@@ -7,6 +7,7 @@
 package file
 
 import (
+	"encoding/binary"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/exported"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/generated"
 )
@@ -71,8 +72,52 @@ func PossibleRangeWriteTypeValues() []RangeWriteType {
 	return generated.PossibleFileRangeWriteTypeValues()
 }
 
+// SourceContentValidationType abstracts mechanisms used to validate source content
+type SourceContentValidationType interface {
+	apply(generated.SourceContentSetter) error
+	notPubliclyImplementable()
+}
+
+// SourceContentValidationTypeCRC64 is a SourceContentValidationType used to provide a precomputed CRC64.
+type SourceContentValidationTypeCRC64 uint64
+
+// Apply implements the SourceContentValidationType interface for type SourceContentValidationTypeCRC64.
+func (s SourceContentValidationTypeCRC64) apply(cfg generated.SourceContentSetter) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(s))
+	cfg.SetSourceContentCRC64(buf)
+	return nil
+}
+
+func (SourceContentValidationTypeCRC64) notPubliclyImplementable() {}
+
 // TransferValidationType abstracts the various mechanisms used to verify a transfer.
 type TransferValidationType = exported.TransferValidationType
 
 // TransferValidationTypeMD5 is a TransferValidationType used to provide a precomputed MD5.
 type TransferValidationTypeMD5 = exported.TransferValidationTypeMD5
+
+// ShareTokenIntent is required if authorization header specifies an OAuth token.
+type ShareTokenIntent = generated.ShareTokenIntent
+
+const (
+	ShareTokenIntentBackup ShareTokenIntent = generated.ShareTokenIntentBackup
+)
+
+// PossibleShareTokenIntentValues returns the possible values for the ShareTokenIntent const type.
+func PossibleShareTokenIntentValues() []ShareTokenIntent {
+	return generated.PossibleShareTokenIntentValues()
+}
+
+// LastWrittenMode specifies if the file last write time should be preserved or overwritten
+type LastWrittenMode = generated.FileLastWrittenMode
+
+const (
+	LastWrittenModeNow      LastWrittenMode = generated.FileLastWrittenModeNow
+	LastWrittenModePreserve LastWrittenMode = generated.FileLastWrittenModePreserve
+)
+
+// PossibleLastWrittenModeValues returns the possible values for the LastWrittenMode const type.
+func PossibleLastWrittenModeValues() []LastWrittenMode {
+	return generated.PossibleFileLastWrittenModeValues()
+}

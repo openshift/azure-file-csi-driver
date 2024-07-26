@@ -48,7 +48,7 @@ storeAccountKey | whether store account key to k8s secret <br><br> Note:  <br> `
 getLatestAccountKey | whether getting the latest account key based on the creation time, this driver would get the first key by default | `true`,`false` | No | `false`
 secretName | specify secret name to store account key | | No |
 secretNamespace | specify the namespace of secret to store account key | `default`,`kube-system`, etc | No | pvc namespace (`csi.storage.k8s.io/pvc/namespace`)
-useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/azure-sdk-for-go/blob/master/storage/share.go) for file share create/delete/resize, this could solve the SRP API throltting issue since data plane API has almost no limit, while it would fail when there is firewall or vnet setting on storage account | `true`,`false` | No | `false`
+useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/azure-sdk-for-go/blob/master/storage/share.go) for file share create/delete/resize, this could solve the SRP API throttling issue since data plane API has almost no limit, while it would fail when there is firewall or vnet setting on storage account | `true`,`false` | No | `false`
 enableMultichannel | specify whether enable [SMB multi-channel](https://learn.microsoft.com/en-us/azure/storage/files/files-smb-protocol?tabs=azure-portal#smb-multichannel) for **Premium** storage account <br> Note: this feature is used with `max_channels=4` (or 2,3) mount option | `true`,`false` | No | `false`
 --- | **Following parameters are only for NFS protocol** | --- | --- |
 rootSquashType | specify root squashing behavior on the share. The default is `NoRootSquash` | `AllSquash`, `NoRootSquash`, `RootSquash` | No |
@@ -82,7 +82,7 @@ pvc-92a4d7f2-f23b-4904-bad4-2cbfcff6e388
 
 Name | Meaning | Available Value | Mandatory | Default value
 --- | --- | --- | --- | ---
-volumeHandle | Specify a value the driver can use to uniquely identify the share in the cluster. | A recommended way to produce a unique value is to combine the globally unique storage account name and share name: {account-name}_{file-share-name}. Note: The # character is reserved for internal use. | Yes |
+volumeHandle | Specify a value the driver can use to uniquely identify the share in the cluster. | A recommended way to produce a unique value is to combine the globally unique storage account name and share name: {account-name}_{file-share-name}. If you plan to use resize, you must follow the VolumeID format in Dynamic Provisioning. Note: The # character is reserved for internal use. | Yes |
 volumeAttributes.subscriptionID | specify Azure subscription ID where Azure file share is located | Azure subscription ID | No | if not empty, `resourceGroup` must be provided
 volumeAttributes.resourceGroup | Azure resource group name | existing resource group name | No | if empty, driver will use the same resource group name as current k8s cluster
 volumeAttributes.storageAccount | existing storage account name | existing storage account name | Yes |
@@ -113,6 +113,7 @@ kubectl create secret generic azure-storage-account-{accountname}-secret --from-
   - mounting Azure NFS File share does not require account key, NFS mount access is configured by either of the following settings:
     - `Firewalls and virtual networks`: select `Enabled from selected virtual networks and IP addresses` with same vnet as agent node
     - `Private endpoint connections`
+  - If a storage account is full, the driver will add a tag `skip-matching` to the storage account to prevent the creation of new file shares in that account. This tag will only be removed after 30 minutes if a file share is deleted from that account. To use the account immediately, the user can manually remove the tag.
 
 #### `shareName` parameter supports following pv/pvc metadata conversion
 > if `shareName` value contains following strings, it would be converted into corresponding pv/pvc name or namespace

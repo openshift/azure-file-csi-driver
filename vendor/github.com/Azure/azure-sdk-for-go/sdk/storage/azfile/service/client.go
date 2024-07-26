@@ -8,6 +8,11 @@ package service
 
 import (
 	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/fileerror"
@@ -17,9 +22,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/shared"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/share"
-	"net/http"
-	"strings"
-	"time"
 )
 
 // ClientOptions contains the optional parameters when creating a Client.
@@ -28,15 +30,48 @@ type ClientOptions base.ClientOptions
 // Client represents a URL to the Azure File Storage service allowing you to manipulate file shares.
 type Client base.Client[generated.ServiceClient]
 
+// NewClient creates an instance of Client with the specified values.
+//   - serviceURL - the URL of the storage account e.g. https://<account>.file.core.windows.net/
+//   - cred - an Azure AD credential, typically obtained via the azidentity module
+//   - options - client options; pass nil to accept the default values
+//
+// Note that service-level operations do not support token credential authentication.
+// This constructor exists to allow the construction of a share.Client that has token credential authentication.
+// Also note that ClientOptions.FileRequestIntent is currently required for token authentication.
+func NewClient(serviceURL string, cred azcore.TokenCredential, options *ClientOptions) (*Client, error) {
+	audience := base.GetAudience((*base.ClientOptions)(options))
+	conOptions := shared.GetClientOptions(options)
+	authPolicy := runtime.NewBearerTokenPolicy(cred, []string{audience}, &policy.BearerTokenOptions{
+		InsecureAllowCredentialWithHTTP: conOptions.InsecureAllowCredentialWithHTTP,
+	})
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
+
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewServiceClient(serviceURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
+}
+
 // NewClientWithNoCredential creates an instance of Client with the specified values.
 // This is used to anonymously access a storage account or with a shared access signature (SAS) token.
 //   - serviceURL - the URL of the storage account e.g. https://<account>.file.core.windows.net/?<sas token>
 //   - options - client options; pass nil to accept the default values
 func NewClientWithNoCredential(serviceURL string, options *ClientOptions) (*Client, error) {
 	conOptions := shared.GetClientOptions(options)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewServiceClient(serviceURL, pl, nil)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewServiceClient(serviceURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientWithSharedKeyCredential creates an instance of Client with the specified values.
@@ -46,10 +81,17 @@ func NewClientWithNoCredential(serviceURL string, options *ClientOptions) (*Clie
 func NewClientWithSharedKeyCredential(serviceURL string, cred *SharedKeyCredential, options *ClientOptions) (*Client, error) {
 	authPolicy := exported.NewSharedKeyCredPolicy(cred)
 	conOptions := shared.GetClientOptions(options)
-	conOptions.PerRetryPolicies = append(conOptions.PerRetryPolicies, authPolicy)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewServiceClient(serviceURL, pl, cred)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewServiceClient(serviceURL, azClient, cred, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientFromConnectionString creates an instance of Client with the specified values.
@@ -80,6 +122,10 @@ func (s *Client) sharedKey() *SharedKeyCredential {
 	return base.SharedKey((*base.Client[generated.ServiceClient])(s))
 }
 
+func (s *Client) getClientOptions() *base.ClientOptions {
+	return base.GetClientOptions((*base.Client[generated.ServiceClient])(s))
+}
+
 // URL returns the URL endpoint used by the Client object.
 func (s *Client) URL() string {
 	return s.generated().Endpoint()
@@ -89,7 +135,7 @@ func (s *Client) URL() string {
 // The new share.Client uses the same request policy pipeline as the Client.
 func (s *Client) NewShareClient(shareName string) *share.Client {
 	shareURL := runtime.JoinPaths(s.generated().Endpoint(), shareName)
-	return (*share.Client)(base.NewShareClient(shareURL, s.generated().Pipeline(), s.sharedKey()))
+	return (*share.Client)(base.NewShareClient(shareURL, s.generated().InternalClient().WithClientName(exported.ModuleName), s.sharedKey(), s.getClientOptions()))
 }
 
 // CreateShare is a lifecycle method to creates a new share under the specified account.
@@ -172,7 +218,7 @@ func (s *Client) NewListSharesPager(options *ListSharesOptions) *runtime.Pager[L
 			if err != nil {
 				return ListSharesSegmentResponse{}, err
 			}
-			resp, err := s.generated().Pipeline().Do(req)
+			resp, err := s.generated().InternalClient().Pipeline().Do(req)
 			if err != nil {
 				return ListSharesSegmentResponse{}, err
 			}
@@ -193,7 +239,6 @@ func (s *Client) GetSASURL(resources sas.AccountResourceTypes, permissions sas.A
 	st := o.format()
 	qps, err := sas.AccountSignatureValues{
 		Version:       sas.Version,
-		Protocol:      sas.ProtocolHTTPS,
 		Permissions:   permissions.String(),
 		ResourceTypes: resources.String(),
 		StartTime:     st,

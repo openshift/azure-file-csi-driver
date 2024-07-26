@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-09-01/storage"
 	azure2 "github.com/Azure/go-autorest/autorest/azure"
@@ -54,6 +55,8 @@ func NewFakeDriver() *Driver {
 	driverOptions := DriverOptions{
 		NodeID:                      fakeNodeID,
 		DriverName:                  DefaultDriverName,
+		KubeConfig:                  "",
+		Endpoint:                    "tcp://127.0.0.1:0",
 		WaitForAzCopyTimeoutMinutes: 1,
 	}
 	driver := NewDriver(&driverOptions)
@@ -97,6 +100,8 @@ func TestNewFakeDriver(t *testing.T) {
 	driverOptions := DriverOptions{
 		NodeID:     fakeNodeID,
 		DriverName: DefaultDriverName,
+		Endpoint:   "tcp://127.0.0.1:0",
+		KubeConfig: "",
 	}
 	d := NewDriver(&driverOptions)
 	assert.NotNil(t, d)
@@ -938,7 +943,6 @@ func TestCreateDisk(t *testing.T) {
 func TestGetFileShareQuota(t *testing.T) {
 	d := NewFakeDriver()
 	d.cloud = &azure.Cloud{}
-	d.fileClient = &azureFileClient{env: &azure2.Environment{}}
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	shareQuota := int32(10)
@@ -1053,7 +1057,15 @@ func TestRun(t *testing.T) {
 				os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 
 				d := NewFakeDriver()
-				d.Run("tcp://127.0.0.1:0", "", true)
+				ctx, cancelFn := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(1 * time.Second)
+					cancelFn()
+				}()
+				if err := d.Run(ctx); err != nil {
+					t.Error(err.Error())
+				}
+
 			},
 		},
 		{
@@ -1078,9 +1090,16 @@ func TestRun(t *testing.T) {
 				os.Setenv(DefaultAzureCredentialFileEnv, fakeCredFile)
 
 				d := NewFakeDriver()
+				ctx, cancelFn := context.WithCancel(context.Background())
+				go func() {
+					time.Sleep(1 * time.Second)
+					cancelFn()
+				}()
 				d.cloud = &azure.Cloud{}
 				d.NodeID = ""
-				d.Run("tcp://127.0.0.1:0", "", true)
+				if err := d.Run(ctx); err != nil {
+					t.Error(err.Error())
+				}
 			},
 		},
 	}
@@ -1446,37 +1465,5 @@ func TestGetStorageEndPointSuffix(t *testing.T) {
 		d.cloud = test.cloud
 		suffix := d.getStorageEndPointSuffix()
 		assert.Equal(t, test.expectedSuffix, suffix, test.name)
-	}
-}
-
-func TestGetCloudEnvironment(t *testing.T) {
-	d := NewFakeDriver()
-
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	tests := []struct {
-		name        string
-		cloud       *azure.Cloud
-		expectedEnv azure2.Environment
-	}{
-		{
-			name:        "nil cloud",
-			cloud:       nil,
-			expectedEnv: azure2.PublicCloud,
-		},
-		{
-			name: "cloud with environment",
-			cloud: &azure.Cloud{
-				Environment: azure2.ChinaCloud,
-			},
-			expectedEnv: azure2.ChinaCloud,
-		},
-	}
-
-	for _, test := range tests {
-		d.cloud = test.cloud
-		env := d.getCloudEnvironment()
-		assert.Equal(t, test.expectedEnv, env, test.name)
 	}
 }

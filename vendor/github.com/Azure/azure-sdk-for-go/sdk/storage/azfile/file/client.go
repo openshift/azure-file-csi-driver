@@ -10,6 +10,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/internal/log"
@@ -19,11 +27,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/generated"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/shared"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas"
-	"io"
-	"os"
-	"strings"
-	"sync"
-	"time"
 )
 
 // ClientOptions contains the optional parameters when creating a Client.
@@ -31,6 +34,31 @@ type ClientOptions base.ClientOptions
 
 // Client represents a URL to the Azure Storage file.
 type Client base.Client[generated.FileClient]
+
+// NewClient creates an instance of Client with the specified values.
+//   - fileURL - the URL of the file e.g. https://<account>.file.core.windows.net/share/directoryPath/file
+//   - cred - an Azure AD credential, typically obtained via the azidentity module
+//   - options - client options; pass nil to accept the default values
+//
+// Note that ClientOptions.FileRequestIntent is currently required for token authentication.
+func NewClient(fileURL string, cred azcore.TokenCredential, options *ClientOptions) (*Client, error) {
+	audience := base.GetAudience((*base.ClientOptions)(options))
+	conOptions := shared.GetClientOptions(options)
+	authPolicy := runtime.NewBearerTokenPolicy(cred, []string{audience}, &policy.BearerTokenOptions{
+		InsecureAllowCredentialWithHTTP: conOptions.InsecureAllowCredentialWithHTTP,
+	})
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
+
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewFileClient(fileURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
+}
 
 // NewClientWithNoCredential creates an instance of Client with the specified values.
 // This is used to anonymously access a file or with a shared access signature (SAS) token.
@@ -40,9 +68,15 @@ type Client base.Client[generated.FileClient]
 // The directoryPath is optional in the fileURL. If omitted, it points to file within the specified share.
 func NewClientWithNoCredential(fileURL string, options *ClientOptions) (*Client, error) {
 	conOptions := shared.GetClientOptions(options)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewFileClient(fileURL, pl, nil)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewFileClient(fileURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientWithSharedKeyCredential creates an instance of Client with the specified values.
@@ -54,10 +88,17 @@ func NewClientWithNoCredential(fileURL string, options *ClientOptions) (*Client,
 func NewClientWithSharedKeyCredential(fileURL string, cred *SharedKeyCredential, options *ClientOptions) (*Client, error) {
 	authPolicy := exported.NewSharedKeyCredPolicy(cred)
 	conOptions := shared.GetClientOptions(options)
-	conOptions.PerRetryPolicies = append(conOptions.PerRetryPolicies, authPolicy)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewFileClient(fileURL, pl, cred)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewFileClient(fileURL, azClient, cred, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientFromConnectionString creates an instance of Client with the specified values.
@@ -93,6 +134,10 @@ func (f *Client) sharedKey() *SharedKeyCredential {
 	return base.SharedKey((*base.Client[generated.FileClient])(f))
 }
 
+func (f *Client) getClientOptions() *base.ClientOptions {
+	return base.GetClientOptions((*base.Client[generated.FileClient])(f))
+}
+
 // URL returns the URL endpoint used by the Client object.
 func (f *Client) URL() string {
 	return f.generated().Endpoint()
@@ -101,10 +146,11 @@ func (f *Client) URL() string {
 // Create operation creates a new file or replaces a file. Note it only initializes the file with no content.
 //   - fileContentLength: Specifies the maximum size for the file in bytes, up to 4 TB.
 //
+// ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/create-file.
 func (f *Client) Create(ctx context.Context, fileContentLength int64, options *CreateOptions) (CreateResponse, error) {
-	fileAttributes, fileCreationTime, fileLastWriteTime, fileCreateOptions, fileHTTPHeaders, leaseAccessConditions := options.format()
-	resp, err := f.generated().Create(ctx, fileContentLength, fileAttributes, fileCreationTime, fileLastWriteTime, fileCreateOptions, fileHTTPHeaders, leaseAccessConditions)
+	fileCreateOptions, fileHTTPHeaders, leaseAccessConditions := options.format()
+	resp, err := f.generated().Create(ctx, fileContentLength, fileCreateOptions, fileHTTPHeaders, leaseAccessConditions)
 	return resp, err
 }
 
@@ -116,7 +162,47 @@ func (f *Client) Delete(ctx context.Context, options *DeleteOptions) (DeleteResp
 	return resp, err
 }
 
+// Rename operation renames a file, and can optionally set system properties for the file.
+//   - destinationPath: the destination path to rename the file to.
+//
+// For more information, see https://learn.microsoft.com/rest/api/storageservices/rename-file.
+func (f *Client) Rename(ctx context.Context, destinationPath string, options *RenameOptions) (RenameResponse, error) {
+	destinationPath = strings.Trim(strings.TrimSpace(destinationPath), "/")
+	if len(destinationPath) == 0 {
+		return RenameResponse{}, errors.New("destination path must not be empty")
+	}
+
+	opts, srcLease, destLease, smbInfo, fileHTTPHeaders := options.format()
+
+	urlParts, err := sas.ParseURL(f.URL())
+	if err != nil {
+		return RenameResponse{}, err
+	}
+
+	destParts := strings.Split(destinationPath, "?")
+	newDestPath := destParts[0]
+	newDestQuery := ""
+	if len(destParts) == 2 {
+		newDestQuery = destParts[1]
+	}
+
+	urlParts.DirectoryOrFilePath = newDestPath
+	destURL := urlParts.String()
+	// replace the query part if it is present in destination path
+	if len(newDestQuery) > 0 {
+		destURL = strings.Split(destURL, "?")[0] + "?" + newDestQuery
+	}
+
+	destFileClient := (*Client)(base.NewFileClient(destURL, f.generated().InternalClient(), f.sharedKey(), f.getClientOptions()))
+
+	resp, err := destFileClient.generated().Rename(ctx, f.URL(), opts, srcLease, destLease, smbInfo, fileHTTPHeaders)
+	return RenameResponse{
+		FileClientRenameResponse: resp,
+	}, err
+}
+
 // GetProperties operation returns all user-defined metadata, standard HTTP properties, and system properties for the file.
+// ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/get-file-properties.
 func (f *Client) GetProperties(ctx context.Context, options *GetPropertiesOptions) (GetPropertiesResponse, error) {
 	opts, leaseAccessConditions := options.format()
@@ -125,10 +211,11 @@ func (f *Client) GetProperties(ctx context.Context, options *GetPropertiesOption
 }
 
 // SetHTTPHeaders operation sets HTTP headers on the file.
+// ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/set-file-properties.
 func (f *Client) SetHTTPHeaders(ctx context.Context, options *SetHTTPHeadersOptions) (SetHTTPHeadersResponse, error) {
-	fileAttributes, fileCreationTime, fileLastWriteTime, opts, fileHTTPHeaders, leaseAccessConditions := options.format()
-	resp, err := f.generated().SetHTTPHeaders(ctx, fileAttributes, fileCreationTime, fileLastWriteTime, opts, fileHTTPHeaders, leaseAccessConditions)
+	opts, fileHTTPHeaders, leaseAccessConditions := options.format()
+	resp, err := f.generated().SetHTTPHeaders(ctx, opts, fileHTTPHeaders, leaseAccessConditions)
 	return resp, err
 }
 
@@ -163,8 +250,8 @@ func (f *Client) AbortCopy(ctx context.Context, copyID string, options *AbortCop
 // Resize operation resizes the file to the specified size.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/set-file-properties.
 func (f *Client) Resize(ctx context.Context, size int64, options *ResizeOptions) (ResizeResponse, error) {
-	fileAttributes, fileCreationTime, fileLastWriteTime, opts, leaseAccessConditions := options.format(size)
-	resp, err := f.generated().SetHTTPHeaders(ctx, fileAttributes, fileCreationTime, fileLastWriteTime, opts, nil, leaseAccessConditions)
+	opts, leaseAccessConditions := options.format(size)
+	resp, err := f.generated().SetHTTPHeaders(ctx, opts, nil, leaseAccessConditions)
 	return resp, err
 }
 
@@ -254,7 +341,6 @@ func (f *Client) GetSASURL(permissions sas.FilePermissions, expiry time.Time, o 
 
 	qps, err := sas.SignatureValues{
 		Version:     sas.Version,
-		Protocol:    sas.ProtocolHTTPS,
 		ShareName:   urlParts.ShareName,
 		FilePath:    urlParts.DirectoryOrFilePath,
 		Permissions: permissions.String(),
@@ -433,6 +519,7 @@ func (f *Client) download(ctx context.Context, writer io.WriterAt, o downloadOpt
 }
 
 // DownloadStream operation reads or downloads a file from the system, including its metadata and properties.
+// ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/get-file.
 func (f *Client) DownloadStream(ctx context.Context, options *DownloadStreamOptions) (DownloadStreamResponse, error) {
 	opts, leaseAccessConditions := options.format()

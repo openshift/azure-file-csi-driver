@@ -8,6 +8,12 @@ package directory
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/file"
@@ -15,9 +21,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/exported"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/generated"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/shared"
-	"net/http"
-	"net/url"
-	"strings"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas"
 )
 
 // ClientOptions contains the optional parameters when creating a Client.
@@ -26,15 +30,46 @@ type ClientOptions base.ClientOptions
 // Client represents a URL to the Azure Storage directory allowing you to manipulate its directories and files.
 type Client base.Client[generated.DirectoryClient]
 
+// NewClient creates an instance of Client with the specified values.
+//   - directoryURL - the URL of the directory e.g. https://<account>.file.core.windows.net/share/directory
+//   - cred - an Azure AD credential, typically obtained via the azidentity module
+//   - options - client options; pass nil to accept the default values
+//
+// Note that ClientOptions.FileRequestIntent is currently required for token authentication.
+func NewClient(directoryURL string, cred azcore.TokenCredential, options *ClientOptions) (*Client, error) {
+	audience := base.GetAudience((*base.ClientOptions)(options))
+	conOptions := shared.GetClientOptions(options)
+	authPolicy := runtime.NewBearerTokenPolicy(cred, []string{audience}, &policy.BearerTokenOptions{
+		InsecureAllowCredentialWithHTTP: conOptions.InsecureAllowCredentialWithHTTP,
+	})
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
+
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewDirectoryClient(directoryURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
+}
+
 // NewClientWithNoCredential creates an instance of Client with the specified values.
 // This is used to anonymously access a directory or with a shared access signature (SAS) token.
 //   - directoryURL - the URL of the directory e.g. https://<account>.file.core.windows.net/share/directory?<sas token>
 //   - options - client options; pass nil to accept the default values
 func NewClientWithNoCredential(directoryURL string, options *ClientOptions) (*Client, error) {
 	conOptions := shared.GetClientOptions(options)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewDirectoryClient(directoryURL, pl, nil)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewDirectoryClient(directoryURL, azClient, nil, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientWithSharedKeyCredential creates an instance of Client with the specified values.
@@ -44,10 +79,17 @@ func NewClientWithNoCredential(directoryURL string, options *ClientOptions) (*Cl
 func NewClientWithSharedKeyCredential(directoryURL string, cred *SharedKeyCredential, options *ClientOptions) (*Client, error) {
 	authPolicy := exported.NewSharedKeyCredPolicy(cred)
 	conOptions := shared.GetClientOptions(options)
-	conOptions.PerRetryPolicies = append(conOptions.PerRetryPolicies, authPolicy)
-	pl := runtime.NewPipeline(exported.ModuleName, exported.ModuleVersion, runtime.PipelineOptions{}, &conOptions.ClientOptions)
+	plOpts := runtime.PipelineOptions{
+		PerRetry: []policy.Policy{authPolicy},
+	}
+	base.SetPipelineOptions((*base.ClientOptions)(conOptions), &plOpts)
 
-	return (*Client)(base.NewDirectoryClient(directoryURL, pl, cred)), nil
+	azClient, err := azcore.NewClient(exported.ModuleName, exported.ModuleVersion, plOpts, &conOptions.ClientOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return (*Client)(base.NewDirectoryClient(directoryURL, azClient, cred, (*base.ClientOptions)(conOptions))), nil
 }
 
 // NewClientFromConnectionString creates an instance of Client with the specified values.
@@ -83,6 +125,10 @@ func (d *Client) sharedKey() *SharedKeyCredential {
 	return base.SharedKey((*base.Client[generated.DirectoryClient])(d))
 }
 
+func (d *Client) getClientOptions() *base.ClientOptions {
+	return base.GetClientOptions((*base.Client[generated.DirectoryClient])(d))
+}
+
 // URL returns the URL endpoint used by the Client object.
 func (d *Client) URL() string {
 	return d.generated().Endpoint()
@@ -91,9 +137,9 @@ func (d *Client) URL() string {
 // NewSubdirectoryClient creates a new Client object by concatenating subDirectoryName to the end of this Client's URL.
 // The new subdirectory Client uses the same request policy pipeline as the parent directory Client.
 func (d *Client) NewSubdirectoryClient(subDirectoryName string) *Client {
-	subDirectoryName = url.PathEscape(subDirectoryName)
+	subDirectoryName = url.PathEscape(strings.TrimRight(subDirectoryName, "/"))
 	subDirectoryURL := runtime.JoinPaths(d.URL(), subDirectoryName)
-	return (*Client)(base.NewDirectoryClient(subDirectoryURL, d.generated().Pipeline(), d.sharedKey()))
+	return (*Client)(base.NewDirectoryClient(subDirectoryURL, d.generated().InternalClient(), d.sharedKey(), d.getClientOptions()))
 }
 
 // NewFileClient creates a new file.Client object by concatenating fileName to the end of this Client's URL.
@@ -101,14 +147,15 @@ func (d *Client) NewSubdirectoryClient(subDirectoryName string) *Client {
 func (d *Client) NewFileClient(fileName string) *file.Client {
 	fileName = url.PathEscape(fileName)
 	fileURL := runtime.JoinPaths(d.URL(), fileName)
-	return (*file.Client)(base.NewFileClient(fileURL, d.generated().Pipeline(), d.sharedKey()))
+	return (*file.Client)(base.NewFileClient(fileURL, d.generated().InternalClient().WithClientName(exported.ModuleName), d.sharedKey(), d.getClientOptions()))
 }
 
 // Create operation creates a new directory under the specified share or parent directory.
+// file.ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/create-directory.
 func (d *Client) Create(ctx context.Context, options *CreateOptions) (CreateResponse, error) {
-	fileAttributes, fileCreationTime, fileLastWriteTime, opts := options.format()
-	resp, err := d.generated().Create(ctx, fileAttributes, fileCreationTime, fileLastWriteTime, opts)
+	opts := options.format()
+	resp, err := d.generated().Create(ctx, opts)
 	return resp, err
 }
 
@@ -121,7 +168,47 @@ func (d *Client) Delete(ctx context.Context, options *DeleteOptions) (DeleteResp
 	return resp, err
 }
 
+// Rename operation renames a directory, and can optionally set system properties for the directory.
+//   - destinationPath: the destination path to rename the directory to.
+//
+// For more information, see https://learn.microsoft.com/rest/api/storageservices/rename-directory.
+func (d *Client) Rename(ctx context.Context, destinationPath string, options *RenameOptions) (RenameResponse, error) {
+	destinationPath = strings.Trim(strings.TrimSpace(destinationPath), "/")
+	if len(destinationPath) == 0 {
+		return RenameResponse{}, errors.New("destination path must not be empty")
+	}
+
+	opts, destLease, smbInfo := options.format()
+
+	urlParts, err := sas.ParseURL(d.URL())
+	if err != nil {
+		return RenameResponse{}, err
+	}
+
+	destParts := strings.Split(destinationPath, "?")
+	newDestPath := destParts[0]
+	newDestQuery := ""
+	if len(destParts) == 2 {
+		newDestQuery = destParts[1]
+	}
+
+	urlParts.DirectoryOrFilePath = newDestPath
+	destURL := urlParts.String()
+	// replace the query part if it is present in destination path
+	if len(newDestQuery) > 0 {
+		destURL = strings.Split(destURL, "?")[0] + "?" + newDestQuery
+	}
+
+	destDirClient := (*Client)(base.NewDirectoryClient(destURL, d.generated().InternalClient(), d.sharedKey(), d.getClientOptions()))
+
+	resp, err := destDirClient.generated().Rename(ctx, d.URL(), opts, nil, destLease, smbInfo)
+	return RenameResponse{
+		DirectoryClientRenameResponse: resp,
+	}, err
+}
+
 // GetProperties operation returns all system properties for the specified directory, and it can also be used to check the existence of a directory.
+// file.ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/get-directory-properties.
 func (d *Client) GetProperties(ctx context.Context, options *GetPropertiesOptions) (GetPropertiesResponse, error) {
 	opts := options.format()
@@ -130,10 +217,11 @@ func (d *Client) GetProperties(ctx context.Context, options *GetPropertiesOption
 }
 
 // SetProperties operation sets system properties for the specified directory.
+// file.ParseNTFSFileAttributes method can be used to convert the file attributes returned in response to NTFSFileAttributes.
 // For more information, see https://learn.microsoft.com/en-us/rest/api/storageservices/set-directory-properties.
 func (d *Client) SetProperties(ctx context.Context, options *SetPropertiesOptions) (SetPropertiesResponse, error) {
-	fileAttributes, fileCreationTime, fileLastWriteTime, opts := options.format()
-	resp, err := d.generated().SetProperties(ctx, fileAttributes, fileCreationTime, fileLastWriteTime, opts)
+	opts := options.format()
+	resp, err := d.generated().SetProperties(ctx, opts)
 	return resp, err
 }
 
@@ -192,7 +280,7 @@ func (d *Client) NewListFilesAndDirectoriesPager(options *ListFilesAndDirectorie
 			if err != nil {
 				return ListFilesAndDirectoriesResponse{}, err
 			}
-			resp, err := d.generated().Pipeline().Do(req)
+			resp, err := d.generated().InternalClient().Pipeline().Do(req)
 			if err != nil {
 				return ListFilesAndDirectoriesResponse{}, err
 			}

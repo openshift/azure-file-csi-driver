@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -40,7 +41,7 @@ const (
 	AzcopyJobCompleted AzcopyJobState = "Completed"
 )
 
-var mutex = &sync.Mutex{}
+var powershellCmdMutex = &sync.Mutex{}
 
 // RoundUpBytes rounds up the volume size in bytes up to multiplications of GiB
 // in the unit of Bytes
@@ -79,8 +80,8 @@ func roundUpSize(volumeSizeBytes int64, allocationUnitBytes int64) int64 {
 
 func RunPowershellCmd(command string, envs ...string) ([]byte, error) {
 	// only one powershell command can be executed at a time to avoid OOM
-	mutex.Lock()
-	defer mutex.Unlock()
+	powershellCmdMutex.Lock()
+	defer powershellCmdMutex.Unlock()
 
 	cmd := exec.Command("powershell", "-Mta", "-NoProfile", "-Command", command)
 	cmd.Env = append(os.Environ(), envs...)
@@ -204,4 +205,31 @@ func parseAzcopyJobShow(jobshow string) (AzcopyJobState, string, error) {
 		return AzcopyJobError, "", fmt.Errorf("error parsing jobs summary: %s in Percent Complete (approx)", jobshow)
 	}
 	return AzcopyJobRunning, strings.ReplaceAll(segments[1], "\n", ""), nil
+}
+
+// ExecFunc returns a exec function's output and error
+type ExecFunc func() (err error)
+
+// TimeoutFunc returns output and error if an ExecFunc timeout
+type TimeoutFunc func() (err error)
+
+// WaitUntilTimeout waits for the exec function to complete or return timeout error
+func WaitUntilTimeout(timeout time.Duration, execFunc ExecFunc, timeoutFunc TimeoutFunc) error {
+	// Create a channel to receive the result of the azcopy exec function
+	done := make(chan bool)
+	var err error
+
+	// Start the azcopy exec function in a goroutine
+	go func() {
+		err = execFunc()
+		done <- true
+	}()
+
+	// Wait for the function to complete or time out
+	select {
+	case <-done:
+		return err
+	case <-time.After(timeout):
+		return timeoutFunc()
+	}
 }
