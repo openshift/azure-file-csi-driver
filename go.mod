@@ -190,6 +190,6 @@ replace (
 	k8s.io/kubectl => k8s.io/kubectl v0.29.0
 	k8s.io/kubelet => k8s.io/kubelet v0.29.0
 	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.29.0
-	k8s.io/mount-utils => k8s.io/mount-utils v0.0.0-20231116185301-00b898b94b20
+	k8s.io/mount-utils => k8s.io/mount-utils v0.29.8
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.29.0
 )
