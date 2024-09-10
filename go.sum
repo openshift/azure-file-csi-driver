@@ -122,6 +122,8 @@ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSs
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dnaeon/go-vcr v1.1.0 h1:ReYa/UBrRyQdant9B4fNHGoCNKw6qh6P0fsdGmZpR7c=
+github.com/dobsonj/mount-utils v0.0.0-20240910210000-cbd64886b2a9 h1:Qh7s68PmKJ2XYjr/B8VxY/nx6x2vHV54lNkgDIvpp2I=
+github.com/dobsonj/mount-utils v0.0.0-20240910210000-cbd64886b2a9/go.mod h1:au99w4FWU5ZWelLb3Yx6kJc8RZ387IyWVM9tN65Yhxo=
 github.com/docker/distribution v2.8.1+incompatible h1:Q50tZOPR6T/hjNsyc9g8/syEs6bk8XXApsHjKukMl68=
 github.com/docker/distribution v2.8.1+incompatible/go.mod h1:J2gT2udsDAN96Uj4KfcMRqY0/ypR+oyYUYmja8H+y+w=
 github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815/go.mod h1:WwZ+bS3ebgob9U8Nd0kOddGdZWjyMGR8Wziv+TBNwSE=
@@ -858,8 +860,6 @@ k8s.io/kubectl v0.26.0 h1:xmrzoKR9CyNdzxBmXV7jW9Ln8WMrwRK6hGbbf69o4T0=
 k8s.io/kubectl v0.26.0/go.mod h1:eInP0b+U9XUJWSYeU9XZnTA+cVYuWyl3iYPGtru0qhQ=
 k8s.io/kubernetes v1.26.0 h1:fL8VMr4xlfTazPORLhz5fsvO5I3bsFpmynVxZTH1ItQ=
 k8s.io/kubernetes v1.26.0/go.mod h1:z0aCJwn6DxzB/dDiWLbQaJO5jWOR2qoaCMnmSAx45XM=
-k8s.io/mount-utils v0.0.0-20230103133730-1df1a57439e2 h1:kfACKquxtsEA7XXDy+iC92lg/1stK0UtzAhf7R2Y8Fc=
-k8s.io/mount-utils v0.0.0-20230103133730-1df1a57439e2/go.mod h1:au99w4FWU5ZWelLb3Yx6kJc8RZ387IyWVM9tN65Yhxo=
 k8s.io/pod-security-admission v0.26.0 h1:XBG/uyP2cYwSFr5IWAQ1IIArxMYARJKzEzSmP4ZbC1s=
 k8s.io/pod-security-admission v0.26.0/go.mod h1:HQHvpCrn6KQLKRUqFvWkHCVKet3X62fn2F3j5anYiEM=
 k8s.io/utils v0.0.0-20210802155522-efc7438f0176/go.mod h1:jPW/WVKK9YHAvNhRxK0md/EJ228hCsBRufyofKtW8HA=
