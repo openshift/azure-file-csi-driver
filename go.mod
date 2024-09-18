@@ -114,7 +114,7 @@ require (
 	go.opentelemetry.io/proto/otlp v0.19.0 // indirect
 	golang.org/x/crypto v0.14.0 // indirect
 	golang.org/x/oauth2 v0.0.0-20220223155221-ee480838109b // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/sys v0.18.0 // indirect
 	golang.org/x/term v0.13.0 // indirect
 	golang.org/x/text v0.13.0 // indirect
 	golang.org/x/time v0.0.0-20220210224613-90d013bbcef8 // indirect
@@ -162,7 +162,7 @@ replace (
 	k8s.io/kubelet => k8s.io/kubelet v0.26.0
 	k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.26.0
 	k8s.io/metrics => k8s.io/metrics v0.26.0
-	k8s.io/mount-utils => k8s.io/mount-utils v0.0.0-20230103133730-1df1a57439e2
+	k8s.io/mount-utils => github.com/openshift/kubernetes/staging/src/k8s.io/mount-utils v0.0.0-20240917150121-53fd427d5826
 	k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.26.0
 	k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.26.0
 	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.26.0

@@ -462,8 +462,8 @@ golang.org/x/net/trace
 ## explicit; go 1.11
 golang.org/x/oauth2
 golang.org/x/oauth2/internal
-# golang.org/x/sys v0.13.0
-## explicit; go 1.17
+# golang.org/x/sys v0.18.0
+## explicit; go 1.18
 golang.org/x/sys/cpu
 golang.org/x/sys/plan9
 golang.org/x/sys/unix
@@ -1194,7 +1194,7 @@ k8s.io/kubernetes/test/e2e/testing-manifests
 k8s.io/kubernetes/test/utils
 k8s.io/kubernetes/test/utils/image
 k8s.io/kubernetes/test/utils/kubeconfig
-# k8s.io/mount-utils v0.0.0 => k8s.io/mount-utils v0.0.0-20230103133730-1df1a57439e2
+# k8s.io/mount-utils v0.0.0 => github.com/openshift/kubernetes/staging/src/k8s.io/mount-utils v0.0.0-20240917150121-53fd427d5826
 ## explicit; go 1.19
 k8s.io/mount-utils
 # k8s.io/pod-security-admission v0.26.0 => k8s.io/pod-security-admission v0.26.0
@@ -1320,7 +1320,7 @@ sigs.k8s.io/yaml
 # k8s.io/kubelet => k8s.io/kubelet v0.26.0
 # k8s.io/legacy-cloud-providers => k8s.io/legacy-cloud-providers v0.26.0
 # k8s.io/metrics => k8s.io/metrics v0.26.0
-# k8s.io/mount-utils => k8s.io/mount-utils v0.0.0-20230103133730-1df1a57439e2
+# k8s.io/mount-utils => github.com/openshift/kubernetes/staging/src/k8s.io/mount-utils v0.0.0-20240917150121-53fd427d5826
 # k8s.io/pod-security-admission => k8s.io/pod-security-admission v0.26.0
 # k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.26.0
 # k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.26.0
