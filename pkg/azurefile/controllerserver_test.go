@@ -666,9 +666,9 @@ func TestCreateVolume(t *testing.T) {
 				mockSubnetClient := mocksubnetclient.NewMockInterface(ctrl)
 				fakeCloud.SubnetsClient = mockSubnetClient
 
-				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(network.Subnet{}, retErr).Times(1)
+				mockSubnetClient.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any()).Return([]network.Subnet{}, retErr).Times(1)
 
-				expectedErr := status.Errorf(codes.Internal, "update service endpoints failed with error: failed to get the subnet fake-subnet under vnet fake-vnet: &{false 0 0001-01-01 00:00:00 +0000 UTC the subnet does not exist}")
+				expectedErr := status.Errorf(codes.Internal, "update service endpoints failed with error: failed to list the subnets under rg rg vnet fake-vnet: Retriable: false, RetryAfter: 0s, HTTPStatusCode: 0, RawError: the subnet does not exist")
 				_, err := d.CreateVolume(ctx, req)
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -676,7 +676,52 @@ func TestCreateVolume(t *testing.T) {
 			},
 		},
 		{
-			name: "No valid key with zero request gib",
+			name: "Failed with storeAccountKey is not supported for account with shared access key disabled",
+			testFunc: func(t *testing.T) {
+				allParam := map[string]string{
+					skuNameField:              "premium",
+					storageAccountTypeField:   "stoacctype",
+					locationField:             "loc",
+					storageAccountField:       "stoacc",
+					resourceGroupField:        "rg",
+					shareNameField:            "",
+					diskNameField:             "diskname.vhd",
+					fsTypeField:               "",
+					storeAccountKeyField:      "storeaccountkey",
+					secretNamespaceField:      "default",
+					mountPermissionsField:     "0755",
+					accountQuotaField:         "1000",
+					allowSharedKeyAccessField: "false",
+				}
+
+				fakeCloud := &azure.Cloud{
+					Config: azure.Config{
+						ResourceGroup: "rg",
+						Location:      "loc",
+						VnetName:      "fake-vnet",
+						SubnetName:    "fake-subnet",
+					},
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name:               "random-vol-name-vol-cap-invalid",
+					CapacityRange:      stdCapRange,
+					VolumeCapabilities: stdVolCap,
+					Parameters:         allParam,
+				}
+				d := NewFakeDriver()
+
+				d.cloud = fakeCloud
+
+				expectedErr := status.Errorf(codes.InvalidArgument, "storeAccountKey is not supported for account with shared access key disabled")
+				_, err := d.CreateVolume(ctx, req)
+				if !reflect.DeepEqual(err, expectedErr) {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "fileServicePropertiesCache is nil",
 			testFunc: func(t *testing.T) {
 				name := "baz"
 				sku := "sku"
@@ -735,7 +780,7 @@ func TestCreateVolume(t *testing.T) {
 				mockFileClient.EXPECT().GetServiceProperties(context.TODO(), gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
 				mockFileClient.EXPECT().SetServiceProperties(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fileServiceProperties, nil).AnyTimes()
 
-				expectedErr := fmt.Errorf("no valid keys")
+				expectedErr := fmt.Errorf("failed to ensure storage account: fileServicePropertiesCache is nil")
 
 				_, err := d.CreateVolume(ctx, req)
 				if !strings.Contains(err.Error(), expectedErr.Error()) {
@@ -1354,8 +1399,6 @@ func TestCreateVolume(t *testing.T) {
 					CapacityRange:      capRange,
 				}
 
-				expectedShareOptions := &fileclient.ShareOptions{Name: "vol-1", Protocol: "SMB", RequestGiB: 100, AccessTier: "", RootSquash: "", Metadata: nil}
-
 				d := NewFakeDriver()
 
 				ctrl := gomock.NewController(t)
@@ -1365,7 +1408,7 @@ func TestCreateVolume(t *testing.T) {
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
 				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
-				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), expectedShareOptions, gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
@@ -1415,8 +1458,6 @@ func TestCreateVolume(t *testing.T) {
 					CapacityRange:      capRange,
 				}
 
-				expectedShareOptions := &fileclient.ShareOptions{Name: "vol-1", Protocol: "SMB", RequestGiB: 100, AccessTier: "", RootSquash: "", Metadata: nil}
-
 				d := NewFakeDriver()
 
 				ctrl := gomock.NewController(t)
@@ -1426,7 +1467,7 @@ func TestCreateVolume(t *testing.T) {
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
 				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
-				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), expectedShareOptions, gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
@@ -1474,8 +1515,6 @@ func TestCreateVolume(t *testing.T) {
 					CapacityRange:      capRange,
 				}
 
-				expectedShareOptions := &fileclient.ShareOptions{Name: "vol-1", Protocol: "SMB", RequestGiB: 1, AccessTier: "", RootSquash: "", Metadata: nil}
-
 				d := NewFakeDriver()
 
 				ctrl := gomock.NewController(t)
@@ -1485,7 +1524,7 @@ func TestCreateVolume(t *testing.T) {
 				d.cloud.StorageAccountClient = mockStorageAccountsClient
 
 				mockFileClient.EXPECT().WithSubscriptionID(gomock.Any()).Return(mockFileClient).AnyTimes()
-				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), expectedShareOptions, gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+				mockFileClient.EXPECT().CreateFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
 				mockFileClient.EXPECT().GetFileShare(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(storage.FileShare{FileShareProperties: &storage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
 				mockStorageAccountsClient.EXPECT().ListByResourceGroup(gomock.Any(), gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
@@ -1767,7 +1806,7 @@ func TestCopyVolume(t *testing.T) {
 				d := NewFakeDriver()
 				ctx := context.Background()
 
-				expectedErr := fmt.Errorf("srcFileShareName() or dstFileShareName(dstFileshare) is empty")
+				expectedErr := fmt.Errorf("one or more of srcAccountName(unit-test), srcFileShareName(), dstFileShareName(dstFileshare) are empty")
 				err := d.copyVolume(ctx, req, "", "", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -1872,7 +1911,7 @@ func TestCopyVolume(t *testing.T) {
 				d := NewFakeDriver()
 				ctx := context.Background()
 
-				expectedErr := fmt.Errorf("srcFileShareName() or dstFileShareName(dstFileshare) is empty")
+				expectedErr := fmt.Errorf("one or more of srcAccountName(unit-test), srcFileShareName(), dstFileShareName(dstFileshare) are empty")
 				err := d.copyVolume(ctx, req, "", "", []string{}, "", "", secret, &fileclient.ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
@@ -1907,7 +1946,7 @@ func TestCopyVolume(t *testing.T) {
 				d := NewFakeDriver()
 				ctx := context.Background()
 
-				expectedErr := fmt.Errorf("srcFileShareName(fileshare) or dstFileShareName() is empty")
+				expectedErr := fmt.Errorf("one or more of srcAccountName(f5713de20cde511e8ba4900), srcFileShareName(fileshare), dstFileShareName() are empty")
 				err := d.copyVolume(ctx, req, "", "", []string{}, "", "", secret, &fileclient.ShareOptions{}, nil, "core.windows.net")
 				if !reflect.DeepEqual(err, expectedErr) {
 					t.Errorf("Unexpected error: %v", err)
