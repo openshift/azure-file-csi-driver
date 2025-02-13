@@ -1108,6 +1108,10 @@ type ShareClientGetPropertiesResponse struct {
 	// ETag contains the information returned from the ETag header response.
 	ETag *azcore.ETag
 
+	// EnableSnapshotVirtualDirectoryAccess contains the information returned from the x-ms-enable-snapshot-virtual-directory-access
+	// header response.
+	EnableSnapshotVirtualDirectoryAccess *bool
+
 	// EnabledProtocols contains the information returned from the x-ms-enabled-protocols header response.
 	EnabledProtocols *string
 
@@ -1129,6 +1133,16 @@ type ShareClientGetPropertiesResponse struct {
 	// NextAllowedQuotaDowngradeTime contains the information returned from the x-ms-share-next-allowed-quota-downgrade-time header
 	// response.
 	NextAllowedQuotaDowngradeTime *time.Time
+
+	// PaidBurstingEnabled contains the information returned from the x-ms-share-paid-bursting-enabled header response.
+	PaidBurstingEnabled *bool
+
+	// PaidBurstingMaxBandwidthMibps contains the information returned from the x-ms-share-paid-bursting-max-bandwidth-mibps header
+	// response.
+	PaidBurstingMaxBandwidthMibps *int64
+
+	// PaidBurstingMaxIops contains the information returned from the x-ms-share-paid-bursting-max-iops header response.
+	PaidBurstingMaxIops *int64
 
 	// ProvisionedBandwidthMiBps contains the information returned from the x-ms-share-provisioned-bandwidth-mibps header response.
 	ProvisionedBandwidthMiBps *int32

@@ -31,6 +31,7 @@ type DriverOptions struct {
 	EnableVHDDiskFeature                   bool
 	EnableVolumeMountGroup                 bool
 	EnableGetVolumeStats                   bool
+	EnableKataCCMount                      bool
 	AppendMountErrorHelpLink               bool
 	MountPermissions                       uint64
 	FSGroupChangePolicy                    string
@@ -47,6 +48,7 @@ type DriverOptions struct {
 	PrintVolumeStatsCallLogs               bool
 	SasTokenExpirationMinutes              int
 	WaitForAzCopyTimeoutMinutes            int
+	GoMaxProcs                             int
 	KubeConfig                             string
 	Endpoint                               string
 }
@@ -67,6 +69,7 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 	fs.BoolVar(&o.EnableVHDDiskFeature, "enable-vhd", true, "enable VHD disk feature (experimental)")
 	fs.BoolVar(&o.EnableVolumeMountGroup, "enable-volume-mount-group", true, "indicates whether enabling VOLUME_MOUNT_GROUP")
 	fs.BoolVar(&o.EnableGetVolumeStats, "enable-get-volume-stats", true, "allow GET_VOLUME_STATS on agent node")
+	fs.BoolVar(&o.EnableKataCCMount, "enable-kata-cc-mount", false, "enable Kata Confidential Containers mount")
 	fs.BoolVar(&o.AppendMountErrorHelpLink, "append-mount-error-help-link", true, "Whether to include a link for help with mount errors when a mount error occurs.")
 	fs.Uint64Var(&o.MountPermissions, "mount-permissions", 0777, "mounted folder permissions")
 	fs.StringVar(&o.FSGroupChangePolicy, "fsgroup-change-policy", "", "indicates how the volume's ownership will be changed by the driver, OnRootMismatch is the default value")
@@ -82,9 +85,10 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 	fs.IntVar(&o.VolStatsCacheExpireInMinutes, "vol-stats-cache-expire-in-minutes", 10, "The cache expire time in minutes for volume stats cache")
 	fs.BoolVar(&o.PrintVolumeStatsCallLogs, "print-volume-stats-call-logs", false, "Whether to print volume statfs call logs with log level 2")
 	fs.IntVar(&o.SasTokenExpirationMinutes, "sas-token-expiration-minutes", 1440, "sas token expiration minutes during volume cloning and snapshot restore")
-	fs.IntVar(&o.WaitForAzCopyTimeoutMinutes, "wait-for-azcopy-timeout-minutes", 5, "timeout in minutes for waiting for azcopy to finish")
+	fs.IntVar(&o.WaitForAzCopyTimeoutMinutes, "wait-for-azcopy-timeout-minutes", 19, "timeout in minutes for waiting for azcopy to finish")
 	fs.StringVar(&o.KubeConfig, "kubeconfig", "", "Absolute path to the kubeconfig file. Required only when running out of cluster.")
 	fs.StringVar(&o.Endpoint, "endpoint", "unix://tmp/csi.sock", "CSI endpoint")
+	fs.IntVar(&o.GoMaxProcs, "max-procs", 2, "maximum number of CPUs that can be executing simultaneously in golang runtime")
 
 	return fs
 }

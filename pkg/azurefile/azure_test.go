@@ -28,17 +28,86 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fake "k8s.io/client-go/kubernetes/fake"
 	azureprovider "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
 func skipIfTestingOnWindows(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping test on Windows")
+	}
+}
+
+func TestGetRuntimeClassForPod(t *testing.T) {
+	ctx := context.TODO()
+
+	// Test the case where kubeClient is nil
+	_, err := getRuntimeClassForPod(ctx, nil, "test-pod", "default")
+	if err == nil || err.Error() != "kubeClient is nil" {
+		t.Fatalf("expected error 'kubeClient is nil', got %v", err)
+	}
+
+	// Create a fake clientset
+	clientset := fake.NewSimpleClientset()
+
+	// Test the case where the pod exists and has a RuntimeClassName
+	runtimeClassName := "my-runtime-class"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClassName,
+		},
+	}
+	_, err = clientset.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	runtimeClass, err := getRuntimeClassForPod(ctx, clientset, "test-pod", "default")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if runtimeClass != runtimeClassName {
+		t.Fatalf("expected runtime class name to be '%s', got '%s'", runtimeClassName, runtimeClass)
+	}
+
+	// Test the case where the pod exists but does not have a RuntimeClassName
+	podWithoutRuntimeClass := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod-no-runtime",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{},
+	}
+	_, err = clientset.CoreV1().Pods("default").Create(ctx, podWithoutRuntimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	runtimeClass, err = getRuntimeClassForPod(ctx, clientset, "test-pod-no-runtime", "default")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if runtimeClass != "" {
+		t.Fatalf("expected runtime class name to be '', got '%s'", runtimeClass)
+	}
+
+	// Test the case where the pod does not exist
+	_, err = getRuntimeClassForPod(ctx, clientset, "nonexistent-pod", "default")
+	if err == nil {
+		t.Fatalf("expected an error, got nil")
 	}
 }
 
@@ -203,7 +272,7 @@ users:
 		if cloud == nil {
 			t.Errorf("return value of getCloudProvider should not be nil even there is error")
 		} else {
-			assert.Equal(t, cloud.UserAgent, test.userAgent)
+			assert.Equal(t, test.userAgent, cloud.UserAgent)
 			assert.Equal(t, cloud.AADFederatedTokenFile, test.aadFederatedTokenFile)
 			assert.Equal(t, cloud.UseFederatedWorkloadIdentityExtension, test.useFederatedWorkloadIdentityExtension)
 			assert.Equal(t, cloud.AADClientID, test.aadClientID)
@@ -263,7 +332,7 @@ func TestUpdateSubnetServiceEndpoints(t *testing.T) {
 			testFunc: func(t *testing.T) {
 				fakeSubnet := network.Subnet{
 					SubnetPropertiesFormat: &network.SubnetPropertiesFormat{},
-					Name:                   pointer.String("subnetName"),
+					Name:                   ptr.To("subnetName"),
 				}
 
 				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).Times(1)
@@ -280,7 +349,7 @@ func TestUpdateSubnetServiceEndpoints(t *testing.T) {
 					SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
 						ServiceEndpoints: &[]network.ServiceEndpointPropertiesFormat{},
 					},
-					Name: pointer.String("subnetName"),
+					Name: ptr.To("subnetName"),
 				}
 
 				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()
@@ -302,7 +371,7 @@ func TestUpdateSubnetServiceEndpoints(t *testing.T) {
 							},
 						},
 					},
-					Name: pointer.String("subnetName"),
+					Name: ptr.To("subnetName"),
 				}
 
 				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()

@@ -17,6 +17,7 @@ limitations under the License.
 package azurefile
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
@@ -27,6 +28,8 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume"
 )
@@ -135,11 +138,16 @@ func isRetriableError(err error) bool {
 	return false
 }
 
-func sleepIfThrottled(err error, defaultSleepSec int) {
-	if err == nil {
-		return
+func isThrottlingError(err error) bool {
+	if err != nil {
+		errMsg := strings.ToLower(err.Error())
+		return strings.Contains(errMsg, strings.ToLower(tooManyRequests)) || strings.Contains(errMsg, clientThrottled)
 	}
-	if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tooManyRequests)) || strings.Contains(strings.ToLower(err.Error()), clientThrottled) {
+	return false
+}
+
+func sleepIfThrottled(err error, defaultSleepSec int) {
+	if isThrottlingError(err) {
 		retryAfter := getRetryAfterSeconds(err)
 		if retryAfter == 0 {
 			retryAfter = defaultSleepSec
@@ -316,4 +324,24 @@ func isReadOnlyFromCapability(vc *csi.VolumeCapability) bool {
 	mode := vc.GetAccessMode().GetMode()
 	return (mode == csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY ||
 		mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY)
+}
+
+const confidentialRuntimeClassHandler = "kata-cc"
+
+// check if runtimeClass is confidential
+func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interface, runtimeClassName string) (bool, error) {
+	// if runtimeClassName is empty, return false
+	if runtimeClassName == "" {
+		return false, nil
+	}
+	if kubeClient == nil {
+		return false, fmt.Errorf("kubeClient is nil")
+	}
+	runtimeClassClient := kubeClient.NodeV1().RuntimeClasses()
+	runtimeClass, err := runtimeClassClient.Get(ctx, runtimeClassName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	klog.Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
+	return runtimeClass.Handler == confidentialRuntimeClassHandler, nil
 }

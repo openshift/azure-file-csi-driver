@@ -31,22 +31,16 @@ import (
 
 	"sigs.k8s.io/azurefile-csi-driver/pkg/os/filesystem"
 	"sigs.k8s.io/azurefile-csi-driver/pkg/os/smb"
-
-	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 )
 
 var driverGlobalMountPath = "C:\\var\\lib\\kubelet\\plugins\\kubernetes.io\\csi\\file.csi.azure.com"
 
 var _ CSIProxyMounter = &winMounter{}
 
-type winMounter struct {
-	volStatsCache azcache.Resource
-}
+type winMounter struct{}
 
-func NewWinMounter(cache azcache.Resource) *winMounter {
-	return &winMounter{
-		volStatsCache: cache,
-	}
+func NewWinMounter() *winMounter {
+	return &winMounter{}
 }
 
 func (mounter *winMounter) SMBMount(source, target, fsType string, mountOptions, sensitiveMountOptions []string) error {
@@ -126,7 +120,7 @@ func (mounter *winMounter) SMBMount(source, target, fsType string, mountOptions,
 
 // Mount just creates a soft link at target pointing to source.
 func (mounter *winMounter) Mount(source, target, fstype string, options []string) error {
-	return filesystem.LinkPath(normalizeWindowsPath(source), normalizeWindowsPath(target))
+	return os.Symlink(normalizeWindowsPath(source), normalizeWindowsPath(target))
 }
 
 // Rmdir - delete the given directory
@@ -137,12 +131,11 @@ func (mounter *winMounter) Rmdir(path string) error {
 // Unmount - Removes the directory - equivalent to unmount on Linux.
 func (mounter *winMounter) Unmount(target string) error {
 	target = normalizeWindowsPath(target)
-	remoteServer, err := smb.GetRemoteServerFromTarget(target, mounter.volStatsCache)
+	remoteServer, err := smb.GetRemoteServerFromTarget(target)
 	if err == nil {
 		klog.V(2).Infof("remote server path: %s, local path: %s", remoteServer, target)
-		if hasDupSMBMount, err := smb.CheckForDuplicateSMBMounts(driverGlobalMountPath, target, remoteServer, mounter.volStatsCache); err == nil {
+		if hasDupSMBMount, err := smb.CheckForDuplicateSMBMounts(driverGlobalMountPath, target, remoteServer); err == nil {
 			if !hasDupSMBMount {
-				remoteServer = strings.Replace(remoteServer, "UNC\\", "\\\\", 1)
 				if err := smb.RemoveSmbGlobalMapping(remoteServer); err != nil {
 					klog.Errorf("RemoveSmbGlobalMapping(%s) failed with %v", target, err)
 				}
@@ -198,7 +191,7 @@ func (mounter *winMounter) IsLikelyNotMountPoint(path string) (bool, error) {
 // Currently the make dir is only used from the staging code path, hence we call it
 // with Plugin context..
 func (mounter *winMounter) MakeDir(path string) error {
-	return filesystem.Mkdir(normalizeWindowsPath(path))
+	return os.MkdirAll(normalizeWindowsPath(path), 0755)
 }
 
 // ExistsPath - Checks if a path exists. Unlike util ExistsPath, this call does not perform follow link.

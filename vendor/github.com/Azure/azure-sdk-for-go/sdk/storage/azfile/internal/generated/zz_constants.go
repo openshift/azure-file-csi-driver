@@ -75,6 +75,21 @@ func PossibleFileLastWrittenModeValues() []FileLastWrittenMode {
 	}
 }
 
+type FilePermissionFormat string
+
+const (
+	FilePermissionFormatBinary FilePermissionFormat = "Binary"
+	FilePermissionFormatSddl   FilePermissionFormat = "Sddl"
+)
+
+// PossibleFilePermissionFormatValues returns the possible values for the FilePermissionFormat const type.
+func PossibleFilePermissionFormatValues() []FilePermissionFormat {
+	return []FilePermissionFormat{
+		FilePermissionFormatBinary,
+		FilePermissionFormatSddl,
+	}
+}
+
 type FileRangeWriteType string
 
 const (
@@ -292,6 +307,7 @@ const (
 	StorageErrorCodeOutOfRangeInput                      StorageErrorCode = "OutOfRangeInput"
 	StorageErrorCodeOutOfRangeQueryParameterValue        StorageErrorCode = "OutOfRangeQueryParameterValue"
 	StorageErrorCodeParentNotFound                       StorageErrorCode = "ParentNotFound"
+	StorageErrorCodePreviousSnapshotNotFound             StorageErrorCode = "PreviousSnapshotNotFound"
 	StorageErrorCodeReadOnlyAttribute                    StorageErrorCode = "ReadOnlyAttribute"
 	StorageErrorCodeRequestBodyTooLarge                  StorageErrorCode = "RequestBodyTooLarge"
 	StorageErrorCodeRequestURLFailedToParse              StorageErrorCode = "RequestUrlFailedToParse"
@@ -363,6 +379,7 @@ func PossibleStorageErrorCodeValues() []StorageErrorCode {
 		StorageErrorCodeOutOfRangeInput,
 		StorageErrorCodeOutOfRangeQueryParameterValue,
 		StorageErrorCodeParentNotFound,
+		StorageErrorCodePreviousSnapshotNotFound,
 		StorageErrorCodeReadOnlyAttribute,
 		StorageErrorCodeRequestBodyTooLarge,
 		StorageErrorCodeRequestURLFailedToParse,

@@ -17,6 +17,7 @@ limitations under the License.
 package azurefile
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -26,6 +27,9 @@ import (
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	nodev1 "k8s.io/api/node/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fake "k8s.io/client-go/kubernetes/fake"
 	utiltesting "k8s.io/client-go/util/testing"
 )
 
@@ -746,6 +750,109 @@ func TestIsReadOnlyFromCapability(t *testing.T) {
 		result := isReadOnlyFromCapability(test.vc)
 		if result != test.expectedResult {
 			t.Errorf("case(%s): isReadOnlyFromCapability returned with %v, not equal to %v", test.name, result, test.expectedResult)
+		}
+	}
+}
+
+func TestIsConfidentialRuntimeClass(t *testing.T) {
+	ctx := context.TODO()
+
+	// Test the case where kubeClient is nil
+	_, err := isConfidentialRuntimeClass(ctx, nil, "test-runtime-class")
+	if err == nil || err.Error() != "kubeClient is nil" {
+		t.Fatalf("expected error 'kubeClient is nil', got %v", err)
+	}
+
+	// Create a fake clientset
+	clientset := fake.NewSimpleClientset()
+
+	// Test the case where the runtime class exists and has the confidential handler
+	runtimeClass := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-runtime-class",
+		},
+		Handler: confidentialRuntimeClassHandler,
+	}
+	_, err = clientset.NodeV1().RuntimeClasses().Create(ctx, runtimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	isConfidential, err := isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !isConfidential {
+		t.Fatalf("expected runtime class to be confidential, got %v", isConfidential)
+	}
+
+	// Test the case where the runtime class exists but does not have the confidential handler
+	nonConfidentialRuntimeClass := &nodev1.RuntimeClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-runtime-class-non-confidential",
+		},
+		Handler: "non-confidential-handler",
+	}
+	_, err = clientset.NodeV1().RuntimeClasses().Create(ctx, nonConfidentialRuntimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	isConfidential, err = isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class-non-confidential")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if isConfidential {
+		t.Fatalf("expected runtime class to not be confidential, got %v", isConfidential)
+	}
+
+	// Test the case where the runtime class does not exist
+	_, err = isConfidentialRuntimeClass(ctx, clientset, "nonexistent-runtime-class")
+	if err == nil {
+		t.Fatalf("expected an error, got nil")
+	}
+}
+
+func TestIsThrottlingError(t *testing.T) {
+	tests := []struct {
+		desc     string
+		err      error
+		expected bool
+	}{
+		{
+			desc:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			desc:     "no match",
+			err:      errors.New("no match"),
+			expected: false,
+		},
+		{
+			desc:     "match error message",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 217s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: true,
+		},
+		{
+			desc:     "match error message exceeds 1200s",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 0, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"client throttled\""),
+			expected: true,
+		},
+		{
+			desc:     "match error message with TooManyRequests throttling",
+			err:      errors.New("could not list storage accounts for account type Premium_LRS: Retriable: true, RetryAfter: 2170s, HTTPStatusCode: 429, RawError: azure cloud provider throttled for operation StorageAccountListByResourceGroup with reason \"TooManyRequests\""),
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := isThrottlingError(test.err)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: err(%v), IsThrottlingError returned with bool(%t), not equal to expected(%t)",
+				test.desc, test.err, result, test.expected)
 		}
 	}
 }
