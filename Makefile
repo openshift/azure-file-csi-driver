@@ -17,7 +17,7 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 REGISTRY ?= andyzhangx
 REGISTRY_NAME ?= $(shell echo $(REGISTRY) | sed "s/.azurecr.io//g")
 IMAGE_NAME ?= azurefile-csi
-IMAGE_VERSION ?= v1.30.5
+IMAGE_VERSION ?= v1.32.0
 # Use a custom version for E2E tests if we are testing in CI
 ifdef CI
 ifndef PUBLISH
@@ -28,7 +28,7 @@ CSI_IMAGE_TAG ?= $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_VERSION)
 CSI_IMAGE_TAG_LATEST = $(REGISTRY)/$(IMAGE_NAME):latest
 BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS ?= "-X ${PKG}/pkg/azurefile.driverVersion=${IMAGE_VERSION} -X ${PKG}/pkg/azurefile.gitCommit=${GIT_COMMIT} -X ${PKG}/pkg/azurefile.buildDate=${BUILD_DATE} -s -w -extldflags '-static'"
-E2E_HELM_OPTIONS ?= --set image.azurefile.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azurefile.tag=$(IMAGE_VERSION) --set linux.dnsPolicy=ClusterFirstWithHostNet --set driver.userAgentSuffix="e2e-test"
+E2E_HELM_OPTIONS ?= --set image.azurefile.repository=$(REGISTRY)/$(IMAGE_NAME) --set image.azurefile.tag=$(IMAGE_VERSION) --set node.enableKataCCMount=true --set linux.dnsPolicy=ClusterFirstWithHostNet --set driver.userAgentSuffix="e2e-test" --set controller.runOnControlPlane=true --set controller.replicas=1 --set snapshot.snapshotController.replicas=1
 E2E_HELM_OPTIONS += ${EXTRA_HELM_OPTIONS}
 ifdef KUBERNETES_VERSION # disable kubelet-registration-probe on capz cluster testing
 E2E_HELM_OPTIONS += --set linux.enableRegistrationProbe=false --set windows.enableRegistrationProbe=false
@@ -80,7 +80,7 @@ unit-test:
 
 .PHONY: sanity-test
 sanity-test: azurefile
-	go test -v -timeout=10m ./test/sanity
+	go test -v -timeout=30m ./test/sanity
 
 .PHONY: e2e-test
 e2e-test:
@@ -154,6 +154,7 @@ container-windows:
 ifdef WINDOWS_USE_HOST_PROCESS_CONTAINERS
 ifeq ($(OSVERSION),ltsc2022)
 	$(MAKE) container-windows-hostprocess
+	$(MAKE) container-windows-hostprocess-latest
 endif
 endif
 
@@ -233,8 +234,8 @@ create-metrics-svc:
 
 .PHONY: install-smb-provisioner
 install-smb-provisioner:
-	kubectl delete secret smbcreds --ignore-not-found
-	kubectl create secret generic smbcreds --from-literal azurestorageaccountname=USERNAME --from-literal azurestorageaccountkey="PASSWORD"
+	kubectl delete secret smbcreds -n default --ignore-not-found
+	kubectl create secret generic smbcreds -n default --from-literal azurestorageaccountname=USERNAME --from-literal azurestorageaccountkey="PASSWORD"
 ifdef TEST_WINDOWS
 	kubectl apply -f deploy/example/smb-provisioner/smb-server-lb.yaml
 else

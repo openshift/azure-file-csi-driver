@@ -20,25 +20,97 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
-	"k8s.io/utils/pointer"
-
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/subnetclient/mocksubnetclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 
-	azureprovider "sigs.k8s.io/cloud-provider-azure/pkg/provider"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
+	azureconfig "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/storage"
 )
 
 func skipIfTestingOnWindows(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Skipping test on Windows")
+	}
+}
+
+func TestGetRuntimeClassForPod(t *testing.T) {
+	ctx := context.TODO()
+
+	// Test the case where kubeClient is nil
+	_, err := getRuntimeClassForPod(ctx, nil, "test-pod", "default")
+	if err == nil || err.Error() != "kubeClient is nil" {
+		t.Fatalf("expected error 'kubeClient is nil', got %v", err)
+	}
+
+	// Create a fake clientset
+	clientset := fake.NewSimpleClientset()
+
+	// Test the case where the pod exists and has a RuntimeClassName
+	runtimeClassName := "my-runtime-class"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			RuntimeClassName: &runtimeClassName,
+		},
+	}
+	_, err = clientset.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	runtimeClass, err := getRuntimeClassForPod(ctx, clientset, "test-pod", "default")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if runtimeClass != runtimeClassName {
+		t.Fatalf("expected runtime class name to be '%s', got '%s'", runtimeClassName, runtimeClass)
+	}
+
+	// Test the case where the pod exists but does not have a RuntimeClassName
+	podWithoutRuntimeClass := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod-no-runtime",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{},
+	}
+	_, err = clientset.CoreV1().Pods("default").Create(ctx, podWithoutRuntimeClass, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	runtimeClass, err = getRuntimeClassForPod(ctx, clientset, "test-pod-no-runtime", "default")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if runtimeClass != "" {
+		t.Fatalf("expected runtime class name to be '', got '%s'", runtimeClass)
+	}
+
+	// Test the case where the pod does not exist
+	_, err = getRuntimeClassForPod(ctx, clientset, "nonexistent-pod", "default")
+	if err == nil {
+		t.Fatalf("expected an error, got nil")
 	}
 }
 
@@ -196,14 +268,14 @@ users:
 			t.Setenv("AZURE_FEDERATED_TOKEN_FILE", test.aadFederatedTokenFile)
 		}
 
-		cloud, err := getCloudProvider(context.Background(), test.kubeconfig, "", "", "", test.userAgent, test.allowEmptyCloudConfig, false, 5, 10)
-		if !testutil.AssertError(err, &test.expectedErr) && !strings.Contains(err.Error(), test.expectedErr.DefaultError.Error()) {
-			t.Errorf("desc: %s,\n input: %q, getCloudProvider err: %v, expectedErr: %v", test.desc, test.kubeconfig, err, test.expectedErr)
+		cloud, _, err := getCloudProvider(context.Background(), test.kubeconfig, "", "", "", test.userAgent, test.allowEmptyCloudConfig, false, 5, 10)
+		if test.expectedErr.DefaultError != nil && test.expectedErr.WindowsError != nil {
+			if !testutil.AssertError(err, &test.expectedErr) && !strings.Contains(err.Error(), test.expectedErr.DefaultError.Error()) {
+				t.Errorf("desc: %s,\n input: %q, getCloudProvider err: %v, expectedErr: %v", test.desc, test.kubeconfig, err, test.expectedErr)
+			}
 		}
-		if cloud == nil {
-			t.Errorf("return value of getCloudProvider should not be nil even there is error")
-		} else {
-			assert.Equal(t, cloud.UserAgent, test.userAgent)
+		if cloud != nil {
+			assert.Equal(t, test.userAgent, cloud.UserAgent)
 			assert.Equal(t, cloud.AADFederatedTokenFile, test.aadFederatedTokenFile)
 			assert.Equal(t, cloud.UseFederatedWorkloadIdentityExtension, test.useFederatedWorkloadIdentityExtension)
 			assert.Equal(t, cloud.AADClientID, test.aadClientID)
@@ -222,114 +294,90 @@ func createTestFile(path string) error {
 	return nil
 }
 
-func TestUpdateSubnetServiceEndpoints(t *testing.T) {
-	d := NewFakeDriver()
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	mockSubnetClient := mocksubnetclient.NewMockInterface(ctrl)
+var _ = ginkgo.Describe("AzureFile", func() {
+	var mockSubnetClient *mock_subnetclient.MockInterface
+	var mockClientFactory *mock_azclient.MockClientFactory
+	var ctx context.Context
+	var ctrl *gomock.Controller
+	var d *Driver
 
-	config := azureprovider.Config{
-		ResourceGroup: "rg",
-		Location:      "loc",
-		VnetName:      "fake-vnet",
-		SubnetName:    "fake-subnet",
-	}
+	ginkgo.BeforeEach(func() {
+		ctx = context.TODO()
+		d = NewFakeDriver()
+		ctrl = gomock.NewController(ginkgo.GinkgoT())
+		mockSubnetClient = mock_subnetclient.NewMockInterface(ctrl)
+		mockClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+		mockClientFactory.EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+		config := azureconfig.Config{
+			ResourceGroup: "rg",
+			Location:      "loc",
+			VnetName:      "fake-vnet",
+			SubnetName:    "fake-subnet",
+		}
 
-	d.cloud = &azureprovider.Cloud{
-		SubnetsClient: mockSubnetClient,
-		Config:        config,
-	}
-	ctx := context.TODO()
+		var err error
+		d.cloud, err = storage.NewRepository(config, &azclient.Environment{
+			StorageEndpointSuffix: "fake-endpoint",
+		}, mockClientFactory, mockClientFactory)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Unexpected error:", err)
+	})
+	ginkgo.AfterEach(func() {
+		ctrl.Finish()
+	})
+	ginkgo.It("[fail] subnet name is nil", func() {
+		mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armnetwork.Subnet{}, nil).Times(1)
+		_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
+		expectedErr := fmt.Errorf("subnet name is nil")
+		gomega.Expect(err).To(gomega.Equal(expectedErr), "Unexpected error:", err)
+	})
 
-	testCases := []struct {
-		name     string
-		testFunc func(t *testing.T)
-	}{
-		{
-			name: "[fail] subnet name is nil",
-			testFunc: func(t *testing.T) {
-				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(network.Subnet{}, nil).Times(1)
-				mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	ginkgo.It("[success] ServiceEndpoints is nil", func() {
+		fakeSubnet := &armnetwork.Subnet{
+			Properties: &armnetwork.SubnetPropertiesFormat{},
+			Name:       ptr.To("subnetName"),
+		}
 
-				_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
-				expectedErr := fmt.Errorf("subnet name is nil")
-				if !reflect.DeepEqual(err, expectedErr) {
-					t.Errorf("Unexpected error: %v", err)
-				}
+		mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).Times(1)
+		mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+		_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Unexpected error:", err)
+	})
+	ginkgo.It("[success] storageService does not exists", func() {
+		fakeSubnet := &armnetwork.Subnet{
+			Properties: &armnetwork.SubnetPropertiesFormat{
+				ServiceEndpoints: []*armnetwork.ServiceEndpointPropertiesFormat{},
 			},
-		},
-		{
-			name: "[success] ServiceEndpoints is nil",
-			testFunc: func(t *testing.T) {
-				fakeSubnet := network.Subnet{
-					SubnetPropertiesFormat: &network.SubnetPropertiesFormat{},
-					Name:                   pointer.String("subnetName"),
-				}
+			Name: ptr.To("subnetName"),
+		}
 
-				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).Times(1)
-				_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
-				if !reflect.DeepEqual(err, nil) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-		{
-			name: "[success] storageService does not exists",
-			testFunc: func(t *testing.T) {
-				fakeSubnet := network.Subnet{
-					SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
-						ServiceEndpoints: &[]network.ServiceEndpointPropertiesFormat{},
+		mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()
+		mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).Times(1)
+
+		_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Unexpected error:", err)
+
+	})
+
+	ginkgo.It("[success] storageService already exists", func() {
+		fakeSubnet := &armnetwork.Subnet{
+			Properties: &armnetwork.SubnetPropertiesFormat{
+				ServiceEndpoints: []*armnetwork.ServiceEndpointPropertiesFormat{
+					{
+						Service: &storageService,
 					},
-					Name: pointer.String("subnetName"),
-				}
-
-				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()
-
-				_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
-				if !reflect.DeepEqual(err, nil) {
-					t.Errorf("Unexpected error: %v", err)
-				}
+				},
 			},
-		},
-		{
-			name: "[success] storageService already exists",
-			testFunc: func(t *testing.T) {
-				fakeSubnet := network.Subnet{
-					SubnetPropertiesFormat: &network.SubnetPropertiesFormat{
-						ServiceEndpoints: &[]network.ServiceEndpointPropertiesFormat{
-							{
-								Service: &storageService,
-							},
-						},
-					},
-					Name: pointer.String("subnetName"),
-				}
+			Name: ptr.To("subnetName"),
+		}
 
-				mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()
+		mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(fakeSubnet, nil).AnyTimes()
 
-				_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
-				if !reflect.DeepEqual(err, nil) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-		{
-			name: "[fail] SubnetsClient is nil",
-			testFunc: func(t *testing.T) {
-				d.cloud.SubnetsClient = nil
-				expectedErr := fmt.Errorf("SubnetsClient is nil")
-				_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "")
-				if !reflect.DeepEqual(err, expectedErr) {
-					t.Errorf("Unexpected error: %v", err)
-				}
-			},
-		},
-	}
+		_, err := d.updateSubnetServiceEndpoints(ctx, "", "", "subnetname")
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "Unexpected error:", err)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, tc.testFunc)
-	}
-}
+	})
+
+})
 
 func TestGetKubeConfig(t *testing.T) {
 	// skip for now as this is very flaky on Windows

@@ -22,12 +22,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/fileclient"
 )
 
 func TestCreateFileShare(t *testing.T) {
-
 	testCases := []struct {
 		name     string
 		testFunc func(t *testing.T)
@@ -35,11 +32,11 @@ func TestCreateFileShare(t *testing.T) {
 		{
 			name: "",
 			testFunc: func(t *testing.T) {
-				options := &fileclient.ShareOptions{
+				options := &ShareOptions{
 					Name:       "devstoreaccount1",
 					RequestGiB: 10,
 				}
-				f, err := newAzureFileClient("test", "dW5pdHRlc3Q=", "ut", nil)
+				f, err := newAzureFileClient("test", "dW5pdHRlc3Q=", "ut")
 				if err != nil {
 					t.Errorf("error creating azure client: %v", err)
 				}
@@ -57,11 +54,90 @@ func TestCreateFileShare(t *testing.T) {
 }
 
 func TestNewAzureFileClient(t *testing.T) {
-	_, actualErr := newAzureFileClient("ut", "ut", "ut", nil)
+	_, actualErr := newAzureFileClient("ut", "ut", "ut")
 	if actualErr != nil {
-		expectedErr := fmt.Errorf("error creating azure client: azure: account name is not valid: it must be between 3 and 24 characters, and only may contain numbers and lowercase letters: ut")
+		expectedErr := fmt.Errorf("error creating azure client: decode account key: illegal base64 data at input byte 0")
 		if !reflect.DeepEqual(actualErr, expectedErr) {
 			t.Errorf("actualErr: (%v), expectedErr: (%v)", actualErr, expectedErr)
 		}
+	}
+}
+
+func TestDeleteFileShare(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "expect error on delete",
+			testFunc: func(t *testing.T) {
+				f, err := newAzureFileClient("test", "dW5pdHRlc3Q=", "ut")
+				if err != nil {
+					t.Errorf("error creating azure client: %v", err)
+				}
+				shareName := "nonexistent"
+				actualErr := f.DeleteFileShare(context.Background(), shareName)
+				expectedErr := fmt.Errorf("Delete \"https://test.file.ut/%s?restype=share\"", shareName)
+				if actualErr == nil || !strings.HasPrefix(actualErr.Error(), expectedErr.Error()) {
+					t.Errorf("actualErr: (%v), expectedErr: (%v)", actualErr, expectedErr)
+				}
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestResizeFileShare(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "expect error on resize",
+			testFunc: func(t *testing.T) {
+				f, err := newAzureFileClient("test", "dW5pdHRlc3Q=", "ut")
+				if err != nil {
+					t.Errorf("error creating azure client: %v", err)
+				}
+				shareName := "nonexistent"
+				actualErr := f.ResizeFileShare(context.Background(), shareName, 20)
+				expectedErr := fmt.Errorf("failed to set quota on file share %s", shareName)
+				if actualErr == nil || !strings.HasPrefix(actualErr.Error(), expectedErr.Error()) {
+					t.Errorf("actualErr: (%v), expectedErr: (%v)", actualErr, expectedErr)
+				}
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
+	}
+}
+
+func TestGetFileShareQuotaDataPlane(t *testing.T) {
+	testCases := []struct {
+		name     string
+		testFunc func(t *testing.T)
+	}{
+		{
+			name: "expect error on resize",
+			testFunc: func(t *testing.T) {
+				f, err := newAzureFileClient("test", "dW5pdHRlc3Q=", "ut")
+				if err != nil {
+					t.Errorf("error creating azure client: %v", err)
+				}
+				shareName := "nonexistent"
+				actualQuota, actualErr := f.GetFileShareQuota(context.Background(), shareName)
+				expectedErr := fmt.Errorf("Get \"https://test.file.ut/%s?restype=share\"", shareName)
+				expectedQuota := -1
+				if actualErr == nil || !strings.HasPrefix(actualErr.Error(), expectedErr.Error()) || actualQuota != -1 {
+					t.Errorf("actualErr: (%v), expectedErr: (%v), actualQuota: (%v), expectedQuota: (%v)", actualErr, expectedErr, actualQuota, expectedQuota)
+				}
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.testFunc)
 	}
 }

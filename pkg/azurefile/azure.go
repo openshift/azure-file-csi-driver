@@ -26,17 +26,23 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2022-07-01/network"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/azurefile-csi-driver/pkg/filewatcher"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
-	"sigs.k8s.io/cloud-provider-azure/pkg/retry"
+	azureconfig "sigs.k8s.io/cloud-provider-azure/pkg/provider/config"
+	"sigs.k8s.io/cloud-provider-azure/pkg/provider/storage"
 )
 
 const (
@@ -49,35 +55,53 @@ var (
 	storageService = "Microsoft.Storage"
 )
 
+func getRuntimeClassForPod(ctx context.Context, kubeClient clientset.Interface, podName string, podNameSpace string) (string, error) {
+	if kubeClient == nil {
+		return "", fmt.Errorf("kubeClient is nil")
+	}
+	// Get runtime class for pod
+	pod, err := kubeClient.CoreV1().Pods(podNameSpace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return ptr.Deref(pod.Spec.RuntimeClassName, ""), nil
+}
+
 // getCloudProvider get Azure Cloud Provider
-func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secretNamespace, userAgent string, allowEmptyCloudConfig, enableWindowsHostProcess bool, kubeAPIQPS float64, kubeAPIBurst int) (*azure.Cloud, error) {
+func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secretNamespace, userAgent string, allowEmptyCloudConfig, enableWindowsHostProcess bool, kubeAPIQPS float64, kubeAPIBurst int) (*storage.AccountRepo, kubernetes.Interface, error) {
 	var (
-		config     *azure.Config
-		kubeClient *clientset.Clientset
+		config     *azureconfig.Config
+		kubeClient kubernetes.Interface
 		fromSecret bool
+		err        error
 	)
 
-	az := &azure.Cloud{}
+	repo := &storage.AccountRepo{}
 
-	kubeCfg, err := getKubeConfig(kubeconfig, enableWindowsHostProcess)
-	if err == nil && kubeCfg != nil {
-		klog.V(2).Infof("set QPS(%f) and QPS Burst(%d) for driver kubeClient", float32(kubeAPIQPS), kubeAPIBurst)
-		kubeCfg.QPS = float32(kubeAPIQPS)
-		kubeCfg.Burst = kubeAPIBurst
-		kubeClient, err = clientset.NewForConfig(kubeCfg)
-		if err != nil {
-			klog.Warningf("NewForConfig failed with error: %v", err)
-		}
+	// for sanity test: if kubeconfig is set as "no-need-kubeconfig", kubeClient will be nil
+	if kubeconfig == "no-need-kubeconfig" {
+		klog.V(2).Infof("kubeconfig is set as no-need-kubeconfig, kubeClient will be nil")
 	} else {
-		klog.Warningf("get kubeconfig(%s) failed with error: %v", kubeconfig, err)
-		if !os.IsNotExist(err) && !errors.Is(err, rest.ErrNotInCluster) {
-			return az, fmt.Errorf("failed to get KubeClient: %v", err)
+		kubeCfg, err := getKubeConfig(kubeconfig, enableWindowsHostProcess)
+		if err == nil && kubeCfg != nil {
+			klog.V(2).Infof("set QPS(%f) and QPS Burst(%d) for driver kubeClient", float32(kubeAPIQPS), kubeAPIBurst)
+			kubeCfg.QPS = float32(kubeAPIQPS)
+			kubeCfg.Burst = kubeAPIBurst
+			kubeClient, err = clientset.NewForConfig(kubeCfg)
+			if err != nil {
+				klog.Warningf("NewForConfig failed with error: %v", err)
+			}
+		} else {
+			klog.Warningf("get kubeconfig(%s) failed with error: %v", kubeconfig, err)
+			if !os.IsNotExist(err) && !errors.Is(err, rest.ErrNotInCluster) {
+				return nil, nil, fmt.Errorf("failed to get KubeClient: %v", err)
+			}
 		}
 	}
 
 	if kubeClient != nil {
 		klog.V(2).Infof("reading cloud config from secret %s/%s", secretNamespace, secretName)
-		config, err = configloader.Load[azure.Config](ctx, &configloader.K8sSecretLoaderConfig{
+		config, err = configloader.Load[azureconfig.Config](ctx, &configloader.K8sSecretLoaderConfig{
 			K8sSecretConfig: configloader.K8sSecretConfig{
 				SecretName:      secretName,
 				SecretNamespace: secretNamespace,
@@ -106,7 +130,7 @@ func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secre
 			}
 			klog.V(2).Infof("use default %s env var: %v", DefaultAzureCredentialFileEnv, credFile)
 		}
-		config, err = configloader.Load[azure.Config](ctx, nil, &configloader.FileLoaderConfig{
+		config, err = configloader.Load[azureconfig.Config](ctx, nil, &configloader.FileLoaderConfig{
 			FilePath: credFile,
 		})
 		if err != nil {
@@ -118,7 +142,7 @@ func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secre
 		if allowEmptyCloudConfig {
 			klog.V(2).Infof("no cloud config provided, error: %v, driver will run without cloud config", err)
 		} else {
-			return az, fmt.Errorf("no cloud config provided, error: %v", err)
+			return nil, nil, fmt.Errorf("no cloud config provided, error: %v", err)
 		}
 	} else {
 		config.UserAgent = userAgent
@@ -133,30 +157,37 @@ func getCloudProvider(ctx context.Context, kubeconfig, nodeID, secretName, secre
 			config.AADFederatedTokenFile = federatedTokenFile
 			config.UseFederatedWorkloadIdentityExtension = true
 		}
+		if len(config.AADClientCertPath) > 0 {
+			// Watch the certificate for changes; if the certificate changes, the pod will be restarted
+			err = filewatcher.WatchFileForChanges(config.AADClientCertPath)
+			klog.Warningf("Failed to watch certificate file for changes: %v", err)
+		}
+		az := &azure.Cloud{}
 		if err = az.InitializeCloudFromConfig(ctx, config, fromSecret, false); err != nil {
 			klog.Warningf("InitializeCloudFromConfig failed with error: %v", err)
 		}
-	}
+		_, env, err := azclient.GetAzureCloudConfigAndEnvConfig(&config.ARMClientConfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to get AzureCloudConfigAndEnvConfig: %v", err)
+		}
 
-	// reassign kubeClient
-	if kubeClient != nil && az.KubeClient == nil {
-		az.KubeClient = kubeClient
-	}
-
-	isController := (nodeID == "")
-	if isController {
-		if err == nil {
+		if nodeID == "" {
 			// Disable UseInstanceMetadata for controller to mitigate a timeout issue using IMDS
 			// https://github.com/kubernetes-sigs/azuredisk-csi-driver/issues/168
 			klog.V(2).Infof("disable UseInstanceMetadata for controller server")
-			az.Config.UseInstanceMetadata = false
+			config.UseInstanceMetadata = false
+			klog.V(2).Infof("starting controller server...")
+		} else {
+			klog.V(2).Infof("starting node server on node(%s)", nodeID)
 		}
-		klog.V(2).Infof("starting controller server...")
-	} else {
-		klog.V(2).Infof("starting node server on node(%s)", nodeID)
+
+		repo, err = storage.NewRepository(*config, env, az.ComputeClientFactory, az.NetworkClientFactory)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create storage repository: %v", err)
+		}
 	}
 
-	return az, nil
+	return repo, kubeClient, nil
 }
 
 func getKubeConfig(kubeconfig string, enableWindowsHostProcess bool) (config *rest.Config, err error) {
@@ -174,7 +205,7 @@ func getKubeConfig(kubeconfig string, enableWindowsHostProcess bool) (config *re
 
 func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceGroup, vnetName, subnetName string) ([]string, error) {
 	var vnetResourceIDs []string
-	if d.cloud.SubnetsClient == nil {
+	if d.cloud.NetworkClientFactory.GetSubnetClient() == nil {
 		return vnetResourceIDs, fmt.Errorf("SubnetsClient is nil")
 	}
 
@@ -196,7 +227,7 @@ func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceG
 	}
 
 	lockKey := vnetResourceGroup + vnetName + subnetName
-	cache, err := d.subnetCache.Get(lockKey, azcache.CacheReadTypeDefault)
+	cache, err := d.subnetCache.Get(ctx, lockKey, azcache.CacheReadTypeDefault)
 	if err != nil {
 		return nil, err
 	}
@@ -209,21 +240,21 @@ func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceG
 	d.subnetLockMap.LockEntry(lockKey)
 	defer d.subnetLockMap.UnlockEntry(lockKey)
 
-	var subnets []network.Subnet
+	var subnets []*armnetwork.Subnet
 	if subnetName != "" {
 		// list multiple subnets separated by comma
 		subnetNames := strings.Split(subnetName, ",")
 		for _, sn := range subnetNames {
 			sn = strings.TrimSpace(sn)
-			subnet, rerr := d.cloud.SubnetsClient.Get(ctx, vnetResourceGroup, vnetName, sn, "")
+			subnet, rerr := d.cloud.NetworkClientFactory.GetSubnetClient().Get(ctx, vnetResourceGroup, vnetName, sn, nil)
 			if rerr != nil {
 				return vnetResourceIDs, fmt.Errorf("failed to get the subnet %s under rg %s vnet %s: %v", subnetName, vnetResourceGroup, vnetName, rerr.Error())
 			}
 			subnets = append(subnets, subnet)
 		}
 	} else {
-		var rerr *retry.Error
-		subnets, rerr = d.cloud.SubnetsClient.List(ctx, vnetResourceGroup, vnetName)
+		var rerr error
+		subnets, rerr = d.cloud.NetworkClientFactory.GetSubnetClient().List(ctx, vnetResourceGroup, vnetName)
 		if rerr != nil {
 			return vnetResourceIDs, fmt.Errorf("failed to list the subnets under rg %s vnet %s: %v", vnetResourceGroup, vnetName, rerr.Error())
 		}
@@ -238,21 +269,21 @@ func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceG
 		klog.V(2).Infof("set vnetResourceID %s", vnetResourceID)
 		vnetResourceIDs = append(vnetResourceIDs, vnetResourceID)
 
-		endpointLocaions := []string{location}
-		storageServiceEndpoint := network.ServiceEndpointPropertiesFormat{
+		endpointLocaions := []*string{to.Ptr(location)}
+		storageServiceEndpoint := &armnetwork.ServiceEndpointPropertiesFormat{
 			Service:   &storageService,
-			Locations: &endpointLocaions,
+			Locations: endpointLocaions,
 		}
 		storageServiceExists := false
-		if subnet.SubnetPropertiesFormat == nil {
-			subnet.SubnetPropertiesFormat = &network.SubnetPropertiesFormat{}
+		if subnet.Properties == nil {
+			subnet.Properties = &armnetwork.SubnetPropertiesFormat{}
 		}
-		if subnet.SubnetPropertiesFormat.ServiceEndpoints == nil {
-			subnet.SubnetPropertiesFormat.ServiceEndpoints = &[]network.ServiceEndpointPropertiesFormat{}
+		if subnet.Properties.ServiceEndpoints == nil {
+			subnet.Properties.ServiceEndpoints = []*armnetwork.ServiceEndpointPropertiesFormat{}
 		}
-		serviceEndpoints := *subnet.SubnetPropertiesFormat.ServiceEndpoints
+		serviceEndpoints := subnet.Properties.ServiceEndpoints
 		for _, v := range serviceEndpoints {
-			if strings.HasPrefix(pointer.StringDeref(v.Service, ""), storageService) {
+			if strings.HasPrefix(ptr.Deref(v.Service, ""), storageService) {
 				storageServiceExists = true
 				klog.V(4).Infof("serviceEndpoint(%s) is already in subnet(%s)", storageService, sn)
 				break
@@ -261,10 +292,10 @@ func (d *Driver) updateSubnetServiceEndpoints(ctx context.Context, vnetResourceG
 
 		if !storageServiceExists {
 			serviceEndpoints = append(serviceEndpoints, storageServiceEndpoint)
-			subnet.SubnetPropertiesFormat.ServiceEndpoints = &serviceEndpoints
+			subnet.Properties.ServiceEndpoints = serviceEndpoints
 
 			klog.V(2).Infof("begin to update the subnet %s under vnet %s in rg %s", sn, vnetName, vnetResourceGroup)
-			if err := d.cloud.SubnetsClient.CreateOrUpdate(ctx, vnetResourceGroup, vnetName, sn, subnet); err != nil {
+			if _, err := d.cloud.NetworkClientFactory.GetSubnetClient().CreateOrUpdate(ctx, vnetResourceGroup, vnetName, sn, *subnet); err != nil {
 				return vnetResourceIDs, fmt.Errorf("failed to update the subnet %s under vnet %s: %v", sn, vnetName, err)
 			}
 		}

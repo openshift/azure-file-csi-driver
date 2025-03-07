@@ -12,11 +12,13 @@
    - `--set node.cloudConfigSecretName`
    - `--set node.cloudConfigSecretNamesapce`
  - switch to `mcr.azk8s.cn` repository in Azure China: `--set image.baseRepo=mcr.azk8s.cn`
+ - Microk8s based kubernetes recommended settings:
+   - `--set linux.kubelet="/var/snap/microk8s/common/var/lib/kubelet"` - sets correct path to microk8s kubelet even though a user has a folder link to it.
 
 ### install a specific version
 ```console
 helm repo add azurefile-csi-driver https://raw.githubusercontent.com/kubernetes-sigs/azurefile-csi-driver/master/charts
-helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version v1.29.2
+helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --version 1.31.2
 ```
 
 ### install on RedHat/CentOS
@@ -25,7 +27,6 @@ helm install azurefile-csi-driver azurefile-csi-driver/azurefile-csi-driver --na
 ```
 
 ### install driver with customized driver name, deployment name
-> only supported from `v1.5.0`+
  - following example would install a driver with name `file2`
 ```console
 helm install azurefile2-csi-driver azurefile-csi-driver/azurefile-csi-driver --namespace kube-system --set driver.name="file2.csi.azure.com" --set controller.name="csi-azurefile2-controller" --set rbac.name=azurefile2 --set serviceAccount.controller=csi-azurefile2-controller-sa --set serviceAccount.node=csi-azurefile2-node-sa --set linux.dsName=csi-azurefile2-node --set windows.dsName=csi-azurefile2-node-win --set node.livenessProbe.healthPort=39613
@@ -56,20 +57,20 @@ The following table lists the configurable parameters of the latest Azure File C
 | `feature.enableVolumeMountGroup`                  | indicates whether enabling VOLUME_MOUNT_GROUP                       | `true`                      |
 | `feature.fsGroupPolicy`                           | CSIDriver FSGroupPolicy value                  | `ReadWriteOnceWithFSType`(available values: `ReadWriteOnceWithFSType`, `File`, `None`) |
 | `image.baseRepo`                                  | base repository of driver images                           | `mcr.microsoft.com`                      |
-| `image.azurefile.repository`                      | azurefile-csi-driver docker image                          | `/oss/kubernetes-csi/azurefile-csi`                            |
-| `image.azurefile.tag`                             | azurefile-csi-driver docker image tag                      | ``                                                            |
+| `image.azurefile.repository`                      | azurefile-csi-driver container image                          | `/oss/kubernetes-csi/azurefile-csi`                            |
+| `image.azurefile.tag`                             | azurefile-csi-driver container image tag                      | ``                                                            |
 | `image.azurefile.pullPolicy`                      | azurefile-csi-driver image pull policy                     | `IfNotPresent`                                                      |
-| `image.csiProvisioner.repository`                 | csi-provisioner docker image                               | `/oss/kubernetes-csi/csi-provisioner`              |
-| `image.csiProvisioner.tag`                        | csi-provisioner docker image tag                           | `v5.0.1`                                                            |
+| `image.csiProvisioner.repository`                 | csi-provisioner container image                               | `/oss/kubernetes-csi/csi-provisioner`              |
+| `image.csiProvisioner.tag`                        | csi-provisioner container image tag                           | `v5.2.0`                                                            |
 | `image.csiProvisioner.pullPolicy`                 | csi-provisioner image pull policy                          | `IfNotPresent`                                                      |
-| `image.csiResizer.repository`                     | csi-resizer docker image                                   | `/oss/kubernetes-csi/csi-resizer`                  |
-| `image.csiResizer.tag`                            | csi-resizer docker image tag                               | `v1.11.1`                                                            |
+| `image.csiResizer.repository`                     | csi-resizer container image                                   | `/oss/kubernetes-csi/csi-resizer`                  |
+| `image.csiResizer.tag`                            | csi-resizer container image tag                               | `v1.13.1`                                                            |
 | `image.csiResizer.pullPolicy`                     | csi-resizer image pull policy                              | `IfNotPresent`                                                      |
-| `image.livenessProbe.repository`                  | liveness-probe docker image                                | `/oss/kubernetes-csi/livenessprobe`                |
-| `image.livenessProbe.tag`                         | liveness-probe docker image tag                            | `v2.13.0`                                                            |
+| `image.livenessProbe.repository`                  | liveness-probe container image                                | `/oss/kubernetes-csi/livenessprobe`                |
+| `image.livenessProbe.tag`                         | liveness-probe container image tag                            | `v2.15.0`                                                            |
 | `image.livenessProbe.pullPolicy`                  | liveness-probe image pull policy                           | `IfNotPresent`                                                      |
-| `image.nodeDriverRegistrar.repository`            | csi-node-driver-registrar docker image                     | `/oss/kubernetes-csi/csi-node-driver-registrar`    |
-| `image.nodeDriverRegistrar.tag`                   | csi-node-driver-registrar docker image tag                 | `v2.11.0`                                                            |
+| `image.nodeDriverRegistrar.repository`            | csi-node-driver-registrar container image                     | `/oss/kubernetes-csi/csi-node-driver-registrar`    |
+| `image.nodeDriverRegistrar.tag`                   | csi-node-driver-registrar container image tag                 | `v2.13.0`                                                            |
 | `image.nodeDriverRegistrar.pullPolicy`            | csi-node-driver-registrar image pull policy                | `IfNotPresent`                                                      |
 | `imagePullSecrets`                                | Specify docker-registry secret names as an array           | [] (does not add image pull secrets to deployed pods)             |
 | `customLabels`                                    | Custom labels to add into metadata                         | `{}`                                                                |
@@ -104,13 +105,13 @@ The following table lists the configurable parameters of the latest Azure File C
 | `controller.resources.csiResizer.limits.memory`       | csi-resizer memory limits                         | 500Mi                                                          |
 | `controller.resources.csiResizer.requests.cpu`        | csi-resizer cpu requests                   | 10m                                                            |
 | `controller.resources.csiResizer.requests.memory`     | csi-resizer memory requests                | 20Mi                                                           |
-| `controller.resources.csiSnapshotter.limits.memory`   | csi-snapshotter memory limits                         | 500Mi                                                          |
+| `controller.resources.csiSnapshotter.limits.memory`   | csi-snapshotter memory limits                         | 400Mi                                                          |
 | `controller.resources.csiSnapshotter.requests.cpu`    | csi-snapshotter cpu requests                   | 10m                                                            |
 | `controller.resources.csiSnapshotter.requests.memory` | csi-snapshotter memory requests                | 20Mi                                                           |
 | `controller.resources.livenessProbe.limits.memory`    | liveness-probe memory limits                          | 100Mi                                                          |
 | `controller.resources.livenessProbe.requests.cpu`     | liveness-probe cpu requests                    | 10m                                                            |
 | `controller.resources.livenessProbe.requests.memory`  | liveness-probe memory requests                 | 20Mi                                                           |
-| `controller.resources.azurefile.limits.memory`        | azurefile memory limits                         | 200Mi                                                          |
+| `controller.resources.azurefile.limits.memory`        | azurefile memory limits                         | 800Mi                                                          |
 | `controller.resources.azurefile.requests.cpu`         | azurefile cpu requests                   | 10m                                                            |
 | `controller.resources.azurefile.requests.memory`      | azurefile memory requests                | 20Mi                                                           |
 | `controller.kubeconfig`                               | configure kubeconfig path on controller node                | '' (empty, use InClusterConfig by default)
@@ -125,11 +126,11 @@ The following table lists the configurable parameters of the latest Azure File C
 | `node.livenessProbe.healthPort `                  | health check port for liveness probe                   | `29613` |
 | `node.logLevel`                                   | node driver log level                                                          |`5`                                                           |
 | `snapshot.enabled`                                | whether enable snapshot feature                            | `false`                                                        |
-| `snapshot.image.csiSnapshotter.repository`        | csi-snapshotter docker image                               | `/oss/kubernetes-csi/csi-snapshotter`         |
-| `snapshot.image.csiSnapshotter.tag`               | csi-snapshotter docker image tag                           | `v8.0.1`                                                       |
+| `snapshot.image.csiSnapshotter.repository`        | csi-snapshotter container image                               | `/oss/kubernetes-csi/csi-snapshotter`         |
+| `snapshot.image.csiSnapshotter.tag`               | csi-snapshotter container image tag                           | `v8.2.0`                                                       |
 | `snapshot.image.csiSnapshotter.pullPolicy`        | csi-snapshotter image pull policy                          | `IfNotPresent`                                                 |
-| `snapshot.image.csiSnapshotController.repository` | snapshot-controller docker image                           | `/oss/kubernetes-csi/snapshot-controller`     |
-| `snapshot.image.csiSnapshotController.tag`        | snapshot-controller docker image tag                       | `v8.0.1`                                                       |
+| `snapshot.image.csiSnapshotController.repository` | snapshot-controller container image                           | `/oss/kubernetes-csi/snapshot-controller`     |
+| `snapshot.image.csiSnapshotController.tag`        | snapshot-controller container image tag                       | `v8.2.0`                                                       |
 | `snapshot.image.csiSnapshotController.pullPolicy` | snapshot-controller image pull policy                      | `IfNotPresent`                                                 |
 | `snapshot.snapshotController.name`                | snapshot controller name                                   | `csi-snapshot-controller`                                                           |
 | `snapshot.snapshotController.replicas`            | the replicas of snapshot-controller                        | `2`                                                          |
@@ -137,7 +138,7 @@ The following table lists the configurable parameters of the latest Azure File C
 | `snapshot.snapshotController.annotations`                          | snapshot controller deployment extra annotations               | `{}`
 | `snapshot.snapshotController.podLabels`                            | snapshot controller pods extra labels                          | `{}`
 | `snapshot.snapshotController.podAnnotations`                       | snapshot controller pods extra annotations                     | `{}`
-| `snapshot.snapshotController.resources.limits.memory`          | csi-snapshot-controller memory limits                          | 100Mi                                                          |
+| `snapshot.snapshotController.resources.limits.memory`          | csi-snapshot-controller memory limits                          | 500Mi                                                          |
 | `snapshot.snapshotController.resources.requests.cpu`           | csi-snapshot-controller cpu requests                    | 10m                                                            |
 | `snapshot.snapshotController.resources.requests.memory`        | csi-snapshot-controller memory requests                 | 20Mi                                                           |
 | `linux.enabled`                                   | whether enable linux feature                               | `true`                                                              |
@@ -166,7 +167,7 @@ The following table lists the configurable parameters of the latest Azure File C
 | `linux.resources.azurefile.requests.memory`            | azurefile memory requests                | 20Mi                                                           |
 | `windows.enabled`                                 | whether enable windows feature                             | `true`                                                             |
 | `windows.dsName`                                  | name of driver daemonset on windows                             |`csi-azurefile-node-win`                                                         |
-| `windows.useHostProcessContainers`                | whether deploy driver daemonset with HostProcess containers on windows | `false`                                                             |
+| `windows.useHostProcessContainers`                | whether deploy driver daemonset with HostProcess containers on windows | `true`                                                             |
 | `windows.kubelet`                                 | configure kubelet directory path on Windows agent node                | `'C:\var\lib\kubelet'`                                            |
 | `windows.kubeconfig`                              | configure kubeconfig path on Windows agent node                | `` (empty, use InClusterConfig by default)                                            |
 | `windows.enableRegistrationProbe`                 | enable [kubelet-registration-probe](https://github.com/kubernetes-csi/node-driver-registrar#health-check-with-an-exec-probe) on windows driver config     | `true`
@@ -183,7 +184,7 @@ The following table lists the configurable parameters of the latest Azure File C
 | `windows.resources.nodeDriverRegistrar.limits.memory`    | csi-node-driver-registrar memory limits               | 150Mi                                                          |
 | `windows.resources.nodeDriverRegistrar.requests.cpu`     | csi-node-driver-registrar cpu requests         | 10m                                                            |
 | `windows.resources.nodeDriverRegistrar.requests.memory`  | csi-node-driver-registrar memory requests      | 40Mi                                                           |
-| `windows.resources.azurefile.limits.memory`              | azurefile memory limits                         | 200Mi                                                         |
+| `windows.resources.azurefile.limits.memory`              | azurefile memory limits                         | 600Mi                                                         |
 | `windows.resources.azurefile.requests.cpu`               | azurefile cpu requests                   | 10m                                                            |
 | `windows.resources.azurefile.requests.memory`            | azurefile memory requests                | 40Mi                                                           |
 | `workloadIdentity.clientID` | client ID of workload identity | ''

@@ -19,6 +19,7 @@ package util
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +117,39 @@ func TestGetAzcopyJob(t *testing.T) {
 			expectedErr:      nil,
 		},
 		{
+			desc:             "run exec parse azcopy job CompletedWithErrors",
+			listStr:          "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithErrors\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			listErr:          nil,
+			enableShow:       false,
+			showStr:          "",
+			showErr:          nil,
+			expectedJobState: AzcopyJobCompletedWithErrors,
+			expectedPercent:  "100.0",
+			expectedErr:      nil,
+		},
+		{
+			desc:             "run exec parse azcopy job CompletedWithSkipped",
+			listStr:          "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithSkipped\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			listErr:          nil,
+			enableShow:       false,
+			showStr:          "",
+			showErr:          nil,
+			expectedJobState: AzcopyJobCompletedWithSkipped,
+			expectedPercent:  "100.0",
+			expectedErr:      nil,
+		},
+		{
+			desc:             "run exec parse azcopy job CompletedWithErrorsAndSkipped",
+			listStr:          "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithErrorsAndSkipped\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			listErr:          nil,
+			enableShow:       false,
+			showStr:          "",
+			showErr:          nil,
+			expectedJobState: AzcopyJobCompletedWithErrorsAndSkipped,
+			expectedPercent:  "100.0",
+			expectedErr:      nil,
+		},
+		{
 			desc:             "run exec get error in azcopy jobs show",
 			listStr:          "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: InProgress\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
 			listErr:          nil,
@@ -161,11 +195,45 @@ func TestGetAzcopyJob(t *testing.T) {
 			m.EXPECT().RunCommand(gomock.Not("azcopy jobs list | grep dstFileshare -B 3"), []string{}).Return(test.showStr, test.showErr)
 		}
 
-		azcopyFunc := &Azcopy{}
-		azcopyFunc.ExecCmd = m
+		azcopyFunc := &Azcopy{ExecCmd: m}
 		jobState, percent, err := azcopyFunc.GetAzcopyJob(dstFileshare, []string{})
 		if jobState != test.expectedJobState || percent != test.expectedPercent || !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("test[%s]: unexpected jobState: %v, percent: %v, err: %v, expected jobState: %v, percent: %v, err: %v", test.desc, jobState, percent, err, test.expectedJobState, test.expectedPercent, test.expectedErr)
+		}
+	}
+}
+
+func TestCleanJobs(t *testing.T) {
+	tests := []struct {
+		desc        string
+		execStr     string
+		execErr     error
+		expectedErr error
+	}{
+		{
+			desc:        "run exec get error",
+			execStr:     "",
+			execErr:     fmt.Errorf("error"),
+			expectedErr: fmt.Errorf("error"),
+		},
+		{
+			desc:        "run exec succeed",
+			execStr:     "cleaned",
+			execErr:     nil,
+			expectedErr: nil,
+		},
+	}
+	for _, test := range tests {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		m := NewMockEXEC(ctrl)
+		m.EXPECT().RunCommand(gomock.Eq("azcopy jobs clean"), nil).Return(test.execStr, test.execErr)
+
+		azcopyFunc := &Azcopy{ExecCmd: m}
+		_, err := azcopyFunc.CleanJobs()
+		if !reflect.DeepEqual(err, test.expectedErr) {
+			t.Errorf("test[%s]: unexpected err: %v, expected err: %v", test.desc, err, test.expectedErr)
 		}
 	}
 }
@@ -211,6 +279,27 @@ func TestParseAzcopyJobList(t *testing.T) {
 			str:              "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: Completed\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
 			expectedJobid:    "",
 			expectedJobState: AzcopyJobCompleted,
+			expectedErr:      nil,
+		},
+		{
+			desc:             "parse azcopy job CompletedWithErrors",
+			str:              "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithErrors\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			expectedJobid:    "",
+			expectedJobState: AzcopyJobCompletedWithErrors,
+			expectedErr:      nil,
+		},
+		{
+			desc:             "parse azcopy job CompletedWithSkipped",
+			str:              "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithSkipped\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			expectedJobid:    "",
+			expectedJobState: AzcopyJobCompletedWithSkipped,
+			expectedErr:      nil,
+		},
+		{
+			desc:             "parse azcopy job CompletedWithErrorsAndSkipped",
+			str:              "JobId: ed1c3833-eaff-fe42-71d7-513fb065a9d9\nStart Time: Monday, 07-Aug-23 03:29:54 UTC\nStatus: CompletedWithErrorsAndSkipped\nCommand: copy https://{accountName}.file.core.windows.net/{srcFileshare}{SAStoken} https://{accountName}.file.core.windows.net/{dstFileshare}{SAStoken} --recursive --check-length=false",
+			expectedJobid:    "",
+			expectedJobState: AzcopyJobCompletedWithErrorsAndSkipped,
 			expectedErr:      nil,
 		},
 		{
@@ -311,5 +400,26 @@ func TestWaitUntilTimeout(t *testing.T) {
 		if err != nil && (err.Error() != test.expectedErr.Error()) {
 			t.Errorf("unexpected error: %v, expected error: %v", err, test.expectedErr)
 		}
+	}
+}
+
+func TestGenerateVolumeName(t *testing.T) {
+	// Normal operation, no truncate
+	v1 := GenerateVolumeName("kubernetes", "pv-cinder-abcde", 255)
+	if v1 != "kubernetes-dynamic-pv-cinder-abcde" {
+		t.Errorf("Expected kubernetes-dynamic-pv-cinder-abcde, got %s", v1)
+	}
+	// Truncate trailing "6789-dynamic"
+	prefix := strings.Repeat("0123456789", 9) // 90 characters prefix + 8 chars. of "-dynamic"
+	v2 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
+	expect := prefix[:84] + "-pv-cinder-abcde"
+	if v2 != expect {
+		t.Errorf("Expected %s, got %s", expect, v2)
+	}
+	// Truncate really long cluster name
+	prefix = strings.Repeat("0123456789", 1000) // 10000 characters prefix
+	v3 := GenerateVolumeName(prefix, "pv-cinder-abcde", 100)
+	if v3 != expect {
+		t.Errorf("Expected %s, got %s", expect, v3)
 	}
 }

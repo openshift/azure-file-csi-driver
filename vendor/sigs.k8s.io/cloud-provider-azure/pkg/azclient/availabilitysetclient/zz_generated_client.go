@@ -24,11 +24,13 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/tracing"
-	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v5"
+	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/metrics"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/utils"
 )
+
+const AzureStackCloudAPIVersion = "2019-07-01"
 
 type Client struct {
 	*armcompute.AvailabilitySetsClient
@@ -56,13 +58,13 @@ func New(subscriptionID string, credential azcore.TokenCredential, options *arm.
 const GetOperationName = "AvailabilitySetsClient.Get"
 
 // Get gets the AvailabilitySet
-func (client *Client) Get(ctx context.Context, resourceGroupName string, resourceName string) (result *armcompute.AvailabilitySet, err error) {
+func (client *Client) Get(ctx context.Context, resourceGroupName string, availabilitysetName string) (result *armcompute.AvailabilitySet, err error) {
 
 	metricsCtx := metrics.BeginARMRequest(client.subscriptionID, resourceGroupName, "AvailabilitySet", "get")
-	defer metricsCtx.Observe(ctx, err)
+	defer func() { metricsCtx.Observe(ctx, err) }()
 	ctx, endSpan := runtime.StartSpan(ctx, GetOperationName, client.tracer, nil)
 	defer endSpan(err)
-	resp, err := client.AvailabilitySetsClient.Get(ctx, resourceGroupName, resourceName, nil)
+	resp, err := client.AvailabilitySetsClient.Get(ctx, resourceGroupName, availabilitysetName, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +77,7 @@ const ListOperationName = "AvailabilitySetsClient.List"
 // List gets a list of AvailabilitySet in the resource group.
 func (client *Client) List(ctx context.Context, resourceGroupName string) (result []*armcompute.AvailabilitySet, err error) {
 	metricsCtx := metrics.BeginARMRequest(client.subscriptionID, resourceGroupName, "AvailabilitySet", "list")
-	defer metricsCtx.Observe(ctx, err)
+	defer func() { metricsCtx.Observe(ctx, err) }()
 	ctx, endSpan := runtime.StartSpan(ctx, ListOperationName, client.tracer, nil)
 	defer endSpan(err)
 	pager := client.AvailabilitySetsClient.NewListPager(resourceGroupName, nil)
