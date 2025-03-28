@@ -135,7 +135,11 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --probe-timeout=3s
+{{- if eq .Values.controller.hostNetwork true }}
+            - --http-endpoint=localhost:{{ .Values.controller.livenessProbe.healthPort }}
+{{- else }}
             - --health-port={{ .Values.controller.livenessProbe.healthPort }}
+{{- end }}
             - --v=2
           imagePullPolicy: {{ .Values.image.livenessProbe.pullPolicy }}
           volumeMounts:
@@ -160,17 +164,24 @@ spec:
             - "--user-agent-suffix={{ .Values.driver.userAgentSuffix }}"
             - "--allow-empty-cloud-config={{ .Values.controller.allowEmptyCloudConfig }}"
           ports:
-            - containerPort: {{ .Values.controller.livenessProbe.healthPort }}
-              name: healthz
-              protocol: TCP
             - containerPort: {{ .Values.controller.metricsPort }}
               name: metrics
               protocol: TCP
+{{- if ne .Values.controller.hostNetwork true }}
+            - containerPort: {{ .Values.controller.livenessProbe.healthPort }}
+              name: healthz
+              protocol: TCP
+{{- end }}
           livenessProbe:
             failureThreshold: 5
             httpGet:
               path: /healthz
+{{- if eq .Values.controller.hostNetwork true }}
+              host: localhost
+              port: {{ .Values.controller.livenessProbe.healthPort }}
+{{- else }}
               port: healthz
+{{- end }}
             initialDelaySeconds: 30
             timeoutSeconds: 10
             periodSeconds: 30
@@ -197,6 +208,8 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+            - mountPath: /root/.azcopy
+              name: azcopy-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
             {{- if eq .Values.linux.distro "fedora" }}
@@ -210,6 +223,8 @@ spec:
           resources: {{- toYaml .Values.controller.resources.azurefile | nindent 12 }}
       volumes:
         - name: socket-dir
+          emptyDir: {}
+        - name: azcopy-dir
           emptyDir: {}
         - name: azure-cred
           hostPath:

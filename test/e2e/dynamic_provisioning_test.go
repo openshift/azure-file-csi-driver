@@ -50,7 +50,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		testDriver  driver.PVTestDriver
 	)
 
-	ginkgo.BeforeEach(func(ctx ginkgo.SpecContext) {
+	ginkgo.BeforeEach(func(_ ginkgo.SpecContext) {
 		checkPodsRestart := testCmd{
 			command:  "bash",
 			args:     []string{"test/utils/check_driver_pods_restart.sh"},
@@ -1439,10 +1439,11 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			CSIDriver: testDriver,
 			Pods:      pods,
 			StorageClassParameters: map[string]string{
-				"skuName":          "Premium_LRS",
-				"protocol":         "nfs",
-				"rootSquashType":   "RootSquash",
-				"mountPermissions": "0755",
+				"skuName":              "Premium_LRS",
+				"protocol":             "nfs",
+				"rootSquashType":       "RootSquash",
+				"mountPermissions":     "0755",
+				"allowSharedKeyAccess": "false",
 			},
 		}
 		test.Run(ctx, cs, ns)

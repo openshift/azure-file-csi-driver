@@ -1,7 +1,9 @@
 # workload identity support on static provisioning
- - supported from v1.29.3
+ - supported from v1.30.1 (from AKS 1.29 with `tokenRequests` field support in `CSIDriver`)
 
-This feature is specifically designed for smb mount and is not available for NFS mount as NFS mount does not require credentials. There is a standalone smb mount for every pod, it may cause performance issues when multiple pods are present on a single node.
+### Limitations
+ - This feature is not supported for NFS mount since NFS mount does not need credentials.
+ - This feature would still retrieve storage account key using federated identity credentials and mount Azure File share using key-based authentication.
 
 ## Prerequisites
 ### 1. Create a cluster with oidc-issuer enabled and get the credential
@@ -85,9 +87,8 @@ spec:
     - nosharesock
   csi:
     driver: file.csi.azure.com
-    # make sure volumeid is unique for every identical share in the cluster
-    # the # character is reserved for internal use
-    volumeHandle: unique_volume_id
+    # make sure volumeHandle is unique for every identical share in the cluster
+    volumeHandle: "{resource-group-name}#{account-name}#{file-share-name}"
     volumeAttributes:
       storageaccount: $ACCOUNT # required
       shareName: $SHARE  # required
@@ -96,48 +97,59 @@ spec:
       # tenantID: $IDENTITY_TENANT  #optional, only specified when workload identity and AKS cluster are in different tenant
       # subscriptionid: $SUBSCRIPTION #optional, only specified when workload identity and AKS cluster are in different subscription
 ---
-apiVersion: apps/v1
-kind: StatefulSet
+kind: PersistentVolumeClaim
+apiVersion: v1
 metadata:
-  name: statefulset-azurefile
+  name: pvc-azurefile
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  volumeName: pv-azurefile
+  storageClassName: azurefile-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   labels:
     app: nginx
+  name: deployment-azurefile
 spec:
-  podManagementPolicy: Parallel 
-  serviceName: statefulset-azurefile
   replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
   template:
     metadata:
       labels:
         app: nginx
+      name: deployment-azurefile
     spec:
-      serviceAccountName: $SERVICE_ACCOUNT_NAME  #required, Pod does not use this service account has no permission to mount the volume
+      serviceAccountName: $SERVICE_ACCOUNT_NAME  #required, Pod has no permission to mount the volume without this field
       nodeSelector:
         "kubernetes.io/os": linux
       containers:
-        - name: statefulset-azurefile
-          image: mcr.microsoft.com/oss/nginx/nginx:1.19.5
+        - name: deployment-azurefile
+          image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
           command:
             - "/bin/bash"
             - "-c"
             - set -euo pipefail; while true; do echo $(date) >> /mnt/azurefile/outfile; sleep 1; done
           volumeMounts:
-            - name: persistent-storage
-              mountPath: /mnt/azurefile
-  updateStrategy:
+            - name: azurefile
+              mountPath: "/mnt/azurefile"
+              readOnly: false
+      volumes:
+        - name: azurefile
+          persistentVolumeClaim:
+            claimName: pvc-azurefile
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
     type: RollingUpdate
-  selector:
-    matchLabels:
-      app: nginx
-  volumeClaimTemplates:
-    - metadata:
-        name: persistent-storage
-      spec:
-        storageClassName: azurefile-csi
-        accessModes: ["ReadWriteMany"]
-        resources:
-          requests:
-            storage: 10Gi
 EOF
 ```
 
@@ -153,7 +165,7 @@ spec:
   nodeSelector:
     "kubernetes.io/os": linux
   containers:
-    - image: mcr.microsoft.com/oss/nginx/nginx:1.19.5
+    - image: mcr.microsoft.com/mirror/docker/library/nginx:1.23
       name: nginx-azurefile
       command:
         - "/bin/bash"

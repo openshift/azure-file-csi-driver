@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 
 	"sigs.k8s.io/azurefile-csi-driver/pkg/azurefile"
@@ -44,6 +45,11 @@ var (
 	driverOptions  azurefile.DriverOptions
 )
 
+// exit is a separate function to handle program termination
+var exit = func(code int) {
+	os.Exit(code)
+}
+
 func main() {
 	flag.Parse()
 	if *version {
@@ -52,15 +58,17 @@ func main() {
 			klog.Fatalln(err)
 		}
 		fmt.Println(info) // nolint
-		os.Exit(0)
+	} else {
+		exportMetrics()
+		handle()
 	}
-
-	exportMetrics()
-	handle()
-	os.Exit(0)
+	exit(0)
 }
 
 func handle() {
+	runtime.GOMAXPROCS(driverOptions.GoMaxProcs)
+	klog.Infof("Sys info: NumCPU: %v MAXPROC: %v", runtime.NumCPU(), runtime.GOMAXPROCS(0))
+
 	driver := azurefile.NewDriver(&driverOptions)
 	if driver == nil {
 		klog.Fatalln("Failed to initialize azurefile CSI Driver")

@@ -117,7 +117,7 @@ func (t *DynamicallyProvisionedResizeVolumeTest) Run(ctx context.Context, client
 
 		creds, err := credentials.CreateAzureCredentialFile(false)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret)
+		azureClient, err := azure.GetAzureClient(creds.Cloud, creds.SubscriptionID, creds.AADClientID, creds.TenantID, creds.AADClientSecret, creds.AADFederatedTokenFile)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 		var resourceGroup string
@@ -139,7 +139,7 @@ func (t *DynamicallyProvisionedResizeVolumeTest) Run(ctx context.Context, client
 		//get file information
 		fileshareClient, err := azureClient.GetAzureFilesClient()
 		framework.ExpectNoError(err, fmt.Sprintf("Error getting client for azurefile %v", err))
-		share, err := fileshareClient.Get(ctx, resourceGroup, accountName, shareName)
+		share, err := fileshareClient.Get(ctx, resourceGroup, accountName, shareName, nil)
 		framework.ExpectNoError(err, fmt.Sprintf("Error getting file for azurefile %v", err))
 		newfileSize := strconv.Itoa(int(*share.FileShareProperties.ShareQuota)) + "Gi"
 		if !(newSize.String() == newfileSize) {
