@@ -361,3 +361,7 @@ func getBackOff(config azureconfig.Config) wait.Backoff {
 		Duration: time.Duration(config.CloudProviderBackoffDuration) * time.Second,
 	}
 }
+
+func isValidSubscriptionID(subsID string) bool {
+	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(subsID)
+}
