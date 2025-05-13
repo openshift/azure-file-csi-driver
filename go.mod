@@ -5,7 +5,7 @@ go 1.23.2
 godebug winsymlink=0
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.0
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.1
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6 v6.3.0
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6 v6.2.0
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources v1.2.0
@@ -20,12 +20,12 @@ require (
 	github.com/kubernetes-csi/csi-lib-utils v0.14.1
 	github.com/kubernetes-csi/csi-proxy/client v1.0.1
 	github.com/kubernetes-csi/external-snapshotter/client/v4 v4.2.0
-	github.com/onsi/ginkgo/v2 v2.23.0
-	github.com/onsi/gomega v1.36.2
+	github.com/onsi/ginkgo/v2 v2.23.3
+	github.com/onsi/gomega v1.36.3
 	github.com/rubiojr/go-vhd v0.0.0-20200706105327-02e210299021
 	github.com/stretchr/testify v1.10.0
-	go.uber.org/mock v0.5.0
-	golang.org/x/net v0.37.0
+	go.uber.org/mock v0.5.2
+	golang.org/x/net v0.38.0
 	golang.org/x/sys v0.31.0
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.5
@@ -40,7 +40,7 @@ require (
 	k8s.io/pod-security-admission v0.32.1
 	k8s.io/utils v0.0.0-20241210054802-24370beab758
 	sigs.k8s.io/cloud-provider-azure v1.29.1-0.20250306141916-e6840d43979a
-	sigs.k8s.io/cloud-provider-azure/pkg/azclient v0.5.9
+	sigs.k8s.io/cloud-provider-azure/pkg/azclient v0.8.1
 	sigs.k8s.io/cloud-provider-azure/pkg/azclient/configloader v0.4.0
 	sigs.k8s.io/yaml v1.4.0
 )
@@ -57,7 +57,7 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns v1.3.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets v1.3.1 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/internal v1.1.1 // indirect
-	github.com/Azure/msi-dataplane v0.4.2 // indirect
+	github.com/Azure/msi-dataplane v0.4.3 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1 // indirect
 	github.com/JeffAshton/win_pdh v0.0.0-20161109143554-76bb4ee9f0ab // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -90,7 +90,7 @@ require (
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
 	github.com/google/btree v1.0.1 // indirect
 	github.com/google/cadvisor v0.51.0 // indirect
 	github.com/google/cel-go v0.22.0 // indirect

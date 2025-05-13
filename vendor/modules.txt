@@ -1,8 +1,8 @@
 # cel.dev/expr v0.19.1
 ## explicit; go 1.21.1
 cel.dev/expr
-# github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.0
-## explicit; go 1.18
+# github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.1
+## explicit; go 1.23.0
 github.com/Azure/azure-sdk-for-go/sdk/azcore
 github.com/Azure/azure-sdk-for-go/sdk/azcore/arm
 github.com/Azure/azure-sdk-for-go/sdk/azcore/arm/internal/resource
@@ -85,7 +85,7 @@ github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/internal/shared
 github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/sas
 github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/service
 github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/share
-# github.com/Azure/msi-dataplane v0.4.2
+# github.com/Azure/msi-dataplane v0.4.3
 ## explicit; go 1.22
 github.com/Azure/msi-dataplane/pkg/dataplane
 github.com/Azure/msi-dataplane/pkg/dataplane/internal/challenge
@@ -229,7 +229,7 @@ github.com/gogo/protobuf/gogoproto
 github.com/gogo/protobuf/proto
 github.com/gogo/protobuf/protoc-gen-gogo/descriptor
 github.com/gogo/protobuf/sortkeys
-# github.com/golang-jwt/jwt/v5 v5.2.1
+# github.com/golang-jwt/jwt/v5 v5.2.2
 ## explicit; go 1.18
 github.com/golang-jwt/jwt/v5
 # github.com/golang/protobuf v1.5.4
@@ -432,7 +432,7 @@ github.com/munnerz/goautoneg
 # github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f
 ## explicit
 github.com/mxk/go-flowrate/flowrate
-# github.com/onsi/ginkgo/v2 v2.23.0
+# github.com/onsi/ginkgo/v2 v2.23.3
 ## explicit; go 1.23.0
 github.com/onsi/ginkgo/v2
 github.com/onsi/ginkgo/v2/config
@@ -454,8 +454,8 @@ github.com/onsi/ginkgo/v2/internal/parallel_support
 github.com/onsi/ginkgo/v2/internal/testingtproxy
 github.com/onsi/ginkgo/v2/reporters
 github.com/onsi/ginkgo/v2/types
-# github.com/onsi/gomega v1.36.2
-## explicit; go 1.22.0
+# github.com/onsi/gomega v1.36.3
+## explicit; go 1.23.0
 github.com/onsi/gomega
 github.com/onsi/gomega/format
 github.com/onsi/gomega/gcustom
@@ -651,8 +651,8 @@ go.opentelemetry.io/proto/otlp/collector/trace/v1
 go.opentelemetry.io/proto/otlp/common/v1
 go.opentelemetry.io/proto/otlp/resource/v1
 go.opentelemetry.io/proto/otlp/trace/v1
-# go.uber.org/mock v0.5.0
-## explicit; go 1.22
+# go.uber.org/mock v0.5.2
+## explicit; go 1.23
 go.uber.org/mock/gomock
 # go.uber.org/multierr v1.11.0
 ## explicit; go 1.19
@@ -688,7 +688,7 @@ golang.org/x/crypto/ssh/internal/bcrypt_pbkdf
 # golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
 ## explicit; go 1.23.0
 golang.org/x/exp/slices
-# golang.org/x/net v0.37.0
+# golang.org/x/net v0.38.0
 ## explicit; go 1.23.0
 golang.org/x/net/context
 golang.org/x/net/html
@@ -1900,8 +1900,8 @@ sigs.k8s.io/cloud-provider-azure/pkg/util/string
 sigs.k8s.io/cloud-provider-azure/pkg/util/taints
 sigs.k8s.io/cloud-provider-azure/pkg/util/vm
 sigs.k8s.io/cloud-provider-azure/pkg/version
-# sigs.k8s.io/cloud-provider-azure/pkg/azclient v0.5.9
-## explicit; go 1.23.1
+# sigs.k8s.io/cloud-provider-azure/pkg/azclient v0.8.1
+## explicit; go 1.23.0
 sigs.k8s.io/cloud-provider-azure/pkg/azclient
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient
@@ -1937,6 +1937,7 @@ sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/etag
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/ratelimit
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/ratelimit/flowcontrol
+sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/retryaftermin
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/retryrepectthrottled
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/policy/useragent
 sigs.k8s.io/cloud-provider-azure/pkg/azclient/privatednszonegroupclient
