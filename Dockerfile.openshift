@@ -1,10 +1,10 @@
-FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.23-openshift-4.19 AS builder
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-golang-1.24-openshift-4.20 AS builder
 WORKDIR /go/src/github.com/openshift/azure-file-csi-driver
 COPY . .
 RUN make azurefile ARCH=$(go env GOARCH) && cp _output/$(go env GOARCH)/azurefileplugin .
 
 # Use base image with azcopy installed
-FROM registry.ci.openshift.org/ocp/4.19:azure-storage-azcopy-base
+FROM registry.ci.openshift.org/ocp/4.20:azure-storage-azcopy-base
 COPY --from=builder /go/src/github.com/openshift/azure-file-csi-driver/azurefileplugin /bin/azurefileplugin
 RUN yum install -y cifs-utils util-linux nfs-utils e2fsprogs xfsprogs ca-certificates && yum clean all && rm -rf /var/cache/yum
 
