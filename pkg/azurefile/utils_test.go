@@ -377,14 +377,6 @@ func TestGetRetryAfterSeconds(t *testing.T) {
 	}
 }
 
-func TestUseDataPlaneAPI(t *testing.T) {
-	volumeContext := map[string]string{"usedataplaneapi": "true"}
-	result := useDataPlaneAPI(volumeContext)
-	if result != true {
-		t.Errorf("Expected value(%s), Actual value(%t)", "true", result)
-	}
-}
-
 func TestCreateStorageAccountSecret(t *testing.T) {
 	result := createStorageAccountSecret("TestAccountName", "TestAccountKey")
 	if result[defaultSecretAccountName] != "TestAccountName" || result[defaultSecretAccountKey] != "TestAccountKey" {
@@ -440,6 +432,7 @@ func TestConvertTagsToMap(t *testing.T) {
 }
 
 func TestChmodIfPermissionMismatch(t *testing.T) {
+	skipIfTestingOnWindows(t)
 	permissionMatchingPath, _ := getWorkDirPath("permissionMatchingPath")
 	_ = makeDir(permissionMatchingPath, 0755)
 	defer os.RemoveAll(permissionMatchingPath)
@@ -448,11 +441,23 @@ func TestChmodIfPermissionMismatch(t *testing.T) {
 	_ = makeDir(permissionMismatchPath, 0721)
 	defer os.RemoveAll(permissionMismatchPath)
 
+	permissionMatchGidMismatchPath, _ := getWorkDirPath("permissionMatchGidMismatchPath")
+	_ = makeDir(permissionMatchGidMismatchPath, 0755)
+	_ = os.Chmod(permissionMatchGidMismatchPath, 0755|os.ModeSetgid) // Setgid bit is set
+	defer os.RemoveAll(permissionMatchGidMismatchPath)
+
+	permissionMismatchGidMismatch, _ := getWorkDirPath("permissionMismatchGidMismatch")
+	_ = makeDir(permissionMismatchGidMismatch, 0721)
+	_ = os.Chmod(permissionMismatchGidMismatch, 0721|os.ModeSetgid) // Setgid bit is set
+	defer os.RemoveAll(permissionMismatchGidMismatch)
+
 	tests := []struct {
-		desc          string
-		path          string
-		mode          os.FileMode
-		expectedError error
+		desc           string
+		path           string
+		mode           os.FileMode
+		expectedPerms  os.FileMode
+		expectedGidBit bool
+		expectedError  error
 	}{
 		{
 			desc:          "Invalid path",
@@ -461,16 +466,44 @@ func TestChmodIfPermissionMismatch(t *testing.T) {
 			expectedError: fmt.Errorf("CreateFile invalid-path: The system cannot find the file specified"),
 		},
 		{
-			desc:          "permission matching path",
-			path:          permissionMatchingPath,
-			mode:          0755,
-			expectedError: nil,
+			desc:           "permission matching path",
+			path:           permissionMatchingPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
 		},
 		{
-			desc:          "permission mismatch path",
-			path:          permissionMismatchPath,
-			mode:          0755,
-			expectedError: nil,
+			desc:           "permission mismatch path",
+			path:           permissionMismatchPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only match the permission mode bits",
+			path:           permissionMatchGidMismatchPath,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: true,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only change the permission mode bits when gid is set",
+			path:           permissionMismatchGidMismatch,
+			mode:           0755,
+			expectedPerms:  0755,
+			expectedGidBit: true,
+			expectedError:  nil,
+		},
+		{
+			desc:           "only change the permission mode bits when gid is not set but mode bits have gid set",
+			path:           permissionMismatchPath,
+			mode:           02755,
+			expectedPerms:  0755,
+			expectedGidBit: false,
+			expectedError:  nil,
 		},
 	}
 
@@ -481,6 +514,18 @@ func TestChmodIfPermissionMismatch(t *testing.T) {
 				t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 			}
 		}
+
+		if test.expectedError == nil {
+			info, _ := os.Lstat(test.path)
+			if test.expectedError == nil && (info.Mode()&os.ModePerm != test.expectedPerms) {
+				t.Errorf("test[%s]: unexpected perms: %v, expected perms: %v, ", test.desc, info.Mode()&os.ModePerm, test.expectedPerms)
+			}
+
+			if (info.Mode()&os.ModeSetgid != 0) != test.expectedGidBit {
+				t.Errorf("test[%s]: unexpected gid bit: %v, expected gid bit: %v", test.desc, info.Mode()&os.ModeSetgid != 0, test.expectedGidBit)
+			}
+		}
+
 	}
 }
 
@@ -949,6 +994,42 @@ func TestVolumeMounter(t *testing.T) {
 	}
 }
 
+func TestGetFileServiceURL(t *testing.T) {
+	tests := []struct {
+		desc                  string
+		account               string
+		storageEndPointSuffix string
+		expected              string
+	}{
+		{
+			desc:                  "default storage endpoint",
+			account:               "testaccount",
+			storageEndPointSuffix: "",
+			expected:              "https://testaccount.file.core.windows.net",
+		},
+		{
+			desc:                  "custom storage endpoint",
+			account:               "testaccount",
+			storageEndPointSuffix: "core.windows.cn",
+			expected:              "https://testaccount.file.core.windows.cn",
+		},
+		{
+			desc:                  "storage endpoint core.windows.net",
+			account:               "testaccount",
+			storageEndPointSuffix: "core.windows.net",
+			expected:              "https://testaccount.file.core.windows.net",
+		},
+	}
+
+	for _, test := range tests {
+		result := getFileServiceURL(test.account, test.storageEndPointSuffix)
+		if result != test.expected {
+			t.Errorf("desc: (%s), input: account(%s), storageEndPointSuffix(%s), getFileServiceURL returned with string(%s), not equal to expected(%s)",
+				test.desc, test.account, test.storageEndPointSuffix, result, test.expected)
+		}
+	}
+}
+
 func TestIsValidSubscriptionID(t *testing.T) {
 	tests := []struct {
 		desc     string
@@ -997,6 +1078,74 @@ func TestIsValidSubscriptionID(t *testing.T) {
 		if result != test.expected {
 			t.Errorf("desc: (%s), input: subsID(%s), isValidSubscriptionID returned with bool(%v), not equal to expected(%v)",
 				test.desc, test.subsID, result, test.expected)
+		}
+	}
+}
+
+func TestRemoveOptionIfExists(t *testing.T) {
+	tests := []struct {
+		desc            string
+		options         []string
+		removeOption    string
+		expectedOptions []string
+		expected        bool
+	}{
+		{
+			desc:         "nil options",
+			removeOption: "option",
+			expected:     false,
+		},
+		{
+			desc:            "empty options",
+			options:         []string{},
+			removeOption:    "option",
+			expectedOptions: []string{},
+			expected:        false,
+		},
+		{
+			desc:            "option not found",
+			options:         []string{"option1", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        false,
+		},
+		{
+			desc:            "option found in the last element",
+			options:         []string{"option1", "option2", "option"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found in the first element",
+			options:         []string{"option", "option1", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found in the middle element",
+			options:         []string{"option1", "option", "option2"},
+			removeOption:    "option",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+		{
+			desc:            "option found with case insensitive match",
+			options:         []string{"option1", "encryptInTransit", "option2"},
+			removeOption:    "encryptintransit",
+			expectedOptions: []string{"option1", "option2"},
+			expected:        true,
+		},
+	}
+
+	for _, test := range tests {
+		result, exists := removeOptionIfExists(test.options, test.removeOption)
+		if !reflect.DeepEqual(result, test.expectedOptions) {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expectedOptions)
+		}
+		if exists != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, exists, test.expected)
 		}
 	}
 }

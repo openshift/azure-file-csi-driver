@@ -859,6 +859,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			StorageClassParameters: map[string]string{
 				"skuName":                     "Standard_LRS",
 				"selectRandomMatchingAccount": "true",
+				"useDataPlaneAPI":             "oauth",
 			},
 		}
 		test.Run(ctx, cs, snapshotrcs, ns)
@@ -986,7 +987,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a Premium_LRS volume on demand with useDataPlaneAPI [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
+	ginkgo.It("should create a Premium_LRS volume on demand with useDataPlaneAPI(oauth) [file.csi.azure.com] [Windows]", func(ctx ginkgo.SpecContext) {
 		skipIfUsingInTreeVolumePlugin()
 
 		pods := []testsuites.PodDetails{
@@ -1020,7 +1021,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			"skuName":                      "Premium_LRS",
 			"secretNamespace":              "kube-system",
 			"createAccount":                "true",
-			"useDataPlaneAPI":              "true",
+			"useDataPlaneAPI":              "oauth",
 			"disableDeleteRetentionPolicy": "true",
 			"accountAccessTier":            "Premium",
 		}
@@ -1479,10 +1480,88 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		scParameters := map[string]string{
 			"protocol":            "nfs",
 			"networkEndpointType": "privateEndpoint",
+			"publicNetworkAccess": "Disabled",
 			"skuName":             "Premium_LRS",
 			"rootSquashType":      "AllSquash",
 			"mountPermissions":    "0",
 			"fsGroupChangePolicy": "Always",
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should create a NFS volume on demand on a storage account with encryptInTransit enabled [file.csi.azure.com] [nfs]", func(ctx ginkgo.SpecContext) {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfTestingInWindowsCluster()
+		if !supportEncryptInTransitwithNFS {
+			ginkgo.Skip("encryptInTransit on nfs file share is not supported on current region")
+		}
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "100Gi",
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+				IsWindows:    isWindowsCluster,
+				WinServerVer: winServerVer,
+			},
+		}
+		scParameters := map[string]string{
+			"protocol":         "nfs",
+			"encryptInTransit": "true",
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+		}
+		test.Run(ctx, cs, ns)
+	})
+
+	ginkgo.It("should create a NFS volume on demand on a storage account with encryptInTransit enabled within mountOptions [file.csi.azure.com] [nfs]", func(ctx ginkgo.SpecContext) {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfTestingInWindowsCluster()
+		if !supportEncryptInTransitwithNFS {
+			ginkgo.Skip("encryptInTransit on nfs file share is not supported on current region")
+		}
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "100Gi",
+						MountOptions: []string{
+							"nconnect=4",
+							"rsize=1048576",
+							"wsize=1048576",
+							"noresvport",
+							"actimeo=30",
+							"encryptInTransit",
+						},
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+				IsWindows:    isWindowsCluster,
+				WinServerVer: winServerVer,
+			},
+		}
+		scParameters := map[string]string{
+			"protocol": "nfs",
 		}
 		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
 			CSIDriver:              testDriver,

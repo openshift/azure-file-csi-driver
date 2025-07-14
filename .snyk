@@ -5,3 +5,4 @@ exclude:
   global:
     - vendor/**
     - hack/boilerplate/boilerplate.py
+    - pkg/azurefile-proxy/main.go

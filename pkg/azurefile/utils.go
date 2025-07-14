@@ -177,17 +177,6 @@ func getRetryAfterSeconds(err error) int {
 	return 0
 }
 
-func useDataPlaneAPI(volContext map[string]string) bool {
-	useDataPlaneAPI := false
-	for k, v := range volContext {
-		switch strings.ToLower(k) {
-		case useDataPlaneAPIField:
-			useDataPlaneAPI = strings.EqualFold(v, trueValue)
-		}
-	}
-	return useDataPlaneAPI
-}
-
 func createStorageAccountSecret(account, key string) map[string]string {
 	secret := make(map[string]string)
 	secret[defaultSecretAccountName] = account
@@ -255,9 +244,11 @@ func chmodIfPermissionMismatch(targetPath string, mode os.FileMode) error {
 		return err
 	}
 	perm := info.Mode() & os.ModePerm
-	if perm != mode {
-		klog.V(2).Infof("chmod targetPath(%s, mode:0%o) with permissions(0%o)", targetPath, info.Mode(), mode)
-		if err := os.Chmod(targetPath, mode); err != nil {
+	expectedPerms := mode & os.ModePerm
+	if perm != expectedPerms {
+		klog.V(2).Infof("chmod targetPath(%s, mode:0%o) with permissions(0%o)", targetPath, info.Mode(), expectedPerms)
+		// only change the permission mode bits, keep the other bits as is
+		if err := os.Chmod(targetPath, (info.Mode()&^os.ModePerm)|os.FileMode(expectedPerms)); err != nil {
 			return err
 		}
 	} else {
@@ -277,7 +268,7 @@ func SetVolumeOwnership(path, gid, policy string) error {
 	if policy != "" {
 		fsGroupChangePolicy = v1.PodFSGroupChangePolicy(policy)
 	}
-	return volume.SetVolumeOwnership(&VolumeMounter{path: path}, path, &gidInt64, &fsGroupChangePolicy, nil)
+	return volume.NewVolumeOwnership(&VolumeMounter{path: path}, path, &gidInt64, &fsGroupChangePolicy, nil).ChangePermissions()
 }
 
 // setKeyValueInMap set key/value pair in map
@@ -344,7 +335,7 @@ func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interf
 	if err != nil {
 		return false, err
 	}
-	klog.Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
+	klog.V(4).Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
 	return runtimeClass.Handler == confidentialRuntimeClassHandler, nil
 }
 
@@ -362,6 +353,24 @@ func getBackOff(config azureconfig.Config) wait.Backoff {
 	}
 }
 
+func getFileServiceURL(accountName, storageEndpointSuffix string) string {
+	if storageEndpointSuffix == "" {
+		storageEndpointSuffix = defaultStorageEndPointSuffix
+	}
+	return fmt.Sprintf(serviceURLTemplate, accountName, storageEndpointSuffix)
+}
+
 func isValidSubscriptionID(subsID string) bool {
 	return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(subsID)
+}
+
+// RemoveOptionIfExists removes the given option from the list of options
+// return the new list and a boolean indicating whether the option was found.
+func removeOptionIfExists(options []string, removeOption string) ([]string, bool) {
+	for i, option := range options {
+		if strings.EqualFold(option, removeOption) {
+			return append(options[:i], options[i+1:]...), true
+		}
+	}
+	return options, false
 }

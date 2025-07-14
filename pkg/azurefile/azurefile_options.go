@@ -22,6 +22,8 @@ import "flag"
 type DriverOptions struct {
 	NodeID                                 string
 	DriverName                             string
+	EnableAzurefileProxy                   bool
+	AzureFileProxyEndpoint                 string
 	CloudConfigSecretName                  string
 	CloudConfigSecretNamespace             string
 	CustomUserAgent                        string
@@ -43,6 +45,7 @@ type DriverOptions struct {
 	AppendNoShareSockOption                bool
 	AppendNoResvPortOption                 bool
 	AppendActimeoOption                    bool
+	UseWinCIMAPI                           bool
 	SkipMatchingTagCacheExpireInMinutes    int
 	VolStatsCacheExpireInMinutes           int
 	PrintVolumeStatsCallLogs               bool
@@ -60,6 +63,8 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 	fs := flag.NewFlagSet("", flag.ExitOnError)
 	fs.StringVar(&o.NodeID, "nodeid", "", "node id")
 	fs.StringVar(&o.DriverName, "drivername", DefaultDriverName, "name of the driver")
+	fs.BoolVar(&o.EnableAzurefileProxy, "enable-azurefile-proxy", false, "enable azurefile proxy")
+	fs.StringVar(&o.AzureFileProxyEndpoint, "azurefile-proxy-endpoint", "unix://tmp/azurefile-proxy.sock", "azurefile-proxy endpoint")
 	fs.StringVar(&o.CloudConfigSecretName, "cloud-config-secret-name", "azure-cloud-provider", "secret name of cloud config")
 	fs.StringVar(&o.CloudConfigSecretNamespace, "cloud-config-secret-namespace", "kube-system", "secret namespace of cloud config")
 	fs.StringVar(&o.CustomUserAgent, "custom-user-agent", "", "custom userAgent")
@@ -81,6 +86,7 @@ func (o *DriverOptions) AddFlags() *flag.FlagSet {
 	fs.BoolVar(&o.AppendNoShareSockOption, "append-nosharesock-option", true, "Whether appending nosharesock option to smb mount command")
 	fs.BoolVar(&o.AppendNoResvPortOption, "append-noresvport-option", true, "Whether appending noresvport option to nfs mount command")
 	fs.BoolVar(&o.AppendActimeoOption, "append-actimeo-option", true, "Whether appending actimeo=0 option to nfs mount command")
+	fs.BoolVar(&o.UseWinCIMAPI, "use-win-cim-api", false, "Whether performing azure file operations using CIM API or Powershell command on Windows node")
 	fs.IntVar(&o.SkipMatchingTagCacheExpireInMinutes, "skip-matching-tag-cache-expire-in-minutes", 30, "The cache expire time in minutes for skipMatchingTagCache")
 	fs.IntVar(&o.VolStatsCacheExpireInMinutes, "vol-stats-cache-expire-in-minutes", 10, "The cache expire time in minutes for volume stats cache")
 	fs.BoolVar(&o.PrintVolumeStatsCallLogs, "print-volume-stats-call-logs", false, "Whether to print volume statfs call logs with log level 2")

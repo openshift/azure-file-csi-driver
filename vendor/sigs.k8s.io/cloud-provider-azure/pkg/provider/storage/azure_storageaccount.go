@@ -97,6 +97,9 @@ type AccountOptions struct {
 	SourceAccountName string
 	// default is "privatelink"
 	PrivateDNSZoneName string
+	// default is vnetName + "-vnetlink"
+	VNetLinkName        string
+	PublicNetworkAccess string
 }
 
 type accountWithLocation struct {
@@ -105,6 +108,7 @@ type accountWithLocation struct {
 type AccountRepo struct {
 	azureconfig.Config
 	Environment          *azclient.Environment
+	AuthProvider         *azclient.AuthProvider
 	ComputeClientFactory azclient.ClientFactory
 	NetworkClientFactory azclient.ClientFactory
 	subnetRepo           subnet.Repository
@@ -113,7 +117,7 @@ type AccountRepo struct {
 	lockMap              *lockmap.LockMap
 }
 
-func NewRepository(config azureconfig.Config, env *azclient.Environment, computeClientFactory azclient.ClientFactory, networkClientFactory azclient.ClientFactory) (*AccountRepo, error) {
+func NewRepository(config azureconfig.Config, env *azclient.Environment, authProvider *azclient.AuthProvider, computeClientFactory azclient.ClientFactory, networkClientFactory azclient.ClientFactory) (*AccountRepo, error) {
 	getter := func(_ context.Context, _ string) (*armstorage.Account, error) { return nil, nil }
 	storageAccountCache, err := cache.NewTimedCache(time.Minute, getter, config.DisableAPICallCache)
 	if err != nil {
@@ -131,6 +135,7 @@ func NewRepository(config azureconfig.Config, env *azclient.Environment, compute
 		Config:               config,
 		Environment:          env,
 		fileServiceRepo:      fileserviceRepo,
+		AuthProvider:         authProvider,
 		ComputeClientFactory: computeClientFactory,
 		NetworkClientFactory: networkClientFactory,
 		subnetRepo:           subnetRepo,
@@ -483,6 +488,9 @@ func (az *AccountRepo) EnsureStorageAccount(ctx context.Context, accountOptions 
 
 		// Create virtual link to the private DNS zone
 		vNetLinkName := vnetName + "-vnetlink"
+		if accountOptions.VNetLinkName != "" {
+			vNetLinkName = accountOptions.VNetLinkName
+		}
 		if _, err := clientFactory.GetVirtualNetworkLinkClient().Get(ctx, vnetResourceGroup, privateDNSZoneName, vNetLinkName); err != nil {
 			if strings.Contains(err.Error(), consts.ResourceNotFoundMessageCode) {
 				if err := az.createVNetLink(ctx, vNetLinkName, vnetResourceGroup, vnetName, privateDNSZoneName); err != nil {
@@ -530,6 +538,13 @@ func (az *AccountRepo) EnsureStorageAccount(ctx context.Context, accountOptions 
 		}
 		tags := convertMapToMapPointer(accountOptions.Tags)
 
+		var publicNetworkAccess *armstorage.PublicNetworkAccess
+		if accountOptions.PublicNetworkAccess != "" {
+			klog.V(2).Infof("set PublicNetworkAccess(%s) on account(%s), subscription(%s), resource group(%s)", accountOptions.PublicNetworkAccess, accountName, subsID, resourceGroup)
+			access := armstorage.PublicNetworkAccess(accountOptions.PublicNetworkAccess)
+			publicNetworkAccess = &access
+		}
+
 		klog.V(2).Infof("azure - no matching account found, begin to create a new account %s in resource group %s, location: %s, accountType: %s, accountKind: %s, tags: %+v",
 			accountName, resourceGroup, location, accountType, kind, accountOptions.Tags)
 
@@ -542,6 +557,7 @@ func (az *AccountRepo) EnsureStorageAccount(ctx context.Context, accountOptions 
 				IsHnsEnabled:           accountOptions.IsHnsEnabled,
 				EnableNfsV3:            accountOptions.EnableNfsV3,
 				MinimumTLSVersion:      to.Ptr(armstorage.MinimumTLSVersionTLS12),
+				PublicNetworkAccess:    publicNetworkAccess,
 			},
 			Tags:     tags,
 			Location: &location}
@@ -717,7 +733,11 @@ func (az *AccountRepo) createPrivateEndpoint(ctx context.Context, accountName st
 		klog.Errorf("Properties of (%s, %s) is nil", vnetName, subnetName)
 	} else {
 		// Disable the private endpoint network policies before creating private endpoint
-		subnet.Properties.PrivateEndpointNetworkPolicies = to.Ptr(armnetwork.VirtualNetworkPrivateEndpointNetworkPoliciesDisabled)
+		if subnet.Properties.PrivateEndpointNetworkPolicies == nil || *subnet.Properties.PrivateEndpointNetworkPolicies == armnetwork.VirtualNetworkPrivateEndpointNetworkPoliciesEnabled {
+			subnet.Properties.PrivateEndpointNetworkPolicies = to.Ptr(armnetwork.VirtualNetworkPrivateEndpointNetworkPoliciesDisabled)
+		} else {
+			klog.V(2).Infof("PrivateEndpointNetworkPolicies is already set to %s for subnet (%s, %s)", *subnet.Properties.PrivateEndpointNetworkPolicies, vnetName, subnetName)
+		}
 	}
 
 	if err := az.subnetRepo.CreateOrUpdate(ctx, vnetResourceGroup, vnetName, subnetName, *subnet); err != nil {

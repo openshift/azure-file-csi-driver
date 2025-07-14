@@ -39,12 +39,14 @@ import (
 	"go.uber.org/mock/gomock"
 	v1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient/mock_fileshareclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/storage"
 )
 
@@ -1014,7 +1016,7 @@ func TestGetFileShareQuota(t *testing.T) {
 			ResourceGroup:  resourceGroupName,
 			Name:           accountName,
 			SubscriptionID: "subsID",
-		}, fileShareName, test.secrets)
+		}, fileShareName, test.secrets, "")
 		if !reflect.DeepEqual(err, test.expectedError) {
 			t.Errorf("test name: %s, Unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
@@ -1630,5 +1632,287 @@ func TestGetFileShareClientForSub(t *testing.T) {
 		}
 		_, err := d.getFileShareClientForSub("test-subID")
 		assert.Equal(t, tc.expectedError, err)
+	}
+}
+
+func TestGetNodeInfoFromLabels(t *testing.T) {
+	testCases := []struct {
+		name         string
+		nodeName     string
+		labels       map[string]string
+		setupClient  bool
+		expectedVals [3]string
+		expectedErr  error
+	}{
+		{
+			name:        "Error when kubeClient is nil",
+			nodeName:    "test-node",
+			setupClient: false,
+			expectedErr: fmt.Errorf("kubeClient is nil"),
+		},
+		{
+			name:        "Error when node does not exist",
+			nodeName:    "nonexistent-node",
+			setupClient: true,
+			expectedErr: fmt.Errorf("get node(nonexistent-node) failed with nodes \"nonexistent-node\" not found"),
+		},
+		{
+			name:        "Error when node has no labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels:      map[string]string{}, // Node exists but has no labels
+			expectedErr: fmt.Errorf("node(test-node) label is empty"),
+		},
+		{
+			name:        "Success with kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				"kubernetes.azure.com/kata-cc-isolation":      "true",
+				"kubernetes.azure.com/kata-mshv-vm-isolation": "true",
+				"katacontainers.io/kata-runtime":              "false",
+			},
+			expectedVals: [3]string{"true", "true", "false"},
+			expectedErr:  nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.TODO()
+			var clientset kubernetes.Interface
+
+			if tc.setupClient {
+				clientset = fake.NewSimpleClientset()
+			}
+
+			if tc.labels != nil && tc.setupClient {
+				node := &v1api.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   tc.nodeName,
+						Labels: tc.labels,
+					},
+				}
+				_, err := clientset.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+				assert.NoError(t, err)
+			}
+
+			kataCCIsolation, kataVMIsolation, kataRuntime, err := getNodeInfoFromLabels(ctx, tc.nodeName, clientset)
+
+			if tc.expectedErr != nil {
+				assert.EqualError(t, err, tc.expectedErr.Error())
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tc.expectedVals[0], kataCCIsolation)
+				assert.Equal(t, tc.expectedVals[1], kataVMIsolation)
+				assert.Equal(t, tc.expectedVals[2], kataRuntime)
+			}
+		})
+	}
+}
+
+func TestIsKataNode(t *testing.T) {
+	testCases := []struct {
+		name        string
+		nodeName    string
+		labels      map[string]string
+		setupClient bool
+		expected    bool
+	}{
+		{
+			name:        "Node does not exist",
+			nodeName:    "",
+			setupClient: true,
+			expected:    false,
+		},
+		{
+			name:        "Node exists but has no kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				"some-other-label": "value",
+			},
+			expected: false,
+		},
+		{
+			name:        "Node has kata labels",
+			nodeName:    "test-node",
+			setupClient: true,
+			labels: map[string]string{
+				"kubernetes.azure.com/kata-cc-isolation": "true",
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.TODO()
+			var clientset kubernetes.Interface
+
+			if tc.setupClient {
+				clientset = fake.NewSimpleClientset()
+			}
+
+			if tc.labels != nil && tc.setupClient {
+				node := &v1api.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   tc.nodeName,
+						Labels: tc.labels,
+					},
+				}
+				_, err := clientset.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+				assert.NoError(t, err)
+			}
+			result := isKataNode(ctx, tc.nodeName, clientset)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestUseDataPlaneAPI(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	tests := []struct {
+		name                     string
+		volumeID                 string
+		accountName              string
+		dataPlaneAPIVolMap       map[string]string
+		dataPlaneAPIAccountCache map[string]string
+		expectedResult           string
+	}{
+		{
+			name:                     "dataPlaneAPIVolMap & dataPlaneAPIAccountCache is empty",
+			dataPlaneAPIVolMap:       make(map[string]string),
+			dataPlaneAPIAccountCache: make(map[string]string),
+			expectedResult:           "",
+		},
+		{
+			name:                     "dataPlaneAPIVolMap is not empty",
+			volumeID:                 "test-volume",
+			dataPlaneAPIVolMap:       map[string]string{"test-volume": "true"},
+			dataPlaneAPIAccountCache: make(map[string]string),
+			expectedResult:           "true",
+		},
+		{
+			name:                     "dataPlaneAPIAccountCache is not empty",
+			accountName:              "test-account",
+			dataPlaneAPIVolMap:       make(map[string]string),
+			dataPlaneAPIAccountCache: map[string]string{"test-account": "oatuh"},
+			expectedResult:           "oatuh",
+		},
+		{
+			name:                     "dataPlaneAPIVolMap & dataPlaneAPIAccountCache is not empty",
+			volumeID:                 "test-volume",
+			accountName:              "test-account",
+			dataPlaneAPIVolMap:       map[string]string{"test-volume": "true"},
+			dataPlaneAPIAccountCache: map[string]string{"test-account": "oatuh"},
+			expectedResult:           "true",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataPlaneAPIAccountCache, _ := cache.NewTimedCache(10*time.Minute, func(_ context.Context, _ string) (interface{}, error) { return nil, nil }, false)
+			for k, v := range test.dataPlaneAPIVolMap {
+				d.dataPlaneAPIVolMap.Store(k, v)
+			}
+			for k, v := range test.dataPlaneAPIAccountCache {
+				dataPlaneAPIAccountCache.Set(k, v)
+			}
+			d.dataPlaneAPIAccountCache = dataPlaneAPIAccountCache
+			result := d.useDataPlaneAPI(context.TODO(), test.volumeID, test.accountName)
+			assert.Equal(t, test.expectedResult, result)
+		})
+	}
+}
+
+func TestSetAzureCredentials(t *testing.T) {
+	testCases := []struct {
+		name               string
+		secretName         string
+		seceretNamespace   string
+		accountName        string
+		accountKey         string
+		expectedError      error
+		expectedSecretName string
+	}{
+		{
+			name:          "kubeClient is nil",
+			accountName:   "test-account",
+			accountKey:    "test-key",
+			expectedError: nil,
+		},
+		{
+			name:          "accountName is empty",
+			expectedError: fmt.Errorf("the account info is not enough, accountName(%v), accountKey(%v)", "", ""),
+		},
+		{
+			name:          "accountKey is empty",
+			expectedError: fmt.Errorf("the account info is not enough, accountName(%v), accountKey(%v)", "", ""),
+		},
+		{
+			name:               "success when secretName is empty",
+			accountName:        "test-account",
+			accountKey:         "test-key",
+			expectedError:      nil,
+			expectedSecretName: fmt.Sprintf(secretNameTemplate, "test-account"),
+		},
+		{
+			name:               "success when secretName is not empty",
+			secretName:         "test-secret",
+			accountName:        "test-account",
+			accountKey:         "test-key",
+			expectedError:      nil,
+			expectedSecretName: "test-secret",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := NewFakeDriver()
+			if tc.name == "kubeClient is nil" {
+				d.kubeClient = nil
+			} else {
+				d.kubeClient = fake.NewSimpleClientset()
+			}
+			secretName, err := d.SetAzureCredentials(context.TODO(), tc.accountName, tc.accountKey, tc.secretName, tc.seceretNamespace)
+			assert.Equal(t, tc.expectedError, err)
+			assert.Equal(t, tc.expectedSecretName, secretName)
+		})
+	}
+}
+
+func TestIsSupportedPublicNetworkAccess(t *testing.T) {
+	tests := []struct {
+		publicNetworkAccess string
+		expectedResult      bool
+	}{
+		{
+			publicNetworkAccess: "",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "Enabled",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "Disabled",
+			expectedResult:      true,
+		},
+		{
+			publicNetworkAccess: "InvalidValue",
+			expectedResult:      false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedPublicNetworkAccess(test.publicNetworkAccess)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedPublicNetworkAccess(%s) returned %v, expected %v", test.publicNetworkAccess, result, test.expectedResult)
+		}
 	}
 }

@@ -33,53 +33,53 @@ import (
 
 func TestParseEndpoint(t *testing.T) {
 	//Valid unix domain socket endpoint
-	sockType, addr, err := parseEndpoint("unix://fake.sock")
+	sockType, addr, err := ParseEndpoint("unix://fake.sock")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "unix")
 	assert.Equal(t, addr, "fake.sock")
 
-	sockType, addr, err = parseEndpoint("unix:///fakedir/fakedir/fake.sock")
+	sockType, addr, err = ParseEndpoint("unix:///fakedir/fakedir/fake.sock")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "unix")
 	assert.Equal(t, addr, "/fakedir/fakedir/fake.sock")
 
 	//Valid unix domain socket with uppercase
-	sockType, addr, err = parseEndpoint("UNIX://fake.sock")
+	sockType, addr, err = ParseEndpoint("UNIX://fake.sock")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "UNIX")
 	assert.Equal(t, addr, "fake.sock")
 
 	//Valid TCP endpoint with ip
-	sockType, addr, err = parseEndpoint("tcp://127.0.0.1:80")
+	sockType, addr, err = ParseEndpoint("tcp://127.0.0.1:80")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "tcp")
 	assert.Equal(t, addr, "127.0.0.1:80")
 
 	//Valid TCP endpoint with uppercase
-	sockType, addr, err = parseEndpoint("TCP://127.0.0.1:80")
+	sockType, addr, err = ParseEndpoint("TCP://127.0.0.1:80")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "TCP")
 	assert.Equal(t, addr, "127.0.0.1:80")
 
 	//Valid TCP endpoint with hostname
-	sockType, addr, err = parseEndpoint("tcp://fakehost:80")
+	sockType, addr, err = ParseEndpoint("tcp://fakehost:80")
 	assert.NoError(t, err)
 	assert.Equal(t, sockType, "tcp")
 	assert.Equal(t, addr, "fakehost:80")
 
-	_, _, err = parseEndpoint("unix:/fake.sock/")
+	_, _, err = ParseEndpoint("unix:/fake.sock/")
 	assert.NotNil(t, err)
 
-	_, _, err = parseEndpoint("fake.sock")
+	_, _, err = ParseEndpoint("fake.sock")
 	assert.NotNil(t, err)
 
-	_, _, err = parseEndpoint("unix://")
+	_, _, err = ParseEndpoint("unix://")
 	assert.NotNil(t, err)
 
-	_, _, err = parseEndpoint("://")
+	_, _, err = ParseEndpoint("://")
 	assert.NotNil(t, err)
 
-	_, _, err = parseEndpoint("")
+	_, _, err = ParseEndpoint("")
 	assert.NotNil(t, err)
 }
 
@@ -220,52 +220,52 @@ func TestNewVolumeCapabilityAccessMode(t *testing.T) {
 
 func TestNewControllerServiceCapability(t *testing.T) {
 	tests := []struct {
-		cap csi.ControllerServiceCapability_RPC_Type
+		c csi.ControllerServiceCapability_RPC_Type
 	}{
 		{
-			cap: csi.ControllerServiceCapability_RPC_UNKNOWN,
+			c: csi.ControllerServiceCapability_RPC_UNKNOWN,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+			c: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+			c: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		},
 	}
 	for _, test := range tests {
-		resp := NewControllerServiceCapability(test.cap)
+		resp := NewControllerServiceCapability(test.c)
 		assert.NotNil(t, resp)
 	}
 }
 
 func TestNewNodeServiceCapability(t *testing.T) {
 	tests := []struct {
-		cap csi.NodeServiceCapability_RPC_Type
+		c csi.NodeServiceCapability_RPC_Type
 	}{
 		{
-			cap: csi.NodeServiceCapability_RPC_UNKNOWN,
+			c: csi.NodeServiceCapability_RPC_UNKNOWN,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+			c: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+			c: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+			c: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 		},
 	}
 	for _, test := range tests {
-		resp := NewNodeServiceCapability(test.cap)
+		resp := NewNodeServiceCapability(test.c)
 		assert.NotNil(t, resp)
 	}
 }
@@ -340,7 +340,7 @@ func TestListenEndpoint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ListenEndpoint(tt.endpoint)
+			got, err := ListenEndpoint(context.Background(), tt.endpoint)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Listen() error = %v, wantErr %v", err, tt.wantErr)
 				return
