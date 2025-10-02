@@ -470,7 +470,7 @@ func (t *TestDeployment) WaitForPodReady(ctx context.Context) {
 	// always get first pod as there should only be one
 	pod := pods.Items[0]
 	t.podName = pod.Name
-	err = e2epod.WaitForPodRunningInNamespace(ctx, t.client, &pod)
+	err = e2epod.WaitForPodRunningInNamespaceSlow(ctx, t.client, pod.Name, t.namespace.Name)
 	framework.ExpectNoError(err)
 }
 
@@ -605,7 +605,7 @@ func (t *TestStatefulset) WaitForPodReady(ctx context.Context) {
 	// always get first pod as there should only be one
 	pod := statefulSetPods.Items[0]
 	t.podName = pod.Name
-	err = e2epod.WaitForPodRunningInNamespace(ctx, t.client, &pod)
+	err = e2epod.WaitForPodRunningInNamespaceSlow(ctx, t.client, pod.Name, t.namespace.Name)
 	framework.ExpectNoError(err)
 }
 
@@ -642,7 +642,7 @@ func (t *TestStatefulset) Logs(ctx context.Context) ([]byte, error) {
 	return podLogs(ctx, t.client, t.podName, t.namespace.Name)
 }
 func waitForStatefulSetComplete(ctx context.Context, cs clientset.Interface, ns *v1.Namespace, ss *apps.StatefulSet) error {
-	err := wait.PollImmediate(poll, pollTimeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, poll, pollTimeout, true, func(context.Context) (bool, error) {
 		var err error
 		statefulSet, err := cs.AppsV1().StatefulSets(ns.Name).Get(ctx, ss.Name, metav1.GetOptions{})
 		if err != nil {
@@ -712,7 +712,7 @@ func (t *TestPod) WaitForSuccess(ctx context.Context) {
 }
 
 func (t *TestPod) WaitForRunning(ctx context.Context) {
-	err := e2epod.WaitForPodRunningInNamespace(ctx, t.client, t.pod)
+	err := e2epod.WaitForPodRunningInNamespaceSlow(ctx, t.client, t.pod.Name, t.namespace.Name)
 	framework.ExpectNoError(err)
 }
 
@@ -950,7 +950,7 @@ func (t *TestVolumeSnapshotClass) CreateSnapshot(ctx context.Context, pvc *v1.Pe
 
 func (t *TestVolumeSnapshotClass) ReadyToUse(ctx context.Context, snapshot *snapshotv1.VolumeSnapshot) {
 	ginkgo.By("waiting for VolumeSnapshot to be ready to use - " + snapshot.Name)
-	err := wait.Poll(15*time.Second, 5*time.Minute, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, 15*time.Second, 5*time.Minute, true, func(context.Context) (bool, error) {
 		vs, err := snapshotclientset.New(t.client).SnapshotV1().VolumeSnapshots(t.namespace.Name).Get(ctx, snapshot.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, fmt.Errorf("did not see ReadyToUse: %v", err)
@@ -1016,7 +1016,7 @@ func getWinImageTag(winServerVer string) string {
 
 func pollForStringWorker(namespace string, pod string, command []string, expectedString string, ch chan<- error) {
 	args := append([]string{"exec", pod, "--"}, command...)
-	err := wait.PollImmediate(poll, pollForStringTimeout, func() (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), poll, pollForStringTimeout, true, func(context.Context) (bool, error) {
 		stdout, err := e2ekubectl.RunKubectl(namespace, args...)
 		if err != nil {
 			framework.Logf("Error waiting for output %q in pod %q: %v.", expectedString, pod, err)
