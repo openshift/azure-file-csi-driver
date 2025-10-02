@@ -22,7 +22,7 @@ ARG ARCH
 
 RUN apt update \
     && apt install -y curl \
-    && curl -Ls https://azcopyvnext-awgzd8g7aagqhzhe.b02.azurefd.net/releases/release-10.29.1-20250515/azcopy_linux_${ARCH}_10.29.1.tar.gz \
+    && curl -Ls https://github.com/Azure/azure-storage-azcopy/releases/download/v10.30.0/azcopy_linux_${ARCH}_10.30.0.tar.gz \
         | tar xvzf - --strip-components=1 -C /usr/local/bin/ --wildcards "*/azcopy"
 
 FROM base
@@ -35,13 +35,11 @@ COPY --from=builder --chown=root:root /usr/local/bin/azcopy /usr/local/bin/azcop
 
 RUN apt update && apt upgrade -y && apt-mark unhold libcap2 && clean-install ca-certificates cifs-utils util-linux e2fsprogs mount udev xfsprogs nfs-common netbase
 
-COPY ./pkg/azurefile-proxy/init.sh /azurefile-proxy/
-COPY ./pkg/azurefile-proxy/install-proxy.sh /azurefile-proxy/
+COPY ./pkg/azurefile-proxy/*.sh /azurefile-proxy/
 COPY ./pkg/azurefile-proxy/azurefile-proxy.service /azurefile-proxy/
 COPY ./_output/${ARCH}/azurefile-proxy /azurefile-proxy/
 
-RUN chmod +x /azurefile-proxy/init.sh && \
-  chmod +x /azurefile-proxy/install-proxy.sh && \
+RUN chmod +x /azurefile-proxy/*.sh && \
   chmod +x /azurefile-proxy/azurefile-proxy.service && \
   chmod +x /azurefile-proxy/azurefile-proxy
 

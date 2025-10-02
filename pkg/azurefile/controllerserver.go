@@ -120,6 +120,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	var createAccount, useSeretCache, matchTags, selectRandomMatchingAccount, getLatestAccountKey, encryptInTransit bool
 	var vnetResourceGroup, vnetName, vnetLinkName, publicNetworkAccess, subnetName, shareNamePrefix, fsGroupChangePolicy, useDataPlaneAPI string
 	var requireInfraEncryption, disableDeleteRetentionPolicy, enableLFS, isMultichannelEnabled, allowSharedKeyAccess *bool
+	var provisionedBandwidthMibps, provisionedIops *int32
 	// set allowBlobPublicAccess as false by default
 	allowBlobPublicAccess := ptr.To(false)
 
@@ -225,8 +226,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		case pvNameKey:
 			fileShareNameReplaceMap[pvNameMetadata] = v
 		case serverNameField:
-			// no op, only used in NodeStageVolume
 		case folderNameField:
+		case clientIDField:
+		case confidentialContainerLabelField:
+		case runtimeClassHandlerField:
+		case createFolderIfNotExistField:
 			// no op, only used in NodeStageVolume
 		case fsGroupChangePolicyField:
 			fsGroupChangePolicy = v
@@ -277,6 +281,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			if err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid %s: %s in storage class", encryptInTransitField, v)
 			}
+		case provisionedBandwidthField:
+			value, err := strconv.ParseInt(v, 10, 32)
+			if err != nil || value < 0 {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid provisionedBandwidth %s in storage class", v)
+			}
+			provisionedBandwidthMibps = to.Ptr(int32(value))
+		case provisionedIopsField:
+			value, err := strconv.ParseInt(v, 10, 32)
+			if err != nil || value < 0 {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid provisionedIops %s in storage class", v)
+			}
+			provisionedIops = to.Ptr(int32(value))
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, "invalid parameter %q in storage class", k)
 		}
@@ -400,7 +416,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	fileShareSize := int(requestGiB)
 
-	if account != "" && resourceGroup != "" && sku == "" && fileShareSize < minimumPremiumShareSize {
+	if account != "" && resourceGroup != "" && sku == "" && fileShareSize < minimumPremiumV2ShareSize {
 		if d.cloud == nil || d.cloud.ComputeClientFactory == nil {
 			return nil, status.Errorf(codes.Internal, "cloud provider is not initialized")
 		}
@@ -421,14 +437,30 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	accountKind := string(armstorage.KindStorageV2)
 	if strings.HasPrefix(strings.ToLower(sku), premium) {
 		accountKind = string(armstorage.KindFileStorage)
-		if fileShareSize < minimumPremiumShareSize {
-			fileShareSize = minimumPremiumShareSize
+		if strings.Contains(strings.ToLower(sku), "v2") {
+			if fileShareSize < minimumPremiumV2ShareSize {
+				klog.V(2).Infof("fileShareSize(%d) is less than minimumPremiumV2ShareSize(%d), using minimumPremiumV2ShareSize", fileShareSize, minimumPremiumV2ShareSize)
+				fileShareSize = minimumPremiumV2ShareSize
+			}
+		} else {
+			if fileShareSize < minimumPremiumShareSize {
+				klog.V(2).Infof("fileShareSize(%d) is less than minimumPremiumShareSize(%d), using minimumPremiumShareSize", fileShareSize, minimumPremiumShareSize)
+				fileShareSize = minimumPremiumShareSize
+			}
 		}
 	}
 
 	// use v2 account kind for v2 sku
 	if strings.Contains(strings.ToLower(sku), "v2") {
 		accountKind = string(armstorage.KindFileStorage)
+		if provisionedIops == nil {
+			provisionedIops = getDefaultIOPS(fileShareSize, sku)
+			klog.V(2).Infof("setting provisionedIops as %d", ptr.Deref(provisionedIops, 0))
+		}
+		if provisionedBandwidthMibps == nil {
+			provisionedBandwidthMibps = getDefaultBandwidth(fileShareSize, sku)
+			klog.V(2).Infof("setting provisionedBandwidthMibps as %d", ptr.Deref(provisionedBandwidthMibps, 0))
+		}
 	}
 
 	// replace pv/pvc name namespace metadata in fileShareName
@@ -579,7 +611,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	accountOptions.Name = accountName
 	secret := req.GetSecrets()
-	if len(secret) == 0 && strings.EqualFold(useDataPlaneAPI, trueValue) {
+	if len(secret) == 0 && (strings.EqualFold(useDataPlaneAPI, trueValue) || secretName != "") {
 		if accountKey == "" {
 			if accountKey, err = d.GetStorageAccesskey(ctx, accountOptions, secret, secretName, secretNamespace); err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to GetStorageAccesskey on account(%s) rg(%s), error: %v", accountOptions.Name, accountOptions.ResourceGroup, err)
@@ -596,12 +628,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	shareOptions := &ShareOptions{
-		Name:       validFileShareName,
-		Protocol:   shareProtocol,
-		RequestGiB: fileShareSize,
-		AccessTier: shareAccessTier,
-		RootSquash: rootSquashType,
-		Metadata:   map[string]*string{createdByMetadata: ptr.To(d.Name)},
+		Name:                      validFileShareName,
+		Protocol:                  shareProtocol,
+		RequestGiB:                fileShareSize,
+		AccessTier:                shareAccessTier,
+		RootSquash:                rootSquashType,
+		ProvisionedBandwidthMibps: provisionedBandwidthMibps,
+		ProvisionedIops:           provisionedIops,
+		Metadata:                  map[string]*string{createdByMetadata: ptr.To(d.Name)},
 	}
 
 	klog.V(2).Infof("begin to create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d) protocol(%s)", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, shareProtocol)
@@ -1111,9 +1145,6 @@ func (d *Driver) ListSnapshots(_ context.Context, _ *csi.ListSnapshotsRequest) (
 
 // restoreSnapshot restores from a snapshot
 func (d *Driver) restoreSnapshot(ctx context.Context, req *csi.CreateVolumeRequest, dstAccountName, dstAccountSasToken string, authAzcopyEnv []string, secretNamespace string, shareOptions *ShareOptions, accountOptions *storage.AccountOptions, storageEndpointSuffix string) error {
-	if shareOptions.Protocol == armstorage.EnabledProtocolsNFS {
-		return fmt.Errorf("protocol nfs is not supported for snapshot restore")
-	}
 	var sourceSnapshotID string
 	if req.GetVolumeContentSource() != nil && req.GetVolumeContentSource().GetSnapshot() != nil {
 		sourceSnapshotID = req.GetVolumeContentSource().GetSnapshot().GetSnapshotId()
@@ -1154,10 +1185,10 @@ func (d *Driver) restoreSnapshot(ctx context.Context, req *csi.CreateVolumeReque
 	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", dstAccountName, storageEndpointSuffix, dstFileShareName, dstAccountSasToken)
 
 	srcFileShareSnapshotName := fmt.Sprintf("%s(snapshot: %s)", srcFileShareName, snapshot)
-	return d.copyFileShareByAzcopy(ctx, srcFileShareSnapshotName, dstFileShareName, srcPath, dstPath, snapshot, srcAccountName, dstAccountName, srcAccountSasToken, authAzcopyEnv, accountOptions)
+	return d.copyFileShareByAzcopy(ctx, srcFileShareSnapshotName, dstFileShareName, srcPath, dstPath, snapshot, srcAccountName, dstAccountName, srcAccountSasToken, authAzcopyEnv, shareOptions, accountOptions)
 }
 
-func (d *Driver) copyFileShareByAzcopy(ctx context.Context, srcFileShareName, dstFileShareName, srcPath, dstPath, snapshot, srcAccountName, dstAccountName, accountSASToken string, authAzcopyEnv []string, accountOptions *storage.AccountOptions) error {
+func (d *Driver) copyFileShareByAzcopy(ctx context.Context, srcFileShareName, dstFileShareName, srcPath, dstPath, snapshot, srcAccountName, dstAccountName, accountSASToken string, authAzcopyEnv []string, shareOptions *ShareOptions, accountOptions *storage.AccountOptions) error {
 	azcopyCopyOptions := azcopyCloneVolumeOptions
 	srcPathAuth := srcPath
 	if snapshot != "" {
@@ -1167,6 +1198,10 @@ func (d *Driver) copyFileShareByAzcopy(ctx context.Context, srcFileShareName, ds
 		} else {
 			srcPathAuth = fmt.Sprintf("%s&sharesnapshot=%s", srcPath, snapshot)
 		}
+	}
+
+	if shareOptions.Protocol == armstorage.EnabledProtocolsNFS {
+		azcopyCopyOptions = append(azcopyCopyOptions, "--from-to=FileNFSFileNFS")
 	}
 
 	jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName, authAzcopyEnv)

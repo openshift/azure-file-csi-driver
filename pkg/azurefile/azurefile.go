@@ -47,7 +47,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
@@ -82,8 +81,9 @@ const (
 	fileShareNameMinLength = 3
 	fileShareNameMaxLength = 63
 
-	minimumPremiumShareSize = 100 // GB
-	// Minimum size of Azure Premium Files is 100GiB
+	minimumPremiumShareSize   = 100 // GB
+	minimumPremiumV2ShareSize = 32  // GB
+	// Minimum size of Azure Premium Files is 100GiB, and PremiumV2 Files is 32GiB.
 	// See https://docs.microsoft.com/en-us/azure/storage/files/storage-files-planning#provisioned-shares
 	defaultAzureFileQuota = 100
 	minimumAccountQuota   = 100 // GB
@@ -98,6 +98,7 @@ const (
 	rootSquashTypeField               = "rootsquashtype"
 	diskNameField                     = "diskname"
 	folderNameField                   = "foldername"
+	createFolderIfNotExistField       = "createfolderifnotexist"
 	serverNameField                   = "server"
 	fsTypeField                       = "fstype"
 	protocolField                     = "protocol"
@@ -128,11 +129,13 @@ const (
 	podNameField                      = "csi.storage.k8s.io/pod.name"
 	podNamespaceField                 = "csi.storage.k8s.io/pod.namespace"
 	serviceAccountTokenField          = "csi.storage.k8s.io/serviceAccount.tokens"
-	clientIDField                     = "clientID"
-	tenantIDField                     = "tenantID"
+	clientIDField                     = "clientid"
+	tenantIDField                     = "tenantid"
 	mountOptionsField                 = "mountoptions"
 	mountPermissionsField             = "mountpermissions"
 	encryptInTransitField             = "encryptintransit"
+	provisionedBandwidthField         = "provisionedbandwidth"
+	provisionedIopsField              = "provisionediops"
 	falseValue                        = "false"
 	trueValue                         = "true"
 	defaultSecretAccountName          = "azurestorageaccountname"
@@ -160,6 +163,10 @@ const (
 	premium                           = "premium"
 	selectRandomMatchingAccountField  = "selectrandommatchingaccount"
 	accountQuotaField                 = "accountquota"
+	confidentialContainerLabelField   = "confidentialcontainerlabel"
+	defaultConfidentialContainerLabel = "kubernetes.azure.com/kata-cc-isolation"
+	runtimeClassHandlerField          = "runtimeclasshandler"
+	defaultRuntimeClassHandler        = "kata-cc"
 
 	accountNotProvisioned = "StorageAccountIsNotProvisioned"
 	// this is a workaround fix for 429 throttling issue, will update cloud provider for better fix later
@@ -202,6 +209,9 @@ const (
 	tagValueDelimiterField = "tagvaluedelimiter"
 	// for data plane API
 	oauth = "oauth"
+
+	standardv2 = "standardv2"
+	premiumv2  = "premiumv2"
 )
 
 var (
@@ -228,7 +238,7 @@ type Driver struct {
 	csi.UnimplementedNodeServer
 
 	cloud                                  *storage.AccountRepo
-	kubeClient                             kubernetes.Interface
+	kubeClient                             clientset.Interface
 	enableAzurefileProxy                   bool
 	azurefileProxyEndpoint                 string
 	cloudConfigSecretName                  string
@@ -467,7 +477,7 @@ func (d *Driver) Run(ctx context.Context) error {
 	csi.RegisterControllerServer(server, d)
 	csi.RegisterNodeServer(server, d)
 	d.server = server
-	d.isKataNode = isKataNode(ctx, d.NodeID, d.kubeClient)
+	d.isKataNode = isKataNode(ctx, d.NodeID, defaultConfidentialContainerLabel, d.kubeClient)
 
 	listener, err := csicommon.ListenEndpoint(ctx, d.endpoint)
 	if err != nil {
@@ -770,7 +780,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 	rgName, accountName, fileShareName, diskName, secretNamespace, subsID, err := GetFileShareInfo(volumeID)
 	if err != nil {
 		// ignore volumeID parsing error
-		klog.V(2).Infof("parsing volumeID(%s) return with error: %v", volumeID, err)
+		klog.V(6).Infof("parsing volumeID(%s) return with error: %v", volumeID, err)
 		err = nil
 	}
 
@@ -807,9 +817,9 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 			if getLatestAccountKey, err = strconv.ParseBool(v); err != nil {
 				return rgName, accountName, accountKey, fileShareName, diskName, subsID, fmt.Errorf("invalid %s: %s in volume context", getLatestAccountKeyField, v)
 			}
-		case strings.ToLower(clientIDField):
+		case clientIDField:
 			clientID = v
-		case strings.ToLower(tenantIDField):
+		case tenantIDField:
 			tenantID = v
 		case strings.ToLower(serviceAccountTokenField):
 			serviceAccountToken = v
@@ -1109,9 +1119,6 @@ func (d *Driver) ResizeFileShare(ctx context.Context, subsID, resourceGroup, acc
 
 // copyFileShare copies a fileshare, if dstAccountName is empty, then copy in the same account
 func (d *Driver) copyFileShare(ctx context.Context, req *csi.CreateVolumeRequest, dstAccountName string, dstAccountSasToken string, authAzcopyEnv []string, secretNamespace string, shareOptions *ShareOptions, accountOptions *storage.AccountOptions, storageEndpointSuffix string) error {
-	if shareOptions.Protocol == armstorage.EnabledProtocolsNFS {
-		return fmt.Errorf("protocol nfs is not supported for volume cloning")
-	}
 	var sourceVolumeID string
 	if req.GetVolumeContentSource() != nil && req.GetVolumeContentSource().GetVolume() != nil {
 		sourceVolumeID = req.GetVolumeContentSource().GetVolume().GetVolumeId()
@@ -1143,7 +1150,7 @@ func (d *Driver) copyFileShare(ctx context.Context, req *csi.CreateVolumeRequest
 	srcPath := fmt.Sprintf("https://%s.file.%s/%s%s", srcAccountName, storageEndpointSuffix, srcFileShareName, srcAccountSasToken)
 	dstPath := fmt.Sprintf("https://%s.file.%s/%s%s", dstAccountName, storageEndpointSuffix, dstFileShareName, dstAccountSasToken)
 
-	return d.copyFileShareByAzcopy(ctx, srcFileShareName, dstFileShareName, srcPath, dstPath, "", srcAccountName, dstAccountName, srcAccountSasToken, authAzcopyEnv, accountOptions)
+	return d.copyFileShareByAzcopy(ctx, srcFileShareName, dstFileShareName, srcPath, dstPath, "", srcAccountName, dstAccountName, srcAccountSasToken, authAzcopyEnv, shareOptions, accountOptions)
 }
 
 // GetTotalAccountQuota returns the total quota in GB of all file shares in the storage account and the number of file shares
@@ -1340,32 +1347,108 @@ func (d *Driver) getFileShareClientForSub(subscriptionID string) (fileshareclien
 	return d.cloud.ComputeClientFactory.GetFileShareClientForSub(subscriptionID)
 }
 
-func getNodeInfoFromLabels(ctx context.Context, nodeID string, kubeClient clientset.Interface) (string, string, string, error) {
+func isKataNode(ctx context.Context, nodeID, confidentialContainerLabel string, kubeClient clientset.Interface) bool {
+	if nodeID == "" {
+		return false
+	}
+
 	if kubeClient == nil || kubeClient.CoreV1() == nil {
-		return "", "", "", fmt.Errorf("kubeClient is nil")
+		klog.Warningf("kubeClient is nil, cannot check if node(%s) is a kata node", nodeID)
+		return false
 	}
 
 	node, err := kubeClient.CoreV1().Nodes().Get(ctx, nodeID, metav1.GetOptions{})
 	if err != nil {
-		return "", "", "", fmt.Errorf("get node(%s) failed with %v", nodeID, err)
+		klog.Warningf("failed to get node(%s): %v", nodeID, err)
+		return false
 	}
 
-	if len(node.Labels) == 0 {
-		return "", "", "", fmt.Errorf("node(%s) label is empty", nodeID)
+	if node == nil || len(node.Labels) == 0 {
+		return false
 	}
-	return node.Labels["kubernetes.azure.com/kata-cc-isolation"], node.Labels["kubernetes.azure.com/kata-mshv-vm-isolation"], node.Labels["katacontainers.io/kata-runtime"], nil
+
+	// Check for the kata isolation labels
+	if _, ok := node.Labels[confidentialContainerLabel]; !ok {
+		return false
+	}
+	klog.V(4).Infof("node(%s) is a kata node with labels: %v", nodeID, node.Labels)
+	return true
 }
 
-func isKataNode(ctx context.Context, nodeID string, kubeClient clientset.Interface) bool {
-	if nodeID == "" {
-		return false
+// createFolderIfNotExists creates a folder in Azure File Share if it doesn't already exist
+// This function handles nested paths by creating each directory level recursively
+func (d *Driver) createFolderIfNotExists(ctx context.Context, accountName, accountKey, fileShareName, folderName, storageEndpointSuffix string) error {
+	fileClient, err := newAzureFileClient(accountName, accountKey, storageEndpointSuffix)
+	if err != nil || fileClient.(*azureFileDataplaneClient).Client == nil {
+		return fmt.Errorf("create Azure File client(%s) failed: %v", accountName, err)
 	}
-	kataCCIsolationLabel, kataVMIsolationLabel, kataRuntimeLabel, err := getNodeInfoFromLabels(ctx, nodeID, kubeClient)
 
-	if err != nil {
-		klog.Warningf("failed to get node info from labels: %v", err)
-		return false
+	shareClient := fileClient.(*azureFileDataplaneClient).Client.NewShareClient(fileShareName)
+
+	// Performance optimization: First check if the complete directory structure already exists
+	// This is the most common case and avoids unnecessary recursive checking
+	fullPathClient := shareClient.NewDirectoryClient(folderName)
+	_, err = fullPathClient.GetProperties(ctx, nil)
+	if err == nil {
+		// Complete directory structure already exists - fast path
+		klog.V(2).Infof("Folder path %s already exists in share %s", folderName, fileShareName)
+		return nil
 	}
-	klog.V(4).Infof("node(%s) labels: kataVMIsolationLabel(%s), kataRuntimeLabel(%s)", nodeID, kataVMIsolationLabel, kataRuntimeLabel)
-	return strings.EqualFold(kataCCIsolationLabel, "true")
+
+	// Check if the error is something other than "not found"
+	var respErr *azcore.ResponseError
+	if !errors.As(err, &respErr) || respErr.StatusCode != 404 {
+		// Some other error occurred (permissions, network, etc.)
+		return fmt.Errorf("failed to check if folder path %s exists: %w", folderName, err)
+	}
+
+	// Directory doesn't exist - need to create it recursively
+	// Split the path by '/' and create directories level by level
+	pathComponents := strings.Split(strings.Trim(folderName, "/"), "/")
+
+	// Build path incrementally and create each directory level
+	currentPath := ""
+	for i, component := range pathComponents {
+		if component == "" {
+			continue // Skip empty components
+		}
+
+		if i > 0 {
+			currentPath += "/"
+		}
+		currentPath += component
+
+		// Get directory client for the current path level
+		directoryClient := shareClient.NewDirectoryClient(currentPath)
+
+		// Check if directory already exists by trying to get its properties
+		if _, err = directoryClient.GetProperties(ctx, nil); err == nil {
+			// Directory already exists, continue to next level
+			klog.V(4).Infof("Directory %s already exists in share %s", currentPath, fileShareName)
+			continue
+		}
+
+		// Check if the error is because directory doesn't exist
+		var respErr *azcore.ResponseError
+		if !errors.As(err, &respErr) || respErr.StatusCode != 404 {
+			// Some other error occurred
+			return fmt.Errorf("failed to check if directory %s exists: %w", currentPath, err)
+		}
+
+		// Create the directory at this level
+		if _, err = directoryClient.Create(ctx, nil); err != nil {
+			var respErr *azcore.ResponseError
+			if errors.As(err, &respErr) && respErr.StatusCode == 409 {
+				// Directory already exists (race condition), which is fine
+				klog.V(4).Infof("Directory %s already exists in share %s (detected during creation)", currentPath, fileShareName)
+				continue
+			}
+			return fmt.Errorf("failed to create directory %s: %w", currentPath, err)
+		}
+
+		klog.V(2).Infof("Successfully created directory %s in share %s", currentPath, fileShareName)
+	}
+
+	klog.V(2).Infof("Successfully ensured folder path %s exists in share %s", folderName, fileShareName)
+	return nil
 }

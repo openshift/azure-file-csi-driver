@@ -19,6 +19,7 @@ package azurefile
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -319,10 +320,8 @@ func isReadOnlyFromCapability(vc *csi.VolumeCapability) bool {
 		mode == csi.VolumeCapability_AccessMode_SINGLE_NODE_READER_ONLY)
 }
 
-const confidentialRuntimeClassHandler = "kata-cc"
-
 // check if runtimeClass is confidential
-func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interface, runtimeClassName string) (bool, error) {
+func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interface, runtimeClassName, runtimeClassHandler string) (bool, error) {
 	// if runtimeClassName is empty, return false
 	if runtimeClassName == "" {
 		return false, nil
@@ -336,7 +335,7 @@ func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interf
 		return false, err
 	}
 	klog.V(4).Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
-	return runtimeClass.Handler == confidentialRuntimeClassHandler, nil
+	return runtimeClass.Handler == runtimeClassHandler, nil
 }
 
 // getBackOff returns a backoff object based on the config
@@ -373,4 +372,46 @@ func removeOptionIfExists(options []string, removeOption string) ([]string, bool
 		}
 	}
 	return options, false
+}
+
+// standardv2:
+//
+//	MIN(MAX(1000 + CEILING(0.2 * ProvisionedStorageGiB), 500), 50000)
+//
+// premiumv2:
+//
+//	MIN(MAX(3000 + CEILING(1 * ProvisionedStorageGiB), 3000), 102400)
+//
+// https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail
+func getDefaultIOPS(requestGiB int, storageAccountType string) *int32 {
+	var iops int32
+	if strings.Contains(strings.ToLower(storageAccountType), standardv2) {
+		iops = min(int32(math.Ceil(0.2*float64(requestGiB))+1000), 50000)
+	} else if strings.Contains(strings.ToLower(storageAccountType), premiumv2) {
+		iops = min(int32(requestGiB+3000), 102400)
+	} else {
+		return nil
+	}
+	return &iops
+}
+
+// standardv2:
+//
+//	MIN(MAX(60 + CEILING(0.02 * ProvisionedStorageGiB), 60), 5120)
+//
+// premiumv2:
+//
+//	MIN(MAX(100 + CEILING(0.1 * ProvisionedStorageGiB), 100), 10340)
+//
+// https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail
+func getDefaultBandwidth(requestGiB int, storageAccountType string) *int32 {
+	var bandwidth int32
+	if strings.Contains(strings.ToLower(storageAccountType), standardv2) {
+		bandwidth = min(int32(math.Ceil(0.02*float64(requestGiB))+60), 5120)
+	} else if strings.Contains(strings.ToLower(storageAccountType), premiumv2) {
+		bandwidth = min(int32(math.Ceil(0.1*float64(requestGiB))+100), 10340)
+	} else {
+		return nil
+	}
+	return &bandwidth
 }
