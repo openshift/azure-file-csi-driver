@@ -13,18 +13,19 @@ spec:
   persistentVolumeReclaimPolicy: Retain  # if set as "Delete" file share would be removed in pvc deletion
   storageClassName: azurefile-csi
   mountOptions:
-    - dir_mode=0777
+    - dir_mode=0777  # modify this permission if you want to enhance the security
     - file_mode=0777
     - uid=0
     - gid=0
     - mfsymlinks
     - cache=strict  # https://linux.die.net/man/8/mount.cifs
-    - nosharesock
+    - nosharesock  # reduce probability of reconnect race
+    - actimeo=30  # reduce latency for metadata-heavy workload
+    - nobrl  # disable sending byte range lock requests to the server and for applications which have challenges with posix locks
   csi:
     driver: file.csi.azure.com
-    # make sure volumeid is unique for every identical share in the cluster
-    # the # character is reserved for internal use
-    volumeHandle: account-name_file-share-name
+    # make sure volumeHandle is unique for every identical share in the cluster
+    volumeHandle: "{resource-group-name}#{account-name}#{file-share-name}"
     volumeAttributes:
       shareName: EXISTING_FILE_SHARE_NAME  # only file share name, don't use full path
     nodeStageSecretRef:

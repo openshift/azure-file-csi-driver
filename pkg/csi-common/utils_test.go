@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"flag"
+	"os"
+	"runtime"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -98,7 +100,7 @@ func TestLogGRPC(t *testing.T) {
 	buf := new(bytes.Buffer)
 	klog.SetOutput(buf)
 
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) { return nil, nil }
+	handler := func(_ context.Context, _ interface{}) (interface{}, error) { return nil, nil }
 	info := grpc.UnaryServerInfo{
 		FullMethod: "fake",
 	}
@@ -116,7 +118,6 @@ func TestLogGRPC(t *testing.T) {
 					"account_name": "k8s",
 					"account_key":  "testkey",
 				},
-				XXX_sizecache: 100,
 			},
 			`GRPC request: {"secrets":"***stripped***","volume_id":"vol_1"}`,
 		},
@@ -134,7 +135,6 @@ func TestLogGRPC(t *testing.T) {
 					"csi.storage.k8s.io/serviceAccount.tokens": "testtoken",
 					"csi.storage.k8s.io/testfield":             "testvalue",
 				},
-				XXX_sizecache: 100,
 			},
 			`GRPC request: {"volume_context":{"csi.storage.k8s.io/serviceAccount.tokens":"***stripped***","csi.storage.k8s.io/testfield":"testvalue"}}`,
 		},
@@ -145,7 +145,6 @@ func TestLogGRPC(t *testing.T) {
 					"csi.storage.k8s.io/serviceAccount.tokens": "testtoken",
 					"csi.storage.k8s.io/testfield":             "testvalue",
 				},
-				XXX_sizecache: 100,
 			},
 			`GRPC request: {"volume_context":{"csi.storage.k8s.io/serviceAccount.tokens":"***stripped***","csi.storage.k8s.io/testfield":"testvalue"}}`,
 		},
@@ -161,7 +160,6 @@ func TestLogGRPC(t *testing.T) {
 					"csi.storage.k8s.io/serviceAccount.tokens": "testtoken",
 					"csi.storage.k8s.io/testfield":             "testvalue",
 				},
-				XXX_sizecache: 100,
 			},
 			`GRPC request: {"secrets":"***stripped***","volume_context":{"csi.storage.k8s.io/serviceAccount.tokens":"***stripped***","csi.storage.k8s.io/testfield":"testvalue"},"volume_id":"vol_1"}`,
 		},
@@ -222,55 +220,53 @@ func TestNewVolumeCapabilityAccessMode(t *testing.T) {
 
 func TestNewControllerServiceCapability(t *testing.T) {
 	tests := []struct {
-		cap csi.ControllerServiceCapability_RPC_Type
+		c csi.ControllerServiceCapability_RPC_Type
 	}{
 		{
-			cap: csi.ControllerServiceCapability_RPC_UNKNOWN,
+			c: csi.ControllerServiceCapability_RPC_UNKNOWN,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+			c: csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+			c: csi.ControllerServiceCapability_RPC_GET_CAPACITY,
 		},
 		{
-			cap: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+			c: csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
 		},
 	}
 	for _, test := range tests {
-		resp := NewControllerServiceCapability(test.cap)
+		resp := NewControllerServiceCapability(test.c)
 		assert.NotNil(t, resp)
-		assert.Equal(t, resp.XXX_sizecache, int32(0))
 	}
 }
 
 func TestNewNodeServiceCapability(t *testing.T) {
 	tests := []struct {
-		cap csi.NodeServiceCapability_RPC_Type
+		c csi.NodeServiceCapability_RPC_Type
 	}{
 		{
-			cap: csi.NodeServiceCapability_RPC_UNKNOWN,
+			c: csi.NodeServiceCapability_RPC_UNKNOWN,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+			c: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
+			c: csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 		},
 		{
-			cap: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
+			c: csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
 		},
 	}
 	for _, test := range tests {
-		resp := NewNodeServiceCapability(test.cap)
+		resp := NewNodeServiceCapability(test.c)
 		assert.NotNil(t, resp)
-		assert.Equal(t, resp.XXX_sizecache, int32(0))
 	}
 }
 
@@ -306,5 +302,55 @@ func TestGetLogLevel(t *testing.T) {
 		if level != test.level {
 			t.Errorf("returned level: (%v), expected level: (%v)", level, test.level)
 		}
+	}
+}
+
+func TestListenEndpoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Skip test on Windows")
+	}
+
+	tests := []struct {
+		name     string
+		endpoint string
+		filePath string
+		wantErr  bool
+	}{
+		{
+			name:     "unix socket",
+			endpoint: "unix:///tmp/csi.sock",
+			filePath: "/tmp/csi.sock",
+			wantErr:  false,
+		},
+		{
+			name:     "tcp socket",
+			endpoint: "tcp://127.0.0.1:0",
+			wantErr:  false,
+		},
+		{
+			name:     "invalid endpoint",
+			endpoint: "invalid://",
+			wantErr:  true,
+		},
+		{
+			name:     "invalid unix socket",
+			endpoint: "unix://does/not/exist",
+			wantErr:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ListenEndpoint(tt.endpoint)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Listen() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err == nil {
+				got.Close()
+				if tt.filePath != "" {
+					os.Remove(tt.filePath)
+				}
+			}
+		})
 	}
 }
