@@ -17,7 +17,7 @@ GIT_COMMIT ?= $(shell git rev-parse HEAD)
 REGISTRY ?= andyzhangx
 REGISTRY_NAME ?= $(shell echo $(REGISTRY) | sed "s/.azurecr.io//g")
 IMAGE_NAME ?= azurefile-csi
-IMAGE_VERSION ?= v1.32.0
+IMAGE_VERSION ?= v1.32.3
 # Use a custom version for E2E tests if we are testing in CI
 ifdef CI
 ifndef PUBLISH
@@ -36,7 +36,7 @@ endif
 ifdef EXTERNAL_E2E_TEST_NFS
 E2E_HELM_OPTIONS += --set feature.enableVolumeMountGroup=false --set feature.fsGroupPolicy=File
 endif
-GINKGO_FLAGS = -ginkgo.v
+GINKGO_FLAGS = -ginkgo.v --ginkgo.timeout=180m
 GO111MODULE = on
 GOPATH ?= $(shell go env GOPATH)
 GOBIN ?= $(GOPATH)/bin
@@ -88,7 +88,7 @@ e2e-test:
 		bash ./test/external-e2e/run.sh;\
 	else \
 		bash ./hack/parse-prow-creds.sh;\
-		go test -v -timeout=0 ./test/e2e ${GINKGO_FLAGS};\
+		go test -v -timeout=180m ./test/e2e ${GINKGO_FLAGS};\
 	fi
 
 .PHONY: e2e-bootstrap

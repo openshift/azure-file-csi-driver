@@ -177,17 +177,6 @@ func getRetryAfterSeconds(err error) int {
 	return 0
 }
 
-func useDataPlaneAPI(volContext map[string]string) bool {
-	useDataPlaneAPI := false
-	for k, v := range volContext {
-		switch strings.ToLower(k) {
-		case useDataPlaneAPIField:
-			useDataPlaneAPI = strings.EqualFold(v, trueValue)
-		}
-	}
-	return useDataPlaneAPI
-}
-
 func createStorageAccountSecret(account, key string) map[string]string {
 	secret := make(map[string]string)
 	secret[defaultSecretAccountName] = account
@@ -329,6 +318,7 @@ func isReadOnlyFromCapability(vc *csi.VolumeCapability) bool {
 }
 
 const confidentialRuntimeClassHandler = "kata-cc"
+const kataVMIsolationRuntimeClassHandler = "kata"
 
 // check if runtimeClass is confidential
 func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interface, runtimeClassName string) (bool, error) {
@@ -344,8 +334,9 @@ func isConfidentialRuntimeClass(ctx context.Context, kubeClient clientset.Interf
 	if err != nil {
 		return false, err
 	}
-	klog.Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
-	return runtimeClass.Handler == confidentialRuntimeClassHandler, nil
+	klog.V(4).Infof("runtimeClass %s handler: %s", runtimeClassName, runtimeClass.Handler)
+	return runtimeClass.Handler == confidentialRuntimeClassHandler ||
+		runtimeClass.Handler == kataVMIsolationRuntimeClassHandler, nil
 }
 
 // getBackOff returns a backoff object based on the config
@@ -360,6 +351,13 @@ func getBackOff(config azureconfig.Config) wait.Backoff {
 		Jitter:   config.CloudProviderBackoffJitter,
 		Duration: time.Duration(config.CloudProviderBackoffDuration) * time.Second,
 	}
+}
+
+func getFileServiceURL(accountName, storageEndpointSuffix string) string {
+	if storageEndpointSuffix == "" {
+		storageEndpointSuffix = defaultStorageEndPointSuffix
+	}
+	return fmt.Sprintf(serviceURLTemplate, accountName, storageEndpointSuffix)
 }
 
 func isValidSubscriptionID(subsID string) bool {
