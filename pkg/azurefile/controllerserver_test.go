@@ -2209,6 +2209,7 @@ func TestCreateSnapshot(t *testing.T) {
 }
 
 func TestDeleteSnapshot(t *testing.T) {
+	t.Skip("DeleteSnapshot functionality is disabled to prevent data loss (OCPBUGS-62547)")
 	d := NewFakeDriver()
 	d.cloud = &azure.Cloud{}
 
