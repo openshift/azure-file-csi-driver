@@ -946,56 +946,8 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 }
 
 // DeleteSnapshot delete a snapshot (todo)
-func (d *Driver) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
-	if len(req.SnapshotId) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "Snapshot ID must be provided")
-	}
-	rgName, accountName, fileShareName, _, _, _, err := GetFileShareInfo(req.SnapshotId) //nolint:dogsled
-	if fileShareName == "" || err != nil {
-		// According to CSI Driver Sanity Tester, should succeed when an invalid snapshot id is used
-		klog.V(4).Infof("failed to get share url with (%s): %v, returning with success", req.SnapshotId, err)
-		return &csi.DeleteSnapshotResponse{}, nil
-	}
-	snapshot, err := getSnapshot(req.SnapshotId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get snapshot name with (%s): %v", req.SnapshotId, err)
-	}
-
-	if rgName == "" {
-		rgName = d.cloud.ResourceGroup
-	}
-	subsID := d.cloud.SubscriptionID
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "controller_delete_snapshot", rgName, subsID, d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, SnapshotID, req.SnapshotId)
-	}()
-
-	var deleteErr error
-	if len(req.GetSecrets()) > 0 {
-		shareURL, err := d.getShareURL(ctx, req.SnapshotId, req.GetSecrets())
-		if err != nil {
-			// According to CSI Driver Sanity Tester, should succeed when an invalid snapshot id is used
-			klog.V(4).Infof("failed to get share url with (%s): %v, returning with success", req.SnapshotId, err)
-			return &csi.DeleteSnapshotResponse{}, nil
-		}
-
-		_, deleteErr = shareURL.WithSnapshot(snapshot).Delete(ctx, azfile.DeleteSnapshotsOptionNone)
-	} else {
-		deleteErr = d.cloud.FileClient.WithSubscriptionID(subsID).DeleteFileShare(ctx, rgName, accountName, fileShareName, snapshot)
-	}
-
-	if deleteErr != nil {
-		if strings.Contains(deleteErr.Error(), "ShareSnapshotNotFound") {
-			klog.Warningf("the specify snapshot(%s) was not found", snapshot)
-			return &csi.DeleteSnapshotResponse{}, nil
-		}
-		return nil, status.Errorf(codes.Internal, "failed to delete snapshot(%s): %v", snapshot, deleteErr)
-	}
-
-	klog.V(2).Infof("delete snapshot(%s) successfully", snapshot)
-	isOperationSucceeded = true
-	return &csi.DeleteSnapshotResponse{}, nil
+func (d *Driver) DeleteSnapshot(_ context.Context, _ *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "Azure File snapshots are TechPreview in 4.18 and snapshot deletion was blocked to prevent data loss. See the following KCS for details and snapshot removal guide: <TBD>")
 }
 
 // ListSnapshots list all snapshots (todo)
