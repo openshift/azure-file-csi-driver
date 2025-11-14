@@ -41,7 +41,7 @@ Microsoft.Network/networkManagers/ipamPools/associateResourcesToPool/action
 
 Name | Meaning | Example | Mandatory | Default value 
 --- | --- | --- | --- | ---
-skuName | Azure file storage account type (alias: `storageAccountType`) | `Standard_LRS`, `Standard_ZRS`, `Standard_GRS`, `Standard_RAGRS`, `Standard_RAGZRS`, `Premium_LRS`, `Premium_ZRS` | No | `Standard_LRS` <br><br> Note:  <br> 1. minimum file share size of Premium account type is `100GB`<br> 2.[`ZRS` account type](https://docs.microsoft.com/en-us/azure/storage/common/storage-redundancy#zone-redundant-storage) is supported in limited regions <br> 3. NFS file share only supports Premium account type
+skuName | Azure file storage account type (alias: `storageAccountType`) | `Standard_LRS`, `Standard_ZRS`, `Standard_GRS`, `Standard_RAGRS`, `Standard_RAGZRS`, `Premium_LRS`, `Premium_ZRS`, `StandardV2_LRS`, `StandardV2_ZRS`, `StandardV2_GRS`, `StandardV2_GZRS`, `PremiumV2_LRS`, `PremiumV2_ZRS` | No | `Standard_LRS` <br><br> Note:  <br> 1. minimum file share size of Premium account type is `100GB`<br> 2.[`ZRS` account type](https://docs.microsoft.com/en-us/azure/storage/common/storage-redundancy#zone-redundant-storage) is supported in limited regions <br> 3. NFS file share only supports Premium account type
 storageAccount | specify Azure storage account name| STORAGE_ACCOUNT_NAME | No | If the driver is not provided with a specific storage account name, it will search for a suitable storage account that matches the account settings within the same resource group. If it cannot find a matching storage account, it will create a new one. However, if a storage account name is specified, the storage account must already exist.
 enableLargeFileShares | indicate whether the storage account should have large file shares enabled or disabled. This parameter should be **only** used on Standard account as Premium account is already enabled by default.  | `true`,`false` | No | `false`
 protocol | file share protocol | `smb`, `nfs` | No | `smb`
@@ -62,6 +62,8 @@ tags | [tags](https://docs.microsoft.com/en-us/azure/azure-resource-manager/mana
 matchTags | whether matching tags when driver tries to find a suitable storage account | `true`,`false` | No | `false`
 selectRandomMatchingAccount | whether randomly selecting a matching account, by default, the driver would always select the first matching account in alphabetical order(note: this driver uses account search cache, which results in uneven distribution of file creation across multiple accounts) | `true`,`false` | No | `false`
 accountQuota | to limit the quota for an account, you can specify a maximum quota in GB (`102400`GB by default). If the account exceeds the specified quota, the driver would skip selecting the account | `` | No | `102400`
+provisionedIOPS | provisioned IOPS for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail) (supported from v1.33.4) | | No | 
+provisionedBandwidth | provisioned throughput (MB/s) for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail)  (supported from v1.33.4)  | | No | 
 --- | **Following parameters are only for SMB protocol** | --- | --- |
 storeAccountKey | Should the storage account key be stored in a Kubernetes secret <br> (Note:  if set to `false`, the driver will use the kubelet identity to obtain the account key) | `true`,`false` | No | `true`
 getLatestAccountKey | whether getting the latest account key based on the creation time, this driver would get the first key by default | `true`,`false` | No | `false`
@@ -73,7 +75,7 @@ enableMultichannel | specify whether enable [SMB multi-channel](https://learn.mi
 allowSharedKeyAccess | Allow or disallow shared key access for storage account created by driver | `true`,`false` | No | `true`
 rootSquashType | specify root squashing behavior on the share. The default is `NoRootSquash` | `AllSquash`, `NoRootSquash`, `RootSquash` | No |
 mountPermissions | mounted folder permissions. The default is `0777`, if set as `0`, driver will not perform `chmod` after mount | `0777` | No |
-encryptInTransit | support encrypt in transit(EiT) for NFS by using [AZNFS-mount helper](https://github.com/Azure/AZNFS-mount) | `true`,`false` | No | `false`
+encryptInTransit | support [Encrypt in Transit(EiT) for NFS (Preview)](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares) | `true`,`false` | No | `false`
 --- | **Following parameters are only for vnet setting, e.g. NFS, private endpoint** | --- | --- |
 vnetResourceGroup | specify vnet resource group where virtual network is | existing resource group name | No | if empty, driver will use the `vnetResourceGroup` value in azure cloud config file
 vnetName | virtual network name | existing virtual network name | No | if empty, driver will use the `vnetName` value in azure cloud config file
@@ -123,7 +125,8 @@ nodeStageSecretRef.namespace | secret namespace | k8s namespace  |  Yes  |
 --- | **Following parameters are only for NFS protocol** | --- | --- |
 volumeAttributes.fsGroupChangePolicy | indicates how volume's ownership will be changed by the driver, pod `securityContext.fsGroupChangePolicy` is ignored  | `OnRootMismatch`(by default), `Always`, `None` | No | `OnRootMismatch`
 volumeAttributes.mountPermissions | mounted folder permissions. The default is `0777` |  | No |
-volumeAttributes.encryptInTransit | support encrypt in transit(EiT) for NFS by using [AZNFS-mount helper](https://github.com/Azure/AZNFS-mount) | `true`,`false` | No | `false`
+volumeAttributes.encryptInTransit | support [Encrypt in Transit(EiT) for NFS (Preview)](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares)| `true`,`false` | No | `false`
+
  - create a Kubernetes secret for `nodeStageSecretRef.name`
  ```console
 kubectl create secret generic azure-storage-account-{accountname}-secret --from-literal=azurestorageaccountname="xxx" --from-literal azurestorageaccountkey="xxx" --type=Opaque

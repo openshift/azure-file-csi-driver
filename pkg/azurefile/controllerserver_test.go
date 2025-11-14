@@ -29,7 +29,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v6"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
+	armstorage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/onsi/ginkgo/v2"
@@ -906,19 +906,26 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 				}
 
 				allParam := map[string]string{
-					skuNameField:            "premium",
-					storageAccountTypeField: "stoacctype",
-					locationField:           "loc",
-					storageAccountField:     "stoacc",
-					resourceGroupField:      "rg",
-					shareNameField:          "",
-					diskNameField:           "diskname.vhd",
-					fsTypeField:             "",
-					storeAccountKeyField:    "storeaccountkey",
-					secretNamespaceField:    "default",
-					mountPermissionsField:   "0755",
-					accountQuotaField:       "1000",
-					useDataPlaneAPIField:    "oauth",
+					skuNameField:                    "premium",
+					storageAccountTypeField:         "stoacctype",
+					locationField:                   "loc",
+					storageAccountField:             "stoacc",
+					resourceGroupField:              "rg",
+					shareNameField:                  "",
+					diskNameField:                   "diskname.vhd",
+					fsTypeField:                     "",
+					storeAccountKeyField:            "storeaccountkey",
+					secretNamespaceField:            "default",
+					mountPermissionsField:           "0755",
+					accountQuotaField:               "1000",
+					useDataPlaneAPIField:            "oauth",
+					clientIDField:                   "client-id",
+					provisionedBandwidthField:       "100",
+					provisionedIopsField:            "800",
+					runtimeClassHandlerField:        "runtime-handler",
+					createFolderIfNotExistField:     "true",
+					confidentialContainerLabelField: "confidential-container-label",
+					mountWithManagedIdentityField:   "true",
 				}
 
 				req := &csi.CreateVolumeRequest{
@@ -1004,42 +1011,72 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 
 		ginkgo.When("invalid mountPermissions", func() {
 			ginkgo.It("should fail", func(ctx context.Context) {
-				name := "baz"
-				SKU := "SKU"
-				kind := "StorageV2"
-				location := "centralus"
-				value := "foo bar"
-				accounts := []*armstorage.Account{
-					{Name: &name, SKU: &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))}, Kind: to.Ptr(armstorage.Kind(kind)), Location: &location},
-				}
-				keys := []*armstorage.AccountKey{
-					{Value: &value},
-				}
-
-				allParam := map[string]string{
-					mountPermissionsField: "0abc",
-				}
-
 				req := &csi.CreateVolumeRequest{
 					Name:               "random-vol-name-valid-request",
 					VolumeCapabilities: stdVolCap,
 					CapacityRange:      lessThanPremCapRange,
-					Parameters:         allParam,
+					Parameters: map[string]string{
+						mountPermissionsField: "0abc",
+					},
 				}
-
-				mockStorageAccountsClient := d.cloud.ComputeClientFactory.GetAccountClient().(*mock_accountclient.MockInterface)
-
-				mockFileClient.EXPECT().Create(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().List(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
-				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
-				mockFileClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
 
 				expectedErr := status.Errorf(codes.InvalidArgument, "invalid %s %s in storage class", "mountPermissions", "0abc")
 				_, err := d.CreateVolume(ctx, req)
 				gomega.Expect(err).To(gomega.Equal(expectedErr))
 			})
 		})
+
+		ginkgo.When("invalid provisionedBandwidth", func() {
+			ginkgo.It("should fail", func(ctx context.Context) {
+				req := &csi.CreateVolumeRequest{
+					Name:               "invalid-provisionedBandwidth",
+					VolumeCapabilities: stdVolCap,
+					CapacityRange:      lessThanPremCapRange,
+					Parameters: map[string]string{
+						provisionedBandwidthField: "abc",
+					},
+				}
+
+				expectedErr := status.Errorf(codes.InvalidArgument, "invalid %s %s in storage class", "provisionedBandwidth", "abc")
+				_, err := d.CreateVolume(ctx, req)
+				gomega.Expect(err).To(gomega.Equal(expectedErr))
+			})
+		})
+
+		ginkgo.When("invalid provisionedIops", func() {
+			ginkgo.It("should fail", func(ctx context.Context) {
+				req := &csi.CreateVolumeRequest{
+					Name:               "invalid-provisionedIops",
+					VolumeCapabilities: stdVolCap,
+					CapacityRange:      lessThanPremCapRange,
+					Parameters: map[string]string{
+						provisionedIopsField: "abc",
+					},
+				}
+
+				expectedErr := status.Errorf(codes.InvalidArgument, "invalid %s %s in storage class", "provisionedIops", "abc")
+				_, err := d.CreateVolume(ctx, req)
+				gomega.Expect(err).To(gomega.Equal(expectedErr))
+			})
+		})
+
+		ginkgo.When("invalid mountWithManagedIdentity", func() {
+			ginkgo.It("should fail", func(ctx context.Context) {
+				req := &csi.CreateVolumeRequest{
+					Name:               "random-vol-name-valid-request",
+					VolumeCapabilities: stdVolCap,
+					CapacityRange:      lessThanPremCapRange,
+					Parameters: map[string]string{
+						mountWithManagedIdentityField: "invalid",
+					},
+				}
+
+				expectedErr := status.Errorf(codes.InvalidArgument, "invalid %s: %s in storage class", mountWithManagedIdentityField, "invalid")
+				_, err := d.CreateVolume(ctx, req)
+				gomega.Expect(err).To(gomega.Equal(expectedErr))
+			})
+		})
+
 		ginkgo.When("invalid parameter", func() {
 			ginkgo.It("should fail", func(ctx context.Context) {
 				name := "baz"
@@ -1412,33 +1449,6 @@ var _ = ginkgo.Describe("TestCopyVolume", func() {
 	ginkgo.AfterEach(func() {
 		ctrl.Finish()
 	})
-	ginkgo.When("restore volume from volumeSnapshot nfs is not supported", func() {
-		ginkgo.It("should fail", func(ctx context.Context) {
-			allParam := map[string]string{}
-
-			volumeSnapshotSource := &csi.VolumeContentSource_SnapshotSource{
-				SnapshotId: "unit-test",
-			}
-			volumeContentSourceSnapshotSource := &csi.VolumeContentSource_Snapshot{
-				Snapshot: volumeSnapshotSource,
-			}
-			volumecontensource := csi.VolumeContentSource{
-				Type: volumeContentSourceSnapshotSource,
-			}
-
-			req := &csi.CreateVolumeRequest{
-				Name:                "random-vol-name-valid-request",
-				VolumeCapabilities:  stdVolCap,
-				CapacityRange:       lessThanPremCapRange,
-				Parameters:          allParam,
-				VolumeContentSource: &volumecontensource,
-			}
-
-			expectedErr := fmt.Errorf("protocol nfs is not supported for snapshot restore")
-			err := d.copyVolume(ctx, req, "", "", []string{}, "", &ShareOptions{Protocol: armstorage.EnabledProtocolsNFS}, nil, "core.windows.net")
-			gomega.Expect(err).To(gomega.Equal(expectedErr))
-		})
-	})
 	ginkgo.When("restore volume from volumeSnapshot not found", func() {
 		ginkgo.It("should fail", func(ctx context.Context) {
 			allParam := map[string]string{}
@@ -1461,7 +1471,7 @@ var _ = ginkgo.Describe("TestCopyVolume", func() {
 				VolumeContentSource: &volumecontensource,
 			}
 
-			expectedErr := status.Errorf(codes.NotFound, "error parsing volume id: \"unit-test\", should at least contain two #")
+			expectedErr := status.Errorf(codes.NotFound, "error parsing snapshot id: \"unit-test\", should at least contain 6 #")
 			err := d.copyVolume(ctx, req, "", "", []string{}, "", &ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 			gomega.Expect(err).To(gomega.Equal(expectedErr))
 		})
@@ -1471,7 +1481,7 @@ var _ = ginkgo.Describe("TestCopyVolume", func() {
 			allParam := map[string]string{}
 
 			volumeSnapshotSource := &csi.VolumeContentSource_SnapshotSource{
-				SnapshotId: "rg#unit-test###",
+				SnapshotId: "rg#unit-test#####snapshot-id",
 			}
 			volumeContentSourceSnapshotSource := &csi.VolumeContentSource_Snapshot{
 				Snapshot: volumeSnapshotSource,
@@ -1490,33 +1500,6 @@ var _ = ginkgo.Describe("TestCopyVolume", func() {
 
 			expectedErr := fmt.Errorf("one or more of srcAccountName(unit-test), srcFileShareName(), dstFileShareName(dstFileshare) are empty")
 			err := d.copyVolume(ctx, req, "", "", []string{}, "", &ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
-			gomega.Expect(err).To(gomega.Equal(expectedErr))
-		})
-	})
-	ginkgo.When("copy volume nfs is not supported", func() {
-		ginkgo.It("should fail", func(ctx context.Context) {
-			allParam := map[string]string{}
-
-			volumeSource := &csi.VolumeContentSource_VolumeSource{
-				VolumeId: "unit-test",
-			}
-			volumeContentSourceVolumeSource := &csi.VolumeContentSource_Volume{
-				Volume: volumeSource,
-			}
-			volumecontensource := csi.VolumeContentSource{
-				Type: volumeContentSourceVolumeSource,
-			}
-
-			req := &csi.CreateVolumeRequest{
-				Name:                "random-vol-name-valid-request",
-				VolumeCapabilities:  stdVolCap,
-				CapacityRange:       lessThanPremCapRange,
-				Parameters:          allParam,
-				VolumeContentSource: &volumecontensource,
-			}
-
-			expectedErr := fmt.Errorf("protocol nfs is not supported for volume cloning")
-			err := d.copyVolume(ctx, req, "", "", []string{}, "", &ShareOptions{Protocol: armstorage.EnabledProtocolsNFS}, nil, "core.windows.net")
 			gomega.Expect(err).To(gomega.Equal(expectedErr))
 		})
 	})
@@ -2019,9 +2002,9 @@ var _ = ginkgo.DescribeTable("DeleteSnapshot", func(req *csi.DeleteSnapshotReque
 		Secrets:    map[string]string{},
 	}, nil),
 	ginkgo.Entry("Invalid Snapshot ID", &csi.DeleteSnapshotRequest{
-		SnapshotId: "testrg#testAccount#testFileShare#testuuid",
+		SnapshotId: "testrg#testAccount#testFileShare#testuuid###",
 		Secrets:    map[string]string{"accountName": "TestAccountName", "accountKey": base64.StdEncoding.EncodeToString([]byte("TestAccountKey"))},
-	}, status.Error(codes.Internal, "failed to get snapshot name with (testrg#testAccount#testFileShare#testuuid): error parsing volume id: \"testrg#testAccount#testFileShare#testuuid\", should at least contain four #"),
+	}, status.Error(codes.Internal, "failed to get snapshot name with (testrg#testAccount#testFileShare#testuuid###): snapshot name is empty"),
 	),
 	ginkgo.Entry("Delete snapshot success", &csi.DeleteSnapshotRequest{
 		SnapshotId: "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#2019-08-22T07:17:53.0000000Z",

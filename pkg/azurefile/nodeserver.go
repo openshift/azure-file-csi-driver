@@ -76,8 +76,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	mountPermissions := d.mountPermissions
 	context := req.GetVolumeContext()
 	if context != nil {
-		// token request
-		if context[serviceAccountTokenField] != "" && getValueInMap(context, clientIDField) != "" {
+		if !strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) && getValueInMap(context, serviceAccountTokenField) != "" && getValueInMap(context, clientIDField) != "" {
 			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s", volumeID, target, getValueInMap(context, clientIDField))
 			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 				StagingTargetPath: target,
@@ -113,40 +112,51 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			}
 		}
 
-		enableKataCCMount := d.isKataNode && d.enableKataCCMount
-		if enableKataCCMount && context[podNameField] != "" && context[podNamespaceField] != "" {
-			runtimeClass, err := getRuntimeClassForPodFunc(ctx, d.kubeClient, context[podNameField], context[podNamespaceField])
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get runtime class for pod %s/%s: %v", context[podNamespaceField], context[podNameField], err)
+		if d.enableKataCCMount && context[podNameField] != "" && context[podNamespaceField] != "" {
+			confidentialContainerLabel := getValueInMap(context, confidentialContainerLabelField)
+			if !d.isKataNode && confidentialContainerLabel != "" {
+				klog.V(2).Infof("NodePublishVolume: checking if node %s is a kata node with confidential container label %s", d.NodeID, confidentialContainerLabel)
+				d.isKataNode = isKataNode(ctx, d.NodeID, confidentialContainerLabel, d.kubeClient)
 			}
-			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with runtimeClass %s", volumeID, target, runtimeClass)
-			isConfidentialRuntimeClass, err := isConfidentialRuntimeClassFunc(ctx, d.kubeClient, runtimeClass)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to check if runtime class %s is confidential: %v", runtimeClass, err)
-			}
-			if isConfidentialRuntimeClass {
-				klog.V(2).Infof("NodePublishVolume for volume(%s) where runtimeClass is %s", volumeID, runtimeClass)
-				source := req.GetStagingTargetPath()
-				if len(source) == 0 {
-					return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
-				}
-				// Load the mount info from staging area
-				mountInfo, err := d.directVolume.VolumeMountInfo(source)
+
+			if d.isKataNode {
+				runtimeClass, err := getRuntimeClassForPodFunc(ctx, d.kubeClient, context[podNameField], context[podNamespaceField])
 				if err != nil {
-					return nil, status.Errorf(codes.Internal, "failed to load mount info from %s: %v", source, err)
+					return nil, status.Errorf(codes.Internal, "failed to get runtime class for pod %s/%s: %v", context[podNamespaceField], context[podNameField], err)
 				}
-				if mountInfo == nil {
-					return nil, status.Errorf(codes.Internal, "mount info is nil for volume %s", volumeID)
+				klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with runtimeClass %s", volumeID, target, runtimeClass)
+				runtimeClassHandler := getValueInMap(context, runtimeClassHandlerField)
+				if runtimeClassHandler == "" {
+					runtimeClassHandler = defaultRuntimeClassHandler
 				}
-				data, err := json.Marshal(mountInfo)
+				isConfidentialRuntimeClass, err := isConfidentialRuntimeClassFunc(ctx, d.kubeClient, runtimeClass, runtimeClassHandler)
 				if err != nil {
-					return nil, status.Errorf(codes.Internal, "failed to marshal mount info %s: %v", source, err)
+					return nil, status.Errorf(codes.Internal, "failed to check if runtime class %s is confidential: %v", runtimeClass, err)
 				}
-				if err = d.directVolume.Add(target, string(data)); err != nil {
-					return nil, status.Errorf(codes.Internal, "failed to save mount info %s: %v", target, err)
+				if isConfidentialRuntimeClass {
+					klog.V(2).Infof("NodePublishVolume for volume(%s) where runtimeClass is %s", volumeID, runtimeClass)
+					source := req.GetStagingTargetPath()
+					if len(source) == 0 {
+						return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
+					}
+					// Load the mount info from staging area
+					mountInfo, err := d.directVolume.VolumeMountInfo(source)
+					if err != nil {
+						return nil, status.Errorf(codes.Internal, "failed to load mount info from %s: %v", source, err)
+					}
+					if mountInfo == nil {
+						return nil, status.Errorf(codes.Internal, "mount info is nil for volume %s", volumeID)
+					}
+					data, err := json.Marshal(mountInfo)
+					if err != nil {
+						return nil, status.Errorf(codes.Internal, "failed to marshal mount info %s: %v", source, err)
+					}
+					if err = d.directVolume.Add(target, string(data)); err != nil {
+						return nil, status.Errorf(codes.Internal, "failed to save mount info %s: %v", target, err)
+					}
+					klog.V(2).Infof("NodePublishVolume: direct volume mount %s at %s successfully", source, target)
+					return &csi.NodePublishVolumeResponse{}, nil
 				}
-				klog.V(2).Infof("NodePublishVolume: direct volume mount %s at %s successfully", source, target)
-				return &csi.NodePublishVolumeResponse{}, nil
 			}
 		}
 	}
@@ -202,11 +212,15 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return nil, status.Errorf(codes.Internal, "failed to unmount target %s: %v", targetPath, err)
 	}
 
-	if d.enableKataCCMount {
+	if d.enableKataCCMount && d.isKataNode {
 		klog.V(2).Infof("NodeUnpublishVolume: remove direct volume mount info %s from %s", volumeID, targetPath)
 		// Remove deletes the direct volume path including all the files inside it.
 		// if there is no kata-cc mountinfo present on this path, it will return nil.
 		if err := d.directVolume.Remove(targetPath); err != nil {
+			if strings.Contains(err.Error(), "file name too long") {
+				klog.Warningf("NodeUnpublishVolume: direct volume mount info %s not found on %s, ignoring error", volumeID, targetPath)
+				return &csi.NodeUnpublishVolumeResponse{}, nil
+			}
 			return nil, status.Errorf(codes.Internal, "failed to direct volume remove mount info %s: %v", targetPath, err)
 		}
 	}
@@ -233,7 +247,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	volumeID := req.GetVolumeId()
 	context := req.GetVolumeContext()
 
-	if getValueInMap(context, clientIDField) != "" && context[serviceAccountTokenField] == "" {
+	if getValueInMap(context, clientIDField) != "" && !strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) && getValueInMap(context, serviceAccountTokenField) == "" {
 		klog.V(2).Infof("Skip NodeStageVolume for volume(%s) since clientID %s is provided but service account token is empty", volumeID, getValueInMap(context, clientIDField))
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
@@ -262,9 +276,8 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 	// don't respect fsType from req.GetVolumeCapability().GetMount().GetFsType()
 	// since it's ext4 by default on Linux
-	var fsType, server, protocol, ephemeralVolMountOptions, storageEndpointSuffix, folderName string
-	var ephemeralVol bool
-	var encryptInTransit bool
+	var fsType, server, protocol, ephemeralVolMountOptions, storageEndpointSuffix, folderName, clientID string
+	var ephemeralVol, createFolderIfNotExist, encryptInTransit, mountWithManagedIdentity bool
 	fileShareNameReplaceMap := map[string]string{}
 
 	mountPermissions := d.mountPermissions
@@ -280,6 +293,8 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			diskName = v
 		case folderNameField:
 			folderName = v
+		case createFolderIfNotExistField:
+			createFolderIfNotExist = strings.EqualFold(v, trueValue)
 		case serverNameField:
 			server = v
 		case ephemeralField:
@@ -298,7 +313,6 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			fileShareNameReplaceMap[pvNameMetadata] = v
 		case mountPermissionsField:
 			if v != "" {
-				var err error
 				var perm uint64
 				if perm, err = strconv.ParseUint(v, 8, 32); err != nil {
 					return nil, status.Errorf(codes.InvalidArgument, "invalid mountPermissions %s", v)
@@ -310,11 +324,17 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 				}
 			}
 		case encryptInTransitField:
-			var err error
 			encryptInTransit, err = strconv.ParseBool(v)
 			if err != nil {
 				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
 			}
+		case mountWithManagedIdentityField:
+			mountWithManagedIdentity, err = strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
+			}
+		case clientIDField:
+			clientID = v
 		}
 	}
 
@@ -357,6 +377,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		source = fmt.Sprintf("%s:/%s/%s", server, accountName, fileShareName)
 	}
 	if folderName != "" {
+		if createFolderIfNotExist {
+			if err := d.createFolderIfNotExists(ctx, accountName, accountKey, fileShareName, folderName, storageEndpointSuffix); err != nil {
+				klog.Warningf("Failed to create folder %s in share %s: %v", folderName, fileShareName, err)
+				// Continue with mounting - folder might already exist or be created by other means
+			}
+		}
 		source = fmt.Sprintf("%s%s%s", source, osSeparator, folderName)
 	}
 
@@ -379,18 +405,29 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		mountOptions = util.JoinMountOptions(mountFlags, []string{"vers=4,minorversion=1,sec=sys"})
 		mountOptions = appendDefaultNfsMountOptions(mountOptions, d.appendNoResvPortOption, d.appendActimeoOption)
 	} else {
-		if accountName == "" || accountKey == "" {
-			return nil, status.Errorf(codes.Internal, "accountName(%s) or accountKey is empty", accountName)
-		}
-		if runtime.GOOS == "windows" {
-			mountOptions = []string{fmt.Sprintf("AZURE\\%s", accountName)}
-			sensitiveMountOptions = []string{accountKey}
-		} else {
-			if err := os.MkdirAll(targetPath, os.FileMode(mountPermissions)); err != nil {
-				return nil, status.Error(codes.Internal, fmt.Sprintf("MkdirAll %s failed with error: %v", targetPath, err))
+		if mountWithManagedIdentity && runtime.GOOS != "windows" {
+			if clientID == "" {
+				clientID = d.cloud.Config.AzureAuthConfig.UserAssignedIdentityID
 			}
-			// parameters suggested by https://azure.microsoft.com/en-us/documentation/articles/storage-how-to-use-files-linux/
-			sensitiveMountOptions = []string{fmt.Sprintf("username=%s,password=%s", accountName, accountKey)}
+			sensitiveMountOptions = []string{"sec=krb5,cruid=0,upcall_target=mount", fmt.Sprintf("username=%s", clientID)}
+			klog.V(2).Infof("using managed identity %s for volume %s with mount options: %v", clientID, volumeID, sensitiveMountOptions)
+		} else {
+			if accountName == "" || accountKey == "" {
+				return nil, status.Errorf(codes.Internal, "accountName(%s) or accountKey is empty", accountName)
+			}
+			if runtime.GOOS == "windows" {
+				mountOptions = []string{fmt.Sprintf("AZURE\\%s", accountName)}
+				sensitiveMountOptions = []string{accountKey}
+			} else {
+				if err := os.MkdirAll(targetPath, os.FileMode(mountPermissions)); err != nil {
+					return nil, status.Error(codes.Internal, fmt.Sprintf("MkdirAll %s failed with error: %v", targetPath, err))
+				}
+				// parameters suggested by https://azure.microsoft.com/en-us/documentation/articles/storage-how-to-use-files-linux/
+				sensitiveMountOptions = []string{fmt.Sprintf("username=%s,password=%s", accountName, accountKey)}
+			}
+		}
+
+		if runtime.GOOS != "windows" {
 			if ephemeralVol {
 				cifsMountFlags = util.JoinMountOptions(cifsMountFlags, strings.Split(ephemeralVolMountOptions, ","))
 			}
@@ -434,6 +471,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			klog.V(2).Infof("mount with proxy succeeded for %s", cifsMountPath)
 		} else {
 			execFunc := func() error {
+				if mountWithManagedIdentity && protocol != nfs && runtime.GOOS != "windows" {
+					if out, err := setCredentialCache(server, clientID); err != nil {
+						return fmt.Errorf("setCredentialCache failed for %s with error: %v, output: %s", server, err, out)
+					}
+				}
 				return SMBMount(d.mounter, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions)
 			}
 			timeoutFunc := func() error { return fmt.Errorf("time out") }
@@ -456,9 +498,9 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		}
 		klog.V(2).Infof("volume(%s) mount %s on %s succeeded", volumeID, source, cifsMountPath)
 	}
-	enableKataCCMount := d.isKataNode && d.enableKataCCMount
+
 	// If runtime OS is not windows and protocol is not nfs, save mountInfo.json
-	if enableKataCCMount {
+	if d.enableKataCCMount && d.isKataNode {
 		if runtime.GOOS != "windows" && protocol != nfs {
 			// Check if mountInfo.json is already present at the targetPath
 			isMountInfoPresent, err := d.directVolume.VolumeMountInfo(cifsMountPath)
@@ -569,7 +611,7 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 		}
 	}
 
-	if d.enableKataCCMount {
+	if d.enableKataCCMount && d.isKataNode {
 		klog.V(2).Infof("NodeUnstageVolume: remove direct volume mount info %s from %s", volumeID, stagingTargetPath)
 		if err := d.directVolume.Remove(stagingTargetPath); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to remove mount info %s: %v", stagingTargetPath, err)

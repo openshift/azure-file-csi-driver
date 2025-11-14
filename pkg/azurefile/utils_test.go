@@ -806,7 +806,7 @@ func TestIsConfidentialRuntimeClass(t *testing.T) {
 	ctx := context.TODO()
 
 	// Test the case where kubeClient is nil
-	_, err := isConfidentialRuntimeClass(ctx, nil, "test-runtime-class")
+	_, err := isConfidentialRuntimeClass(ctx, nil, "test-runtime-class", defaultRuntimeClassHandler)
 	if err == nil || err.Error() != "kubeClient is nil" {
 		t.Fatalf("expected error 'kubeClient is nil', got %v", err)
 	}
@@ -819,14 +819,14 @@ func TestIsConfidentialRuntimeClass(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-runtime-class",
 		},
-		Handler: confidentialRuntimeClassHandler,
+		Handler: defaultRuntimeClassHandler,
 	}
 	_, err = clientset.NodeV1().RuntimeClasses().Create(ctx, runtimeClass, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	isConfidential, err := isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class")
+	isConfidential, err := isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class", defaultRuntimeClassHandler)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -847,7 +847,7 @@ func TestIsConfidentialRuntimeClass(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	isConfidential, err = isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class-non-confidential")
+	isConfidential, err = isConfidentialRuntimeClass(ctx, clientset, "test-runtime-class-non-confidential", defaultRuntimeClassHandler)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -857,7 +857,7 @@ func TestIsConfidentialRuntimeClass(t *testing.T) {
 	}
 
 	// Test the case where the runtime class does not exist
-	_, err = isConfidentialRuntimeClass(ctx, clientset, "nonexistent-runtime-class")
+	_, err = isConfidentialRuntimeClass(ctx, clientset, "nonexistent-runtime-class", defaultRuntimeClassHandler)
 	if err == nil {
 		t.Fatalf("expected an error, got nil")
 	}
@@ -1148,4 +1148,253 @@ func TestRemoveOptionIfExists(t *testing.T) {
 			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, exists, test.expected)
 		}
 	}
+}
+
+func TestGetDefaultIOPS(t *testing.T) {
+	tests := []struct {
+		desc               string
+		requestGiB         int
+		storageAccountType string
+		expected           *int32
+	}{
+		{
+			desc:               "standardv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1020),
+		},
+		{
+			desc:               "standardv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1001),
+		},
+		{
+			desc:               "standardv2 with large storage hitting max",
+			requestGiB:         300000,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(50000),
+		},
+		{
+			desc:               "standardv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "STANDARDV2",
+			expected:           int32Ptr(1020),
+		},
+		{
+			desc:               "premiumv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3100),
+		},
+		{
+			desc:               "premiumv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3001),
+		},
+		{
+			desc:               "premiumv2 with large storage hitting max",
+			requestGiB:         200000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(102400),
+		},
+		{
+			desc:               "premiumv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "PREMIUMV2",
+			expected:           int32Ptr(3100),
+		},
+		{
+			desc:               "unsupported storage account type",
+			requestGiB:         100,
+			storageAccountType: "Standard_LRS",
+			expected:           nil,
+		},
+		{
+			desc:               "empty storage account type",
+			requestGiB:         100,
+			storageAccountType: "",
+			expected:           nil,
+		},
+		{
+			desc:               "standardv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(1000),
+		},
+		{
+			desc:               "premiumv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(3000),
+		},
+	}
+
+	for _, test := range tests {
+		result := getDefaultIOPS(test.requestGiB, test.storageAccountType)
+		if test.expected == nil {
+			if result != nil {
+				t.Errorf("test[%s]: unexpected output: %v, expected nil", test.desc, *result)
+			}
+		} else {
+			if result == nil {
+				t.Errorf("test[%s]: unexpected nil output, expected: %v", test.desc, *test.expected)
+			} else if *result != *test.expected {
+				t.Errorf("test[%s]: unexpected output: %v, expected: %v", test.desc, *result, *test.expected)
+			}
+		}
+	}
+}
+
+func TestGetDefaultBandwidth(t *testing.T) {
+	tests := []struct {
+		desc               string
+		requestGiB         int
+		storageAccountType string
+		expected           *int32
+	}{
+		{
+			desc:               "standardv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(62),
+		},
+		{
+			desc:               "standardv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(61),
+		},
+		{
+			desc:               "standardv2 with large storage hitting max",
+			requestGiB:         300000,
+			storageAccountType: "StandardV2_LRS_",
+			expected:           int32Ptr(5120),
+		},
+		{
+			desc:               "standardv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "STANDARDV2",
+			expected:           int32Ptr(62),
+		},
+		{
+			desc:               "premiumv2 with small storage",
+			requestGiB:         100,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "premiumv2 with 1GiB storage",
+			requestGiB:         1,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(101),
+		},
+		{
+			desc:               "premiumv2 with large storage hitting max",
+			requestGiB:         200000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(10340),
+		},
+		{
+			desc:               "premiumv2 case insensitive",
+			requestGiB:         100,
+			storageAccountType: "PREMIUMV2",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "unsupported storage account type",
+			requestGiB:         100,
+			storageAccountType: "Standard_LRS",
+			expected:           nil,
+		},
+		{
+			desc:               "empty storage account type",
+			requestGiB:         100,
+			storageAccountType: "",
+			expected:           nil,
+		},
+		{
+			desc:               "standardv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(60),
+		},
+		{
+			desc:               "premiumv2 with zero storage",
+			requestGiB:         0,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(100),
+		},
+		{
+			desc:               "standardv2 with storage for exact calculation",
+			requestGiB:         2500,
+			storageAccountType: "StandardV2_LRS",
+			expected:           int32Ptr(110),
+		},
+		{
+			desc:               "premiumv2 with storage for exact calculation",
+			requestGiB:         1000,
+			storageAccountType: "PremiumV2_LRS",
+			expected:           int32Ptr(200),
+		},
+	}
+
+	for _, test := range tests {
+		result := getDefaultBandwidth(test.requestGiB, test.storageAccountType)
+		if test.expected == nil {
+			if result != nil {
+				t.Errorf("test[%s]: unexpected output: %v, expected nil", test.desc, *result)
+			}
+		} else {
+			if result == nil {
+				t.Errorf("test[%s]: unexpected nil output, expected: %v", test.desc, *test.expected)
+			} else if *result != *test.expected {
+				t.Errorf("test[%s]: unexpected output: %v, expected: %v", test.desc, *result, *test.expected)
+			}
+		}
+	}
+}
+
+func TestSetCredentialCache(t *testing.T) {
+	tests := []struct {
+		desc          string
+		server        string
+		clientID      string
+		expectedError string
+	}{
+		{
+			desc:          "empty server",
+			server:        "",
+			clientID:      "test-client-id",
+			expectedError: "server and clientID must be provided",
+		},
+		{
+			desc:          "empty clientID",
+			server:        "test.file.core.windows.net",
+			clientID:      "",
+			expectedError: "server and clientID must be provided",
+		},
+		{
+			desc:          "both empty",
+			server:        "",
+			clientID:      "",
+			expectedError: "server and clientID must be provided",
+		},
+	}
+
+	for _, test := range tests {
+		_, err := setCredentialCache(test.server, test.clientID)
+		if test.expectedError != "" {
+			if err == nil {
+				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
+			} else if !strings.Contains(err.Error(), test.expectedError) {
+				t.Errorf("test[%s]: expected error containing %q, got %v", test.desc, test.expectedError, err)
+			}
+		}
+	}
+}
+
+func int32Ptr(i int32) *int32 {
+	return &i
 }

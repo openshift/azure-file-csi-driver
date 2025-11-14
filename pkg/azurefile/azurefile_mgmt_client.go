@@ -21,7 +21,7 @@ import (
 	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
+	armstorage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/provider/storage"
@@ -62,8 +62,11 @@ func (az *azureFileMgmtClient) CreateFileShare(ctx context.Context, shareOptions
 		az.accountOptions.EnableHTTPSTrafficOnly = false
 	}
 	shareOps := armstorage.FileShare{
-		Name:                to.Ptr(shareOptions.Name),
-		FileShareProperties: &armstorage.FileShareProperties{},
+		Name: to.Ptr(shareOptions.Name),
+		FileShareProperties: &armstorage.FileShareProperties{
+			ProvisionedBandwidthMibps: shareOptions.ProvisionedBandwidthMibps,
+			ProvisionedIops:           shareOptions.ProvisionedIops,
+		},
 	}
 	if shareOptions.RequestGiB > 0 {
 		quota := int32(shareOptions.RequestGiB)

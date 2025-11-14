@@ -117,7 +117,7 @@ func mockGetRuntimeClassForPod(_ context.Context, _ clientset.Interface, _, _ st
 	return "mockRuntimeClass", nil
 }
 
-func mockIsConfidentialRuntimeClass(_ context.Context, _ clientset.Interface, _ string) (bool, error) {
+func mockIsConfidentialRuntimeClass(_ context.Context, _ clientset.Interface, _ string, _ string) (bool, error) {
 	return true, nil
 }
 
@@ -347,6 +347,7 @@ func TestNodeUnpublishVolume(t *testing.T) {
 			},
 			setup: func() {
 				if runtime.GOOS == "windows" {
+					d.isKataNode = true
 					mockDirectVolume.EXPECT().Remove(errorTarget).Return(nil)
 				}
 			},
@@ -355,6 +356,7 @@ func TestNodeUnpublishVolume(t *testing.T) {
 			desc: "[Success] Valid request",
 			req:  &csi.NodeUnpublishVolumeRequest{TargetPath: targetFile, VolumeId: "vol_1"},
 			setup: func() {
+				d.isKataNode = true
 				mockDirectVolume.EXPECT().Remove(targetFile).Return(nil)
 			},
 			expectedErr: testutil.TestError{},
@@ -552,6 +554,19 @@ func TestNodeStageVolume(t *testing.T) {
 				}},
 			expectedErr: testutil.TestError{
 				DefaultError: status.Error(codes.InvalidArgument, "fsGroupChangePolicy(test_fsGroupChangePolicy) is not supported, supported fsGroupChangePolicy list: [None Always OnRootMismatch]"),
+			},
+		},
+		{
+			desc: "[Error] Invalid mountWithManagedIdentity",
+			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1", StagingTargetPath: sourceTest,
+				VolumeCapability: &stdVolCap,
+				VolumeContext: map[string]string{
+					mountWithManagedIdentityField: "invalid",
+					shareNameField:                "test_sharename",
+					serverNameField:               "test_servername",
+				}},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Errorf(codes.InvalidArgument, "GetAccountInfo(vol_1) failed with error: invalid %s: %s in volume context", mountWithManagedIdentityField, "invalid"),
 			},
 		},
 		{
@@ -898,6 +913,7 @@ func TestNodeUnstageVolume(t *testing.T) {
 			},
 			setup: func() {
 				if runtime.GOOS == "windows" {
+					d.isKataNode = true
 					mockDirectVolume.EXPECT().Remove(errorTarget).Return(nil)
 				}
 			},
@@ -906,6 +922,7 @@ func TestNodeUnstageVolume(t *testing.T) {
 			desc: "[Success] Valid request",
 			req:  &csi.NodeUnstageVolumeRequest{StagingTargetPath: targetFile, VolumeId: "vol_1"},
 			setup: func() {
+				d.isKataNode = true
 				mockDirectVolume.EXPECT().Remove(targetFile).Return(nil)
 			},
 			expectedErr: testutil.TestError{},

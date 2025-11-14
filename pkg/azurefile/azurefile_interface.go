@@ -19,7 +19,7 @@ package azurefile
 import (
 	"context"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage"
+	armstorage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
 )
 
 const (
@@ -38,6 +38,11 @@ type ShareOptions struct {
 	RootSquash string
 	// Metadata - A name-value pair to associate with the share as metadata.
 	Metadata map[string]*string
+	// The provisioned bandwidth of the share, in mebibytes per second. This property is only for file shares created under Files
+	// Provisioned v2 account type
+	ProvisionedBandwidthMibps *int32
+	// The provisioned IOPS of the share. This property is only for file shares created under Files Provisioned v2 account type.
+	ProvisionedIops *int32
 }
 
 type azureFileClient interface {
