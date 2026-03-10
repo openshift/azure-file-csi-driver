@@ -19,6 +19,7 @@ package azurefile
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -39,6 +40,7 @@ import (
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	mount_azurefile "sigs.k8s.io/azurefile-csi-driver/pkg/azurefile-proxy/pb"
+	csiMetrics "sigs.k8s.io/azurefile-csi-driver/pkg/metrics"
 	volumehelper "sigs.k8s.io/azurefile-csi-driver/pkg/util"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
@@ -58,7 +60,12 @@ func NewMountClient(cc *grpc.ClientConn) *MountClient {
 }
 
 // NodePublishVolume mount the volume from staging to target path
-func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (resp *csi.NodePublishVolumeResponse, returnedErr error) {
+	csiMC := csiMetrics.NewCSIMetricContext("node_publish_volume")
+	defer func() {
+		csiMC.Observe(returnedErr == nil)
+	}()
+
 	volCap := req.GetVolumeCapability()
 	if volCap == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
@@ -76,8 +83,8 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	mountPermissions := d.mountPermissions
 	context := req.GetVolumeContext()
 	if context != nil {
-		if !strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) && getValueInMap(context, serviceAccountTokenField) != "" && getValueInMap(context, clientIDField) != "" {
-			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s", volumeID, target, getValueInMap(context, clientIDField))
+		if getValueInMap(context, serviceAccountTokenField) != "" && shouldUseServiceAccountToken(context) {
+			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s, mountWithWIToken: %s", volumeID, target, getValueInMap(context, clientIDField), getValueInMap(context, mountWithWITokenField))
 			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 				StagingTargetPath: target,
 				VolumeContext:     context,
@@ -197,7 +204,12 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 }
 
 // NodeUnpublishVolume unmount the volume from the target path
-func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (resp *csi.NodeUnpublishVolumeResponse, returnedErr error) {
+	csiMC := csiMetrics.NewCSIMetricContext("node_unpublish_volume")
+	defer func() {
+		csiMC.Observe(returnedErr == nil)
+	}()
+
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
@@ -224,14 +236,19 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 			return nil, status.Errorf(codes.Internal, "failed to direct volume remove mount info %s: %v", targetPath, err)
 		}
 	}
-
 	klog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
 // NodeStageVolume mount the volume to a staging path
-func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (resp *csi.NodeStageVolumeResponse, returnedErr error) {
+	requestName := "node_stage_volume"
+	csiMC := csiMetrics.NewCSIMetricContext(requestName)
+	defer func() {
+		csiMC.Observe(returnedErr == nil)
+	}()
+
 	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
 	}
@@ -247,8 +264,8 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	volumeID := req.GetVolumeId()
 	context := req.GetVolumeContext()
 
-	if getValueInMap(context, clientIDField) != "" && !strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) && getValueInMap(context, serviceAccountTokenField) == "" {
-		klog.V(2).Infof("Skip NodeStageVolume for volume(%s) since clientID %s is provided but service account token is empty", volumeID, getValueInMap(context, clientIDField))
+	if getValueInMap(context, serviceAccountTokenField) == "" && shouldUseServiceAccountToken(context) {
+		klog.V(2).Infof("Skip NodeStageVolume for volume(%s) since clientID(%s) or mountWithWIToken(%s) is provided but service account token is empty", volumeID, getValueInMap(context, clientIDField), getValueInMap(context, mountWithWITokenField))
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -261,13 +278,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		klog.V(2).Infof("CSI volume is read-only, mounting with extra option ro")
 	}
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_stage_volume", d.cloud.ResourceGroup, "", d.Name)
-	isOperationSucceeded := false
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, requestName, d.cloud.ResourceGroup, "", d.Name)
 	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
+		mc.ObserveOperationWithResult(returnedErr == nil, VolumeID, volumeID)
 	}()
 
-	_, accountName, accountKey, fileShareName, diskName, _, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), context)
+	_, accountName, accountKey, fileShareName, diskName, _, tenantID, tokenFilePath, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), context)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("GetAccountInfo(%s) failed with error: %v", volumeID, err))
 	}
@@ -277,7 +293,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	// don't respect fsType from req.GetVolumeCapability().GetMount().GetFsType()
 	// since it's ext4 by default on Linux
 	var fsType, server, protocol, ephemeralVolMountOptions, storageEndpointSuffix, folderName, clientID string
-	var ephemeralVol, createFolderIfNotExist, encryptInTransit, mountWithManagedIdentity bool
+	var ephemeralVol, createFolderIfNotExist, encryptInTransit, mountWithManagedIdentity, mountWithWIToken bool
 	fileShareNameReplaceMap := map[string]string{}
 
 	mountPermissions := d.mountPermissions
@@ -333,6 +349,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			if err != nil {
 				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
 			}
+		case mountWithWITokenField:
+			mountWithWIToken, err = strconv.ParseBool(v)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Volume context property %q must be a boolean value: %v", k, err))
+			}
 		case clientIDField:
 			clientID = v
 		}
@@ -352,6 +373,10 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 	if !isSupportedFSGroupChangePolicy(fsGroupChangePolicy) {
 		return nil, status.Errorf(codes.InvalidArgument, "fsGroupChangePolicy(%s) is not supported, supported fsGroupChangePolicy list: %v", fsGroupChangePolicy, supportedFSGroupChangePolicyList)
+	}
+
+	if mountWithManagedIdentity && mountWithWIToken {
+		return nil, status.Error(codes.InvalidArgument, "mountWithManagedIdentity and mountWithWIToken cannot be both true")
 	}
 
 	lockKey := fmt.Sprintf("%s-%s", volumeID, targetPath)
@@ -405,12 +430,22 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		mountOptions = util.JoinMountOptions(mountFlags, []string{"vers=4,minorversion=1,sec=sys"})
 		mountOptions = appendDefaultNfsMountOptions(mountOptions, d.appendNoResvPortOption, d.appendActimeoOption)
 	} else {
+		if (mountWithManagedIdentity || mountWithWIToken) && clientID == "" {
+			clientID = d.cloud.Config.AzureAuthConfig.UserAssignedIdentityID
+		}
+
 		if mountWithManagedIdentity && runtime.GOOS != "windows" {
-			if clientID == "" {
-				clientID = d.cloud.Config.AzureAuthConfig.UserAssignedIdentityID
-			}
 			sensitiveMountOptions = []string{"sec=krb5,cruid=0,upcall_target=mount", fmt.Sprintf("username=%s", clientID)}
 			klog.V(2).Infof("using managed identity %s for volume %s with mount options: %v", clientID, volumeID, sensitiveMountOptions)
+		} else if mountWithWIToken && runtime.GOOS != "windows" {
+			sensitiveMountOptions = []string{"sec=krb5,cruid=0,upcall_target=mount"}
+			klog.V(2).Infof("using workload identity token for volume %s with mount options: %v", volumeID, sensitiveMountOptions)
+			if tokenFilePath != "" {
+				// always set credential cache when token file is provided even mount does not happen
+				if out, err := setCredentialCache(server, clientID, tenantID, tokenFilePath); err != nil {
+					return nil, status.Errorf(codes.Internal, "setCredentialCache failed for %s with error: %v, output: %s", server, err, out)
+				}
+			}
 		} else {
 			if accountName == "" || accountKey == "" {
 				return nil, status.Errorf(codes.Internal, "accountName(%s) or accountKey is empty", accountName)
@@ -472,14 +507,16 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		} else {
 			execFunc := func() error {
 				if mountWithManagedIdentity && protocol != nfs && runtime.GOOS != "windows" {
-					if out, err := setCredentialCache(server, clientID); err != nil {
+					if out, err := setCredentialCache(server, clientID, tenantID, tokenFilePath); err != nil {
 						return fmt.Errorf("setCredentialCache failed for %s with error: %v, output: %s", server, err, out)
 					}
 				}
 				return SMBMount(d.mounter, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions)
 			}
-			timeoutFunc := func() error { return fmt.Errorf("time out") }
-			if err := volumehelper.WaitUntilTimeout(90*time.Second, execFunc, timeoutFunc); err != nil {
+			timeoutFunc := func() error {
+				return fmt.Errorf("mount operation timed out after %d seconds: source=%s, target=%s", MountTimeoutInSec, source, cifsMountPath)
+			}
+			if err := volumehelper.WaitUntilTimeout(MountTimeoutInSec*time.Second, execFunc, timeoutFunc); err != nil {
 				var helpLinkMsg string
 				if d.appendMountErrorHelpLink {
 					helpLinkMsg = "\nPlease refer to http://aka.ms/filemounterror for possible causes and solutions for mount errors."
@@ -571,12 +608,18 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		}
 	}
 
-	isOperationSucceeded = true
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 // NodeUnstageVolume unmount the volume from the staging path
 func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	requestName := "node_unstage_volume"
+	csiMC := csiMetrics.NewCSIMetricContext(requestName)
+	isOperationSucceeded := false
+	defer func() {
+		csiMC.Observe(isOperationSucceeded)
+	}()
+
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in request")
@@ -592,8 +635,7 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 	}
 	defer d.volumeLocks.Release(lockKey)
 
-	mc := metrics.NewMetricContext(azureFileCSIDriverName, "node_unstage_volume", d.cloud.ResourceGroup, "", d.Name)
-	isOperationSucceeded := false
+	mc := metrics.NewMetricContext(azureFileCSIDriverName, requestName, d.cloud.ResourceGroup, "", d.Name)
 	defer func() {
 		mc.ObserveOperationWithResult(isOperationSucceeded, VolumeID, volumeID)
 	}()
@@ -759,7 +801,16 @@ func (d *Driver) ensureMountPoint(target string, perm os.FileMode) (bool, error)
 
 	if !notMnt {
 		// testing original mount point, make sure the mount link is valid
-		_, err := os.ReadDir(target)
+		// Use ReadDir(1) instead of full os.ReadDir to avoid expensive directory listing
+		f, err := os.Open(target)
+		if err == nil {
+			defer f.Close()
+			_, err = f.ReadDir(1)
+			// EOF means empty directory, which is valid
+			if err == io.EOF {
+				err = nil
+			}
+		}
 		if err == nil {
 			klog.V(2).Infof("already mounted to target %s", target)
 			return !notMnt, nil
@@ -781,7 +832,6 @@ func (d *Driver) ensureMountPoint(target string, perm os.FileMode) (bool, error)
 }
 
 func (d *Driver) mountWithProxy(ctx context.Context, source, target, fsType string, options, sensitiveMountOptions []string) error {
-	klog.V(2).Infof("start connecting to azurefile proxy")
 	conn, err := grpc.NewClient(d.azurefileProxyEndpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		klog.Error("failed to connect to azurefile proxy:", err)
@@ -792,7 +842,6 @@ func (d *Driver) mountWithProxy(ctx context.Context, source, target, fsType stri
 			klog.Error("failed to close connection to azurefile proxy:", err)
 		}
 	}()
-	klog.V(2).Infof("connected to azurefile proxy successfully")
 
 	mountClient := NewMountClient(conn)
 	mountreq := mount_azurefile.MountAzureFileRequest{
@@ -803,12 +852,20 @@ func (d *Driver) mountWithProxy(ctx context.Context, source, target, fsType stri
 		SensitiveOptions: sensitiveMountOptions,
 	}
 	klog.V(2).Infof("begin to mount with azurefile proxy, source: %s, target: %s, fstype: %s, mountOptions: %v", source, target, fsType, options)
-	_, err = mountClient.service.MountAzureFile(ctx, &mountreq)
-	if err != nil {
-		klog.Error("GRPC call returned with an error:", err)
+	newCtx, cancel := context.WithTimeout(ctx, MountTimeoutInSec*time.Second)
+	defer cancel()
+	execFunc := func() error {
+		_, err := mountClient.service.MountAzureFile(newCtx, &mountreq)
 		return err
 	}
+	timeoutFunc := func() error {
+		return fmt.Errorf("mount with azurefile proxy timed out after %d seconds: source=%s, target=%s", MountTimeoutInSec, source, target)
+	}
 
+	if err = volumehelper.WaitUntilTimeout(MountTimeoutInSec*time.Second, execFunc, timeoutFunc); err != nil {
+		klog.Error("GRPC call returned with an error:", err)
+	}
+	klog.V(2).Infof("mount %s on %s with azurefile proxy completed with error: %v", source, target, err)
 	return err
 }
 
@@ -827,6 +884,17 @@ func checkGidPresentInMountFlags(mountFlags []string) bool {
 		if strings.HasPrefix(mountFlag, "gid") {
 			return true
 		}
+	}
+	return false
+}
+
+// shouldUseServiceAccountToken determines whether a service account token should be used for authentication based on the volume context attributes.
+func shouldUseServiceAccountToken(attrib map[string]string) bool {
+	if getValueInMap(attrib, mountWithWITokenField) == trueValue {
+		return true
+	}
+	if getValueInMap(attrib, clientIDField) != "" && !strings.EqualFold(getValueInMap(attrib, mountWithManagedIdentityField), trueValue) {
+		return true
 	}
 	return false
 }

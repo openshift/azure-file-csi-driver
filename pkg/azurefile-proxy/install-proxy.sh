@@ -27,18 +27,22 @@ fi
 if [ "${INSTALL_AZNFS_MOUNT}" = "true" ];then
   # install aznfs-mount on ubuntu
   if [ "$DISTRIBUTION" = "ubuntu" ];then
-    AZNFS_VERSION="0.3.15"
-    echo "install aznfs v$AZNFS_VERSION...."
+    if [ -z "${AZNFS_UBUNTU_VERSION}" ]; then
+      AZNFS_UBUNTU_VERSION="3.0.10"
+    fi
+    echo "install aznfs v$AZNFS_UBUNTU_VERSION...."
     # shellcheck disable=SC1091
     $HOST_CMD curl -sSL -O "https://packages.microsoft.com/config/$(. /host/etc/os-release && echo "$ID/$VERSION_ID")/packages-microsoft-prod.deb"
     yes | $HOST_CMD dpkg -i packages-microsoft-prod.deb && $HOST_CMD apt-get update
     $HOST_CMD rm packages-microsoft-prod.deb
-    $HOST_CMD apt-get install -y aznfs="$AZNFS_VERSION"
+    $HOST_CMD apt-get install -y aznfs="$AZNFS_UBUNTU_VERSION" --allow-downgrades
     echo "aznfs-mount installed"
   elif [ "$DISTRIBUTION" = "azurelinux" ];then # install aznfs-mount on azure linux 3.0
-    AZNFS_VERSION="0.1.548"
-    echo "install aznfs v$AZNFS_VERSION...."
-    $HOST_CMD curl -fsSL https://github.com/Azure/AZNFS-mount/releases/download/$AZNFS_VERSION/aznfs_install.sh | $HOST_CMD bash
+    if [ -z "${AZNFS_AZURELINUX_VERSION}" ]; then
+      AZNFS_AZURELINUX_VERSION="0.1.548"
+    fi
+    echo "install aznfs v$AZNFS_AZURELINUX_VERSION...."
+    $HOST_CMD curl -fsSL https://github.com/Azure/AZNFS-mount/releases/download/$AZNFS_AZURELINUX_VERSION/aznfs_install.sh | $HOST_CMD bash
   else
     echo "aznfs-mount is not supported on Linux distribution: $DISTRIBUTION"
     exit 0
@@ -64,8 +68,12 @@ if [ "${INSTALL_AZUREFILE_PROXY}" = "true" ];then
   fi
   if [ "$updateAzurefileProxy" = "true" ];then
     echo "copy azurefile-proxy...."
+    # if it reports "Read-only file system" error here, return as success
+    if ! cp /azurefile-proxy/azurefile-proxy /host/usr/bin/azurefile-proxy --force; then
+      echo "Warning: failed to copy azurefile-proxy, possibly due to read-only file system, continue..."
+      exit 0
+    fi
     rm -rf /host/"$KUBELET_PATH"/plugins/file.csi.azure.com/azurefile-proxy.sock
-    cp /azurefile-proxy/azurefile-proxy /host/usr/bin/azurefile-proxy --force
     chmod 755 /host/usr/bin/azurefile-proxy
   fi
 
@@ -81,7 +89,12 @@ if [ "${INSTALL_AZUREFILE_PROXY}" = "true" ];then
   if [ "$updateService" = "true" ];then
     echo "copy azurefile-proxy.service...."
     mkdir -p /host/usr/lib/systemd/system
-    cp /azurefile-proxy/azurefile-proxy.service /host/usr/lib/systemd/system/azurefile-proxy.service
+
+    # if it reports "Read-only file system" error here, return as success
+    if ! cp /azurefile-proxy/azurefile-proxy.service /host/usr/lib/systemd/system/azurefile-proxy.service; then
+      echo "Warning: failed to copy azurefile-proxy.service, possibly due to read-only file system, continue..."
+      exit 0
+    fi
   fi
 
   $HOST_CMD systemctl daemon-reload

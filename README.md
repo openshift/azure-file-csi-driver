@@ -7,7 +7,6 @@
 
 ### About
 This driver allows Kubernetes to access [Azure File](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-introduction) volume using smb and nfs protocols, csi plugin name: `file.csi.azure.com`.
-> This driver only permits the mounting of SMB file shares using key-based (NTLM v2) authentication, and therefore does not support the maximum security profile of Azure File share settings.  On the other hand, mounting NFS file shares does not require key-based authentication.
 
 Disclaimer: Deploying this driver manually is not an officially supported Microsoft product. For a fully managed and supported experience on Kubernetes, use [AKS with the managed Azure File CSI driver](https://learn.microsoft.com/azure/aks/azure-files-csi).
 
@@ -17,9 +16,9 @@ Disclaimer: Deploying this driver manually is not an officially supported Micros
 |Driver Version  |Image                                                      | supported k8s version |
 |----------------|---------------------------------------------------------- |-----------------------|
 |master branch   |mcr.microsoft.com/k8s/csi/azurefile-csi:latest             | 1.21+                 |
-|v1.34.1         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.34.1 | 1.21+                 |
-|v1.33.4         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.33.4-2 | 1.21+                 |
-|v1.32.6         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.32.6-3 | 1.21+                 |
+|v1.35.0         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.35.0 | 1.21+                 |
+|v1.34.3         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.34.3 | 1.21+                 |
+|v1.33.7         |mcr.microsoft.com/oss/v2/kubernetes-csi/azurefile-csi:v1.33.7 | 1.21+                 |
 
 ### Driver parameters
 Please refer to [driver parameters](./docs/driver-parameters.md)
@@ -52,10 +51,11 @@ This option does not depend on cloud provider config file, supports cross subscr
 ### Features
  - [Windows](./deploy/example/windows)
  - [NFS](./deploy/example/nfs)
- - [Volume Snapshot](./deploy/example/snapshot)
+ - [Volume Snapshot and Restore](./deploy/example/snapshot)
  - [Volume Expansion](./deploy/example/resize)
  - [Volume Cloning](./deploy/example/cloning)
- - [Workload identity](./docs/workload-identity-static-pv-mount.md)
+ - [Mount with workload identity](./docs/workload-identity-static-pv-mount.md)
+ - [Mount with managed identity](./docs/managed-identity-mount.md)
 
 ### Troubleshooting
  - [CSI driver troubleshooting guide](./docs/csi-debug.md) 

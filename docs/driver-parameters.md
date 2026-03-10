@@ -4,11 +4,10 @@
 
 <details><summary>required permissions for CSI driver controller</summary>
 <pre>
- # To grant permissions for following actions, you need to assign both "Storage Account Contributor" role to the CSI driver controller.
+ # To grant permissions for following actions, you need to assign "Storage Account Contributor" role to the CSI driver controller.
 Microsoft.Storage/storageAccounts/read
 Microsoft.Storage/storageAccounts/write
 Microsoft.Storage/storageAccounts/listKeys/action
-Microsoft.Storage/operations/read
 # this is only necessary if the driver creates the storage account with a private endpoint:
 Microsoft.Network/virtualNetworks/join/action
 Microsoft.Network/virtualNetworks/subnets/join/action
@@ -65,12 +64,13 @@ accountQuota | to limit the quota for an account, you can specify a maximum quot
 provisionedIOPS | provisioned IOPS for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail) (supported from v1.33.4) | | No | 
 provisionedBandwidth | provisioned throughput (MB/s) for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail)  (supported from v1.33.4)  | | No | 
 --- | **Following parameters are only for SMB protocol** | --- | --- |
-storeAccountKey | Should the storage account key be stored in a Kubernetes secret <br> (Note:  if set to `false`, the driver will use the kubelet identity to obtain the account key) | `true`,`false` | No | `true`
+storeAccountKey | Should the storage account key be stored in a Kubernetes secret <br> (Note:  if set to `false`, the driver will use the kubelet identity to retrieve the account key during volume mount) | `true`,`false` | No | `true`
 getLatestAccountKey | whether getting the latest account key based on the creation time, this driver would get the first key by default | `true`,`false` | No | `false`
 secretName | specify secret name to store account key | | No |
 secretNamespace | specify the namespace of secret to store account key | `default`,`kube-system`, etc | No | pvc namespace (`csi.storage.k8s.io/pvc/namespace`)
 useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/azure-sdk-for-go/blob/master/storage/share.go) for file share create/delete/resize, this could solve the SRP API throttling issue since data plane API has almost no limit, while it would fail when there is firewall or vnet setting on storage account | `true`,`false` | No | `false`
 enableMultichannel | specify whether enable [SMB multi-channel](https://learn.microsoft.com/en-us/azure/storage/files/files-smb-protocol?tabs=azure-portal#smb-multichannel) for **Premium** storage account <br> Note: this feature is used with `max_channels=4` (or 2,3) mount option | `true`,`false` | No | `false`
+clientID | Specify the Azure client ID that will be used to create the Azure file share | Azure client ID | No | If left empty, the kubelet managed identity will be used when mounting without an account key
 --- | **Following parameters are only for NFS protocol** | --- | --- |
 allowSharedKeyAccess | Allow or disallow shared key access for storage account created by driver | `true`,`false` | No | `true`
 rootSquashType | specify root squashing behavior on the share. The default is `NoRootSquash` | `AllSquash`, `NoRootSquash`, `RootSquash` | No |
@@ -91,9 +91,9 @@ k8s-azure-created-by: azure
 
  - VolumeID(`volumeHandle`) is the identifier of the volume handled by the driver, format of VolumeID: 
 ```
-{resource-group-name}#{account-name}#{file-share-name}#{placeholder}#{uuid}#{secret-namespace}
+{resource-group-name}#{account-name}#{file-share-name}#{placeholder}#{uuid}#{secret-namespace}#{subscription-id}
 ```
- > `placeholder`, `uuid`, `secret-namespace` are optional
+ > `placeholder`, `uuid`, `secret-namespace`, `subscription-id` are optional
 
  - file share name format created by dynamic provisioning(example)
 ```
@@ -120,6 +120,7 @@ volumeAttributes.storageEndpointSuffix | specify Azure storage endpoint suffix |
 volumeAttributes.secretName | secret name that stores storage account name and key | | No |
 volumeAttributes.secretNamespace | secret namespace | `default`,`kube-system`, etc | No | pvc namespace (`csi.storage.k8s.io/pvc/namespace`)
 volumeAttributes.getLatestAccountKey | whether getting the latest account key based on the creation time, this driver would get the first key by default | `true`,`false` | No | `false`
+volumeAttributes.clientID | Specify the Azure client ID that will be used to create the Azure file share | Azure client ID | No | If left empty, the kubelet managed identity will be used when mounting without an account key
 nodeStageSecretRef.name | secret name that stores storage account name and key | existing secret name |  Yes  |
 nodeStageSecretRef.namespace | secret namespace | k8s namespace  |  Yes  |
 --- | **Following parameters are only for NFS protocol** | --- | --- |
@@ -140,9 +141,9 @@ useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/
 
 ### Tips
   - mounting Azure SMB File share requires account key
-    - If you set `storeAccountKey: "false"` in the storage class, the driver will not store the account key as a Kubernetes secret,  the driver will not store the account key as a Kubernetes secret. Instead, it will use the kubelet identity to obtain the account key.
+    - If you set `storeAccountKey: "false"` in the storage class, the driver will not store the account key as a Kubernetes secret,  the driver will not store the account key as a Kubernetes secret. Instead, the driver will use the kubelet identity to retrieve the account key during volume mount (make sure kubelet identity has reader access to the storage account).
     - if the `nodeStageSecretRef` field is not specified in the persistent volume (PV) configuration, the driver will attempt to retrieve the `azure-storage-account-{accountname}-secret` in the pod namespace.
-    - If `azure-storage-account-{accountname}-secret` in the pod namespace does not exist, the driver will use the kubelet identity to retrieve the account key directly from the Azure storage account API, provided that the kubelet identity has reader access to the storage account.
+    - If `azure-storage-account-{accountname}-secret` in the pod namespace does not exist, the driver will use the kubelet identity to obtain the account key during volume mount (make sure kubelet identity has reader access to the storage account).
     > If you have recently rotated the account key, it is important to update the account key stored in the Kubernetes secret. Additionally, the application pods that reference the Azure file volume should be restarted after the secret has been updated. In cases where two pods share the same PVC on the same node, it is necessary to reschedule the pods to a different node without that PVC mounted to ensure that remounting occurs successfully. To safely rotate the account key without experiencing downtime, you can follow the steps outlined [here](https://github.com/kubernetes-sigs/azurefile-csi-driver/issues/1218#issuecomment-1851996062).
   - mounting Azure NFS File share does not require account key, NFS mount access is configured by either of the following settings:
     - `Firewalls and virtual networks`: select `Enabled from selected virtual networks and IP addresses` with same vnet as agent node
@@ -150,6 +151,8 @@ useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/
   - In case a storage account is full, the driver will add a `skip-matching` tag to the account to prevent the creation of new file shares. This tag will remain for 30 minutes after a file share is deleted from the account. If the user wants to use the account immediately, they can manually remove the tag.
   - The default NFS mount options in this driver are `vers=4,minorversion=1,sec=sys`. It is not supported to specify these NFS mount options, including `nfsvers`.
   - when there is a large number of files inside an NFS volume, the process of setting volume ownership can slow down the NFS volume mount when `securityContext.fsGroup` is different from group ownership of volume. By configuring `fsGroupChangePolicy: None` in the `parameters` of storage class or persistent volume, you can bypass the volume ownership setting step, resulting in faster NFS volume mounts.
+       > when the issue is related to setting the volume ownership, the CSI driver logs will display the message: volume_linux.go:128] "Expected group ownership of volume did not match with Gid".
+  - If there are CVEs in the `livenessprobe` and `csi-node-driver-registrar` sidecar images, you can run `kubectl edit ds -n kube-system csi-azurefile-node` to change the `imagePullPolicy` to `Always` for both sidecar containers. This will cause the CSI driver to restart and pull the latest patched images, thereby resolving the CVEs in these sidecar components.
 
 #### `shareName` parameter supports following pv/pvc metadata conversion
 > if `shareName` value contains following strings, it would be converted into corresponding pv/pvc name or namespace
