@@ -748,6 +748,63 @@ func TestReplaceWithMap(t *testing.T) {
 	}
 }
 
+func TestFolderNamePlaceholderExpansion(t *testing.T) {
+	tests := []struct {
+		desc       string
+		folderName string
+		replaceMap map[string]string
+		expected   string
+	}{
+		{
+			desc:       "expand all placeholders in folderName",
+			folderName: pvcNamespaceMetadata + "/" + pvcNameMetadata + "/" + pvNameMetadata,
+			replaceMap: map[string]string{
+				pvcNamespaceMetadata: "test-ns",
+				pvcNameMetadata:      "test-pvc",
+				pvNameMetadata:       "test-pv",
+			},
+			expected: "test-ns/test-pvc/test-pv",
+		},
+		{
+			desc:       "expand partial placeholders",
+			folderName: "static-prefix/" + pvcNameMetadata,
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "static-prefix/my-pvc",
+		},
+		{
+			desc:       "no placeholders in folderName",
+			folderName: "static-folder/subfolder",
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "static-folder/subfolder",
+		},
+		{
+			desc:       "empty folderName",
+			folderName: "",
+			replaceMap: map[string]string{
+				pvcNameMetadata: "my-pvc",
+			},
+			expected: "",
+		},
+		{
+			desc:       "empty replaceMap",
+			folderName: pvcNameMetadata + "/" + pvNameMetadata,
+			replaceMap: map[string]string{},
+			expected:   pvcNameMetadata + "/" + pvNameMetadata,
+		},
+	}
+
+	for _, test := range tests {
+		result := replaceWithMap(test.folderName, test.replaceMap)
+		if result != test.expected {
+			t.Errorf("test[%s]: unexpected output: %v, expected result: %v", test.desc, result, test.expected)
+		}
+	}
+}
+
 func TestIsReadOnlyFromCapability(t *testing.T) {
 	testCases := []struct {
 		name           string
@@ -1386,7 +1443,7 @@ func TestSetCredentialCache(t *testing.T) {
 			clientID:      "",
 			tenantID:      "test-tenant-id",
 			tokenFile:     "test-token-file",
-			expectedError: "clientID must be provided",
+			expectedError: "clientID must be provided when tokenFile is set",
 		},
 		{
 			desc:          "empty tenantID with tokenFile",
@@ -1423,7 +1480,7 @@ func TestSetCredentialCache(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		_, err := setCredentialCache(test.server, test.clientID, test.tenantID, test.tokenFile)
+		_, err := setCredentialCache(test.server, test.clientID, test.tenantID, test.tokenFile, "")
 		if test.expectedError != "" {
 			if err == nil {
 				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
@@ -1433,6 +1490,53 @@ func TestSetCredentialCache(t *testing.T) {
 		}
 		// Note: We don't test successful execution as it requires azfilesauthmanager binary
 		// The actual command execution will fail, but we've validated the argument construction
+	}
+
+	// Test direct token mode
+	tokenTests := []struct {
+		desc          string
+		server        string
+		token         string
+		tokenFile     string
+		expectedError string
+	}{
+		{
+			desc:          "token mode: empty server",
+			server:        "",
+			token:         "test-oauth-token",
+			expectedError: "server must be provided",
+		},
+		{
+			desc:          "token mode: valid token bypasses clientID check",
+			server:        "test.file.core.windows.net",
+			token:         "test-oauth-token",
+			expectedError: "", // Will fail due to missing azfilesauthmanager, but must NOT fail with clientID/tenantID error
+		},
+		{
+			desc:          "both token and tokenFile should fail",
+			server:        "test.file.core.windows.net",
+			token:         "test-oauth-token",
+			tokenFile:     "/tmp/token",
+			expectedError: "token and tokenFile are mutually exclusive",
+		},
+	}
+
+	for _, test := range tokenTests {
+		_, err := setCredentialCache(test.server, "", "", test.tokenFile, test.token)
+		if test.expectedError != "" {
+			if err == nil {
+				t.Errorf("test[%s]: expected error containing %q, got nil", test.desc, test.expectedError)
+			} else if !strings.Contains(err.Error(), test.expectedError) {
+				t.Errorf("test[%s]: expected error containing %q, got %v", test.desc, test.expectedError, err)
+			}
+		} else if err != nil {
+			// Token mode should not return clientID/tenantID validation errors
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "clientID must be provided when tokenFile is set") || strings.Contains(errMsg, "tenantID must be provided") {
+				t.Errorf("test[%s]: token mode should bypass clientID/tenantID validation, got: %v", test.desc, err)
+			}
+			// Other errors (e.g., azfilesauthmanager not found) are expected in test environment
+		}
 	}
 }
 
@@ -1497,6 +1601,55 @@ func TestIsValidTokenFileName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isValidTokenFileName(tc.fileName); got != tc.expected {
 				t.Fatalf("isValidTokenFileName(%q) = %t, want %t", tc.fileName, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestIsValidFolderName(t *testing.T) {
+	tests := []struct {
+		name      string
+		folder    string
+		expectErr bool
+	}{
+		{name: "valid simple", folder: "myfolder", expectErr: false},
+		{name: "valid nested", folder: "a/b/c", expectErr: false},
+		{name: "valid with leading slash", folder: "/myfolder", expectErr: false},
+		{name: "valid with trailing slash", folder: "myfolder/", expectErr: false},
+		{name: "valid with pvc placeholder", folder: "${pvc.metadata.name}", expectErr: false},
+		{name: "empty string is allowed", folder: "", expectErr: false},
+		{name: "backslash", folder: "my\\folder", expectErr: true},
+		{name: "colon", folder: "my:folder", expectErr: true},
+		{name: "asterisk", folder: "my*folder", expectErr: true},
+		{name: "question mark", folder: "my?folder", expectErr: true},
+		{name: "double quote", folder: `my"folder`, expectErr: true},
+		{name: "less than", folder: "my<folder", expectErr: true},
+		{name: "greater than", folder: "my>folder", expectErr: true},
+		{name: "pipe", folder: "my|folder", expectErr: true},
+		{name: "control char", folder: "my\x01folder", expectErr: true},
+		{name: "null byte", folder: "my\x00folder", expectErr: true},
+		{name: "whitespace only", folder: "   ", expectErr: true},
+		{name: "whitespace only segment in path", folder: "a/   /b", expectErr: true},
+		{name: "dot dot segment", folder: "..", expectErr: true},
+		{name: "dot dot in path", folder: "a/../b", expectErr: true},
+		{name: "ends with period", folder: "folder.", expectErr: true},
+		{name: "ends with space", folder: "folder ", expectErr: true},
+		{name: "empty segment", folder: "a//b", expectErr: true},
+		{name: "nested segment ends with period", folder: "a/b./c", expectErr: true},
+		{name: "valid hyphen and underscore", folder: "my-folder_name", expectErr: false},
+		{name: "valid dots in middle", folder: "my.folder.name", expectErr: false},
+		{name: "invalid single dot segment", folder: ".", expectErr: true},
+		{name: "reserved name CON is allowed", folder: "CON", expectErr: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := isValidFolderName(tc.folder)
+			if tc.expectErr && err == nil {
+				t.Fatalf("isValidFolderName(%q) expected error but got nil", tc.folder)
+			}
+			if !tc.expectErr && err != nil {
+				t.Fatalf("isValidFolderName(%q) unexpected error: %v", tc.folder, err)
 			}
 		})
 	}
