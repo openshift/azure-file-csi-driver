@@ -71,6 +71,8 @@ spec:
             - "-csi-address=$(ADDRESS)"
             - "--leader-election"
             - "--leader-election-namespace=kube-system"
+            - "--kube-api-qps=100"
+            - "--kube-api-burst=200"
             - "--retry-interval-max=30m"
           env:
             - name: ADDRESS
