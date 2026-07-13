@@ -42,6 +42,8 @@ const (
 	tagKeyValueDelimiter = "="
 )
 
+var subscriptionIDRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
 // lockMap used to lock on entries
 type lockMap struct {
 	sync.Mutex
@@ -302,6 +304,18 @@ func getValueInMap(m map[string]string, key string) string {
 	return ""
 }
 
+// getSecretNamespace resolves the secret namespace from volume context,
+// falling back to PVC namespace, then to "default".
+func getSecretNamespace(volumeContext map[string]string) string {
+	if ns := getValueInMap(volumeContext, secretNamespaceField); ns != "" {
+		return ns
+	}
+	if ns := getValueInMap(volumeContext, pvcNamespaceKey); ns != "" {
+		return ns
+	}
+	return defaultNamespace
+}
+
 // replaceWithMap replace key with value for str
 func replaceWithMap(str string, m map[string]string) string {
 	for k, v := range m {
@@ -361,7 +375,7 @@ func getFileServiceURL(accountName, storageEndpointSuffix string) string {
 }
 
 func isValidSubscriptionID(subsID string) bool {
-	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(subsID)
+	return subscriptionIDRegex.MatchString(subsID)
 }
 
 // RemoveOptionIfExists removes the given option from the list of options
@@ -417,28 +431,98 @@ func getDefaultBandwidth(requestGiB int, storageAccountType string) *int32 {
 	return &bandwidth
 }
 
-func setCredentialCache(server, clientID, tenantID, tokenFile string) ([]byte, error) {
+func setCredentialCache(server, clientID, tenantID, tokenFile, token, authorityHost, resource string) ([]byte, error) {
 	if server == "" {
 		return nil, fmt.Errorf("server must be provided")
 	}
-	if clientID == "" {
-		return nil, fmt.Errorf("clientID must be provided")
+	if token != "" && tokenFile != "" {
+		return nil, fmt.Errorf("token and tokenFile are mutually exclusive, only one can be provided")
 	}
 
+	serverURL := "https://" + server
 	var args []string
-	if tokenFile != "" {
+	switch {
+	case token != "":
+		// direct token mode: azfilesauthmanager set https://<server> <access_token>
+		args = []string{"set", serverURL, token}
+	case tokenFile != "":
+		if clientID == "" {
+			return nil, fmt.Errorf("clientID must be provided when tokenFile is set")
+		}
 		if tenantID == "" {
 			return nil, fmt.Errorf("tenantID must be provided when tokenFile is provided")
 		}
-		args = []string{"set", "https://" + server, "--workload-identity", "--tenant-id", tenantID, "--client-id", clientID, "--token-file", tokenFile}
-	} else {
-		args = []string{"set", "https://" + server, "--imds-client-id", clientID}
+		args = []string{"set", serverURL, "--workload-identity", "--tenant-id", tenantID, "--client-id", clientID, "--token-file", tokenFile}
+		// pass the cloud-specific AAD authority host and storage resource
+		if authorityHost != "" {
+			args = append(args, "--authority-host", authorityHost)
+		}
+		if resource != "" {
+			args = append(args, "--resource", resource)
+		}
+	default:
+		if clientID == "" {
+			return nil, fmt.Errorf("clientID must be provided")
+		}
+		args = []string{"set", serverURL, "--imds-client-id", clientID}
 	}
 
 	cmd := exec.Command("azfilesauthmanager", args...)
 	cmd.Env = append(os.Environ(), cmd.Env...)
-	klog.V(2).Infof("Executing command: %q", cmd.String())
+	if token != "" {
+		klog.V(2).Infof("Executing command: azfilesauthmanager set %s <token-redacted>", serverURL)
+	} else {
+		klog.V(2).Infof("Executing command: %q", cmd.String())
+	}
 	return cmd.CombinedOutput()
+}
+
+// invalidFolderNameChars contains characters not allowed in Azure file share folder names
+var invalidFolderNameChars = regexp.MustCompile(`[\\:*?"<>|]`)
+
+// isValidFolderName checks if a folder name is valid for Azure file share.
+// Empty folderName is allowed. Folder name may contain "/" as path separator for nested folders.
+// Each path segment must not contain \:*?"<>| or control characters,
+// must not be ".." (directory traversal), and must not end with a period or space.
+func isValidFolderName(folderName string) error {
+	if folderName == "" {
+		return nil
+	}
+
+	// reject null bytes early — they truncate C strings and are a path injection risk
+	if strings.ContainsRune(folderName, 0) {
+		return fmt.Errorf("folderName(%q) contains null byte which is not allowed", folderName)
+	}
+
+	segments := strings.Split(strings.Trim(folderName, "/"), "/")
+	for _, seg := range segments {
+		if seg == "" {
+			return fmt.Errorf("folderName contains empty path segment")
+		}
+
+		// ".." and "." are not allowed as path segments (directory traversal)
+		if seg == ".." || seg == "." {
+			return fmt.Errorf("folderName(%q) contains disallowed path segment %q", folderName, seg)
+		}
+
+		// check for invalid characters
+		if invalidFolderNameChars.MatchString(seg) {
+			return fmt.Errorf("folderName(%q) contains invalid character in segment %q, characters \\:*?\"<>| are not allowed", folderName, seg)
+		}
+
+		// check for control characters (0x00-0x1F)
+		for _, c := range seg {
+			if c >= 0x00 && c <= 0x1F {
+				return fmt.Errorf("folderName(%q) contains control character in segment %q", folderName, seg)
+			}
+		}
+
+		// must not end with period or space
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return fmt.Errorf("folderName(%q) segment %q must not end with a period or space", folderName, seg)
+		}
+	}
+	return nil
 }
 
 // isValidTokenFileName checks if the token file name is valid
