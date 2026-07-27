@@ -50,7 +50,8 @@ resourceGroup | specify the resource group in which Azure file share will be cre
 subscriptionID | specify Azure subscription ID where Azure file share will be created | Azure subscription ID | No | if not empty, `resourceGroup` must be provided
 shareName | specify Azure file share name | existing or new Azure file name | No | if empty, driver will generate an Azure file share name
 shareNamePrefix | specify Azure file share name prefix created by driver | can only contain lowercase letters, numbers, hyphens, and length should be less than 21 | No |
-folderName | specify folder name in Azure file share | existing folder name in Azure file share | No | if folder name does not exist in file share, mount would fail
+folderName | specify folder name in Azure file share | existing folder name in Azure file share, supports `${pvc.metadata.name}`, `${pvc.metadata.namespace}`, `${pv.metadata.name}` placeholders | No | if the folder does not exist in the file share, mount may fail unless `createFolderIfNotExist=true`
+createFolderIfNotExist | specify whether to create the folder if it does not exist in the Azure file share (supported from v1.34.0) | `true`,`false` | No | `false`
 shareAccessTier | [Access tier for file share](https://docs.microsoft.com/en-us/azure/storage/files/storage-files-planning#storage-tiers) (this parameter is ignored when using bring your own account key scenario) | For general-purpose v2 account, the available tiers are `TransactionOptimized`(default), `Hot`, and `Cool`. For file storage account, the available tier is `Premium`. | No | empty(use default setting for different storage account types)
 server | specify Azure storage account server address | existing server address, e.g. `accountname.file.core.windows.net` | No | if empty, driver will use default `accountname.file.core.windows.net` or other sovereign cloud account address
 disableDeleteRetentionPolicy | specify whether disable DeleteRetentionPolicy for storage account created by driver | `true`,`false` | No | `false`
@@ -112,7 +113,8 @@ volumeAttributes.subscriptionID | specify Azure subscription ID where Azure file
 volumeAttributes.resourceGroup | Azure resource group name | existing resource group name | No | if empty, driver will use the same resource group name as current k8s cluster
 volumeAttributes.storageAccount | existing storage account name | existing storage account name | Yes |
 volumeAttributes.shareName | Azure file share name | existing Azure file share name | Yes |
-volumeAttributes.folderName | specify folder name in Azure file share | existing folder name in Azure file share | No | if folder name does not exist in file share, mount would fail
+volumeAttributes.folderName | specify folder name in Azure file share | existing folder name in Azure file share, supports `${pvc.metadata.name}`, `${pvc.metadata.namespace}`, `${pv.metadata.name}` placeholders | No | if folder name does not exist in file share, mount would fail unless `volumeAttributes.createFolderIfNotExist=true`
+volumeAttributes.createFolderIfNotExist | specify whether to create the folder if it does not exist in the Azure file share (supported from v1.34.0) | `true`,`false` | No | `false`
 volumeAttributes.protocol | specify file share protocol | `smb`, `nfs` | No | `smb`
 volumeAttributes.server | specify Azure storage account server address | existing server address, e.g. `accountname.file.core.windows.net` | No | if empty, driver will use default `accountname.file.core.windows.net` or other sovereign cloud account address
 volumeAttributes.storageEndpointSuffix | specify Azure storage endpoint suffix | `core.windows.net`, `core.chinacloudapi.cn`, etc | No | if empty, driver will use default storage endpoint suffix according to cloud environment, e.g. `core.windows.net`
@@ -138,6 +140,17 @@ kubectl create secret generic azure-storage-account-{accountname}-secret --from-
 Name | Meaning | Available Value | Mandatory | Default value
 --- | --- | --- | --- | ---
 useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/azure-sdk-for-go/blob/master/storage/share.go) for snapshot create/delete, this could solve the SRP API throttling issue since data plane API has almost no limit, while it would fail when there is firewall or vnet setting on storage account | `true`,`false` | No | `false`
+
+### `VolumeAttributesClass`
+
+> Supported from Azure File CSI driver v1.35.0. Requires Kubernetes 1.31+ (beta) or 1.34+ (GA).
+
+Name | Meaning | Available Value | Mandatory | Default value
+--- | --- | --- | --- | ---
+provisionedIOPS | provisioned IOPS for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail). Only applicable to PremiumV2 and StandardV2 SKUs. | integer string, e.g. `"5000"` | No |
+provisionedBandwidth | provisioned throughput (MiB/s) for [file share v2](https://learn.microsoft.com/en-us/azure/storage/files/understanding-billing#provisioned-v2-provisioning-detail). Only applicable to PremiumV2 and StandardV2 SKUs. | integer string, e.g. `"200"` | No |
+
+> For usage examples, see [ModifyVolume example](../deploy/example/modifyvolume/README.md).
 
 ### Tips
   - mounting Azure SMB File share requires account key

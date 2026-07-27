@@ -397,6 +397,26 @@ func TestGetFileShareInfo(t *testing.T) {
 			subsID:            "",
 			expectedError:     nil,
 		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#../../etc/shadow#uuid#namespace",
+			resourceGroupName: "",
+			accountName:       "",
+			fileShareName:     "",
+			diskName:          "",
+			namespace:         "",
+			subsID:            "",
+			expectedError:     fmt.Errorf("invalid diskName %q: contains directory traversal sequence", "../../etc/shadow"),
+		},
+		{
+			id:                "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#../../evil",
+			resourceGroupName: "",
+			accountName:       "",
+			fileShareName:     "",
+			diskName:          "",
+			namespace:         "",
+			subsID:            "",
+			expectedError:     fmt.Errorf("invalid namespace %q: contains directory traversal sequence", "../../evil"),
+		},
 	}
 
 	for _, test := range tests {
@@ -811,6 +831,24 @@ func TestGetAccountInfo(t *testing.T) {
 			expectDiskName:      "",
 		},
 		{
+			volumeID: "uniqe-volumeid-nfs-createfolder",
+			rgName:   "vol_nfs",
+			secrets:  emptySecret,
+			reqContext: map[string]string{
+				resourceGroupField:          "vol_nfs",
+				storageAccountField:         "test_accountname",
+				shareNameField:              "test_sharename",
+				protocolField:               "nfs",
+				createFolderIfNotExistField: "true",
+				folderNameField:             "testfolder",
+			},
+			expectErr:           false,
+			err:                 nil,
+			expectAccountName:   "test_accountname",
+			expectFileShareName: "test_sharename",
+			expectDiskName:      "",
+		},
+		{
 			volumeID: "invalid_getLatestAccountKey_value##",
 			rgName:   "vol_2",
 			secrets:  emptySecret,
@@ -858,9 +896,10 @@ func TestGetAccountInfo(t *testing.T) {
 		mockStorageAccountsClient := mock_accountclient.NewMockInterface(ctrl)
 		d.cloud.ComputeClientFactory = mock_azclient.NewMockClientFactory(ctrl)
 		d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClient().Return(mockStorageAccountsClient).AnyTimes()
+		d.cloud.ComputeClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetAccountClientForSub(gomock.Any()).Return(mockStorageAccountsClient, nil).AnyTimes()
 		d.kubeClient = clientSet
 		d.cloud.Environment = &azclient.Environment{StorageEndpointSuffix: "abc"}
-		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), test.rgName).Return(key, nil).AnyTimes()
+		mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(key, nil).AnyTimes()
 		rgName, accountName, _, fileShareName, diskName, _, _, _, err := d.GetAccountInfo(context.Background(), test.volumeID, test.secrets, test.reqContext)
 		if test.expectErr && err == nil {
 			t.Errorf("Unexpected non-error")
@@ -999,6 +1038,72 @@ func TestGetFileShareQuota(t *testing.T) {
 		}
 		if quota != test.expectedQuota {
 			t.Errorf("Unexpected return quota: %d, expected: %d", quota, test.expectedQuota)
+		}
+	}
+}
+
+func TestDriverCreateFileShare(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	shareQuota := int32(10)
+	resourceGroupName := "rg"
+	accountName := "accountname"
+	fileShareName := "filesharename"
+
+	tests := []struct {
+		desc                string
+		mockedFileShareResp *armstorage.FileShare
+		mockedFileShareErr  error
+		mockedCreateResp    *armstorage.FileShare
+		mockedCreateErr     error
+		expectedError       error
+		expectCreate        bool
+	}{
+		{
+			desc:                "file share already exists, skip create",
+			mockedFileShareResp: &armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &shareQuota}},
+			mockedFileShareErr:  nil,
+			expectedError:       nil,
+			expectCreate:        false,
+		},
+		{
+			desc:                "file share does not exist, create it",
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  &azcore.ResponseError{StatusCode: http.StatusNotFound},
+			mockedCreateResp:    &armstorage.FileShare{},
+			mockedCreateErr:     nil,
+			expectedError:       nil,
+			expectCreate:        true,
+		},
+		{
+			desc:                "GetFileShareQuota returns non-404 error, fall through to create",
+			mockedFileShareResp: &armstorage.FileShare{},
+			mockedFileShareErr:  fmt.Errorf("quota check error"),
+			mockedCreateResp:    &armstorage.FileShare{},
+			mockedCreateErr:     nil,
+			expectedError:       nil,
+			expectCreate:        true,
+		},
+	}
+
+	for _, test := range tests {
+		mockFileClient := mock_fileshareclient.NewMockInterface(ctrl)
+		clientFactory := mock_azclient.NewMockClientFactory(ctrl)
+		clientFactory.EXPECT().GetFileShareClientForSub(gomock.Any()).Return(mockFileClient, nil).AnyTimes()
+		d.cloud.ComputeClientFactory = clientFactory
+		mockFileClient.EXPECT().Get(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedFileShareResp, test.mockedFileShareErr).AnyTimes()
+		if test.expectCreate {
+			mockFileClient.EXPECT().Create(context.TODO(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(test.mockedCreateResp, test.mockedCreateErr).Times(1)
+		}
+		err := d.CreateFileShare(context.TODO(), &storage.AccountOptions{
+			ResourceGroup:  resourceGroupName,
+			Name:           accountName,
+			SubscriptionID: "subsID",
+		}, &ShareOptions{Name: fileShareName, RequestGiB: int(shareQuota)}, map[string]string{}, "")
+		if !reflect.DeepEqual(err, test.expectedError) {
+			t.Errorf("test[%s]: unexpected error: %v, expected error: %v", test.desc, err, test.expectedError)
 		}
 	}
 }
@@ -1454,6 +1559,96 @@ func TestGetStorageEndPointSuffix(t *testing.T) {
 	}
 }
 
+func TestGetActiveDirectoryEndpoint(t *testing.T) {
+	d := NewFakeDriver()
+
+	tests := []struct {
+		name     string
+		cloud    *storage.AccountRepo
+		expected string
+	}{
+		{
+			name:     "nil cloud",
+			cloud:    nil,
+			expected: defaultActiveDirectoryEndpoint,
+		},
+		{
+			name:     "empty environment",
+			cloud:    &storage.AccountRepo{},
+			expected: defaultActiveDirectoryEndpoint,
+		},
+		{
+			name: "public cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ActiveDirectoryEndpoint: "https://login.microsoftonline.com/",
+				},
+			},
+			expected: "https://login.microsoftonline.com/",
+		},
+		{
+			name: "china cloud",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ActiveDirectoryEndpoint: "https://login.chinacloudapi.cn/",
+				},
+			},
+			expected: "https://login.chinacloudapi.cn/",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		assert.Equal(t, test.expected, d.getActiveDirectoryEndpoint(), test.name)
+	}
+}
+
+func TestGetStorageResource(t *testing.T) {
+	d := NewFakeDriver()
+
+	tests := []struct {
+		name     string
+		cloud    *storage.AccountRepo
+		expected string
+	}{
+		{
+			name:     "nil cloud",
+			cloud:    nil,
+			expected: defaultStorageResource,
+		},
+		{
+			name: "nil resource identifiers",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{},
+			},
+			expected: defaultStorageResource,
+		},
+		{
+			name: "china cloud with custom storage resource",
+			cloud: &storage.AccountRepo{
+				Environment: &azclient.Environment{
+					ResourceIdentifiers: &azclient.ResourceIdentifier{
+						Storage: "https://storage.example.azure.com/",
+					},
+				},
+			},
+			expected: "https://storage.example.azure.com/",
+		},
+	}
+
+	for _, test := range tests {
+		d.cloud = test.cloud
+		assert.Equal(t, test.expected, d.getStorageResource(), test.name)
+	}
+}
+
+func TestGetEndpointsFromCloudName(t *testing.T) {
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{Environment: azclient.EnvironmentFromName("AZURECHINACLOUD")}
+	assert.Equal(t, "https://login.chinacloudapi.cn/", d.getActiveDirectoryEndpoint())
+	assert.Equal(t, "https://storage.azure.com/", d.getStorageResource())
+}
+
 func TestGetStorageAccesskey(t *testing.T) {
 	options := &storage.AccountOptions{
 		Name:           "test-sa",
@@ -1857,6 +2052,24 @@ func TestCreateFolderIfNotExists(t *testing.T) {
 		storageEndpointSuffix string
 		expectedError         string
 	}{
+		{
+			name:                  "Empty account name",
+			accountName:           "",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "testshare",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "accountName is empty",
+		},
+		{
+			name:                  "Empty file share name",
+			accountName:           "testaccount",
+			accountKey:            base64.StdEncoding.EncodeToString([]byte("testkey")),
+			fileShareName:         "",
+			folderName:            "testfolder",
+			storageEndpointSuffix: "core.windows.net",
+			expectedError:         "fileShareName is empty",
+		},
 		{
 			name:                  "Invalid account key",
 			accountName:           "testaccount",
