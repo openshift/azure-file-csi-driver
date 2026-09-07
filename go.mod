@@ -147,7 +147,7 @@ require (
 	go.opentelemetry.io/proto/otlp v1.4.0 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
@@ -208,3 +208,5 @@ replace (
 )
 
 replace golang.org/x/crypto => github.com/openshift-sustaining/crypto v0.48.0-sec.1
+
+replace golang.org/x/net => github.com/openshift-sustaining/net v0.50.0-sec.4
