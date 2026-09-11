@@ -672,7 +672,7 @@ go.uber.org/zap/internal/pool
 go.uber.org/zap/internal/stacktrace
 go.uber.org/zap/zapcore
 go.uber.org/zap/zapgrpc
-# golang.org/x/crypto v0.40.0 => github.com/openshift-sustaining/crypto v0.41.0-sec.2
+# golang.org/x/crypto v0.41.0 => github.com/openshift-sustaining/crypto v0.41.0-sec.2
 ## explicit; go 1.23.0
 golang.org/x/crypto/blowfish
 golang.org/x/crypto/chacha20
@@ -691,7 +691,7 @@ golang.org/x/crypto/ssh/internal/bcrypt_pbkdf
 # golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6
 ## explicit; go 1.23.0
 golang.org/x/exp/slices
-# golang.org/x/net v0.42.0
+# golang.org/x/net v0.42.0 => github.com/openshift-sustaining/net v0.43.0-sec.4
 ## explicit; go 1.23.0
 golang.org/x/net/context
 golang.org/x/net/html
@@ -2037,3 +2037,4 @@ sigs.k8s.io/yaml/goyaml.v2
 # k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.32.1
 # google.golang.org/grpc => github.com/openshift-sustaining/grpc-go v1.75.1-sec.1
 # golang.org/x/crypto => github.com/openshift-sustaining/crypto v0.41.0-sec.2
+# golang.org/x/net => github.com/openshift-sustaining/net v0.43.0-sec.4
