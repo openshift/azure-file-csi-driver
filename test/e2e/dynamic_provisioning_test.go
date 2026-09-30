@@ -177,6 +177,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			PodWithSnapshot:                podWithSnapshot,
 			StorageClassParameters:         map[string]string{"skuName": "Standard_LRS"},
 			SnapshotStorageClassParameters: map[string]string{"skuName": "Premium_LRS"},
+			VolumeSnapshotClassParameters:  map[string]string{"metadata": "comment=e2e-snapshot,environment=test"},
 		}
 		test.Run(ctx, cs, snapshotrcs, ns)
 	})
@@ -448,7 +449,8 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			},
 		}
 		scParameters := map[string]string{
-			"skuName": "Standard_LRS",
+			"skuName":             "Standard_LRS",
+			"networkEndpointType": "serviceEndpoint",
 		}
 		test := testsuites.DynamicallyProvisionedReadOnlyVolumeTest{
 			CSIDriver:              testDriver,
@@ -901,7 +903,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		test.Run(ctx, cs, ns)
 	})
 
-	ginkgo.It("should create a pod, write and read to it, take a standard smb volume snapshot, and validate whether it is ready to use [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
+	ginkgo.It("should create a pod, write and read to it, take a standard smb volume snapshot, and validate whether it is ready to use (oauth) [file.csi.azure.com]", func(ctx ginkgo.SpecContext) {
 		skipIfTestingInWindowsCluster()
 		skipIfUsingInTreeVolumePlugin()
 
@@ -924,7 +926,7 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			CSIDriver:       testDriver,
 			Pod:             pod,
 			ShouldOverwrite: false,
-			ShouldRestore:   false,
+			ShouldRestore:   true,
 			PodWithSnapshot: podWithSnapshot,
 			StorageClassParameters: map[string]string{
 				"skuName":                     "Standard_LRS",
@@ -1441,7 +1443,11 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 				Cmd: convertToPowershellCommandIfNecessary("echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data"),
 				Volumes: []testsuites.VolumeDetails{
 					{
-						ClaimSize: "100Gi",
+						VolumeID:           "onprem#USERNAME#share",
+						ShareName:          "share",
+						Server:             server,
+						NodeStageSecretRef: secretName,
+						ClaimSize:          "100Gi",
 						MountOptions: []string{
 							"dir_mode=0777",
 							"file_mode=0777",
@@ -1462,14 +1468,9 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 			},
 		}
 
-		test := testsuites.DynamicallyProvisionedInlineVolumeTest{
-			CSIDriver:       testDriver,
-			Pods:            pods,
-			SecretName:      secretName,
-			Server:          server,
-			ShareName:       "share",
-			ReadOnly:        false,
-			CSIInlineVolume: true,
+		test := testsuites.PreProvisionedMultiplePods{
+			CSIDriver: testDriver,
+			Pods:      pods,
 		}
 		test.Run(ctx, cs, ns)
 	})
@@ -1993,6 +1994,57 @@ var _ = ginkgo.Describe("Dynamic Provisioning", func() {
 		// system:serviceaccount:default:<sa-name>, so the SA must be in default namespace
 		defaultNS := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 		test.Run(ctx, cs, defaultNS)
+	})
+
+	ginkgo.It("should create a volume on demand with workload identity account key retrieval [file.csi.azure.com]", ginkgo.Serial, func(ctx ginkgo.SpecContext) {
+		skipIfUsingInTreeVolumePlugin()
+		skipIfTestingInWindowsCluster()
+		skipIfTestingInMigrationCluster()
+		if !isCapzTest {
+			ginkgo.Skip("test case is only available for capz test")
+		}
+
+		// Wait for background AAD OIDC cache warm-up to complete.
+		ginkgo.By("Waiting for AAD OIDC cache warm-up to complete")
+		<-wiReady
+
+		gomega.Expect(wiSetupSucceeded).To(gomega.BeTrue(), "Workload identity setup failed, cannot run WI account key mount test")
+		gomega.Expect(wiClientID).NotTo(gomega.BeEmpty(), "WI client ID not set after background warm-up")
+		gomega.Expect(errWISetup).NotTo(gomega.HaveOccurred(),
+			"background AAD OIDC warm-up failed; WI account key retrieval will not work")
+		clientID := wiClientID
+
+		pods := []testsuites.PodDetails{
+			{
+				Cmd: "echo 'hello world' > /mnt/test-1/data && grep 'hello world' /mnt/test-1/data",
+				Volumes: []testsuites.VolumeDetails{
+					{
+						ClaimSize: "100Gi",
+						VolumeMount: testsuites.VolumeMountDetails{
+							NameGenerate:      "test-volume-",
+							MountPathGenerate: "/mnt/test-",
+						},
+					},
+				},
+			},
+		}
+		// Account-key mode: WI is used to retrieve the storage account key,
+		// then the key is used for the actual SMB mount. No mountWithWorkloadIdentityToken.
+		// Requires Storage Account Contributor role on the managed identity.
+		scParameters := map[string]string{
+			"skuName":  "Premium_LRS",
+			"clientID": clientID,
+		}
+		test := testsuites.DynamicallyProvisionedCmdVolumeTest{
+			CSIDriver:              testDriver,
+			Pods:                   pods,
+			StorageClassParameters: scParameters,
+			ServiceAccountName:     wiServiceAccountName,
+		}
+		// Use default namespace because the federated identity credential is bound to
+		// system:serviceaccount:default:<sa-name>, so the SA must be in default namespace.
+		defaultNS2 := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+		test.Run(ctx, cs, defaultNS2)
 	})
 
 })

@@ -56,6 +56,7 @@ type VolumeDetails struct {
 	// Optional, used with specified StorageClass
 	StorageClass       *storagev1.StorageClass
 	ShareName          string
+	Server             string
 	NodeStageSecretRef string
 	AccessModes        []v1.PersistentVolumeAccessMode
 }
@@ -267,8 +268,12 @@ func (volume *VolumeDetails) SetupPreProvisionedPersistentVolumeClaim(ctx contex
 	if volume.ShareName != "" {
 		attrib["shareName"] = volume.ShareName
 	}
+	if volume.Server != "" {
+		attrib["server"] = volume.Server
+	}
 	nodeStageSecretRef := volume.NodeStageSecretRef
 	pv := csiDriver.GetPersistentVolume(volume.VolumeID, volume.FSType, volume.ClaimSize, volume.ReclaimPolicy, namespace.Name, attrib, nodeStageSecretRef)
+	pv.Spec.MountOptions = volume.MountOptions
 	tpv := NewTestPreProvisionedPersistentVolume(client, pv)
 	tpv.Create(ctx)
 	ginkgo.By("setting up the PVC")
@@ -282,9 +287,17 @@ func (volume *VolumeDetails) SetupPreProvisionedPersistentVolumeClaim(ctx contex
 	return tpvc, cleanupFuncs
 }
 
-func CreateVolumeSnapshotClass(ctx context.Context, client restclientset.Interface, namespace *v1.Namespace, csiDriver driver.VolumeSnapshotTestDriver) (*TestVolumeSnapshotClass, func()) {
+func CreateVolumeSnapshotClass(ctx context.Context, client restclientset.Interface, namespace *v1.Namespace, csiDriver driver.VolumeSnapshotTestDriver, extraParameters map[string]string) (*TestVolumeSnapshotClass, func()) {
 	ginkgo.By("setting up the VolumeSnapshotClass")
 	volumeSnapshotClass := csiDriver.GetVolumeSnapshotClass(namespace.Name)
+	if extraParameters != nil {
+		if volumeSnapshotClass.Parameters == nil {
+			volumeSnapshotClass.Parameters = map[string]string{}
+		}
+		for k, v := range extraParameters {
+			volumeSnapshotClass.Parameters[k] = v
+		}
+	}
 	tvsc := NewTestVolumeSnapshotClass(client, namespace, volumeSnapshotClass)
 	tvsc.Create(ctx)
 

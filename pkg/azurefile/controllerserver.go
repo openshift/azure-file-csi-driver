@@ -50,6 +50,7 @@ import (
 const (
 	azureFileCSIDriverName = "azurefile_csi_driver"
 	privateEndpoint        = "privateendpoint"
+	serviceEndpoint        = "serviceendpoint"
 	snapshotTimeFormat     = "2006-01-02T15:04:05.0000000Z07:00"
 	snapshotsExpand        = "snapshots"
 
@@ -411,13 +412,20 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Errorf(codes.InvalidArgument, "publicNetworkAccess(%s) is not supported, supported PublicNetworkAccess list: %v", publicNetworkAccess, armstorage.PossiblePublicNetworkAccessValues())
 	}
 
+	if !isSupportedNetworkEndpointType(networkEndpointType) {
+		return nil, status.Errorf(codes.InvalidArgument, "networkEndpointType(%s) is not supported, supported networkEndpointType list: %v", networkEndpointType, supportedNetworkEndpointTypeList)
+	}
+
 	if protocol == nfs && fsType != "" && fsType != nfs {
 		return nil, status.Errorf(codes.InvalidArgument, "fsType(%s) is not supported with protocol(%s)", fsType, protocol)
 	}
 
 	enableHTTPSTrafficOnly := true
 	shareProtocol := armstorage.EnabledProtocolsSMB
+	var isNFSEncryptionInTransitEnabled *bool
+	var skipHTTPSTrafficOnlyMatch bool
 	var createPrivateEndpoint *bool
+	var createServiceEndpoint bool
 	if strings.EqualFold(networkEndpointType, privateEndpoint) {
 		if strings.Contains(subnetName, ",") {
 			return nil, status.Errorf(codes.InvalidArgument, "subnetName(%s) can only contain one subnet for private endpoint", subnetName)
@@ -427,6 +435,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if privateDNSZoneResourceGroup != "" {
 			return nil, status.Errorf(codes.InvalidArgument, "%s(%s) is only supported with private endpoint", privateDNSZoneResourceGroupField, privateDNSZoneResourceGroup)
 		}
+		createServiceEndpoint = strings.EqualFold(networkEndpointType, serviceEndpoint)
 	}
 	var vnetResourceIDs []string
 	if fsType == nfs || protocol == nfs {
@@ -438,12 +447,32 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 
 		protocol = nfs
-		enableHTTPSTrafficOnly = false
+		// Configure per-protocol encryption in transit for NFS at account
+		// creation time. Account matching in cloud-provider-azure is
+		// one-directional: an encryptInTransit=true request may reuse any
+		// existing NFS account (its enforcement comes from client-side TLS
+		// plus the account-level ProtocolSettings.Nfs.EncryptionInTransit
+		// stamped when the driver creates the account), while an
+		// encryptInTransit=false request is prevented from reusing an
+		// account whose EiT is already required.
+		isNFSEncryptionInTransitEnabled = ptr.To(encryptInTransit)
+		// EnableHTTPSTrafficOnly on the account blocks plaintext Azure Files
+		// NFS mounts. Only keep HTTPS-only on when encryptInTransit=true
+		// (client-side TLS via aznfs), otherwise disable it so plaintext NFS
+		// mounts work.
+		if !encryptInTransit {
+			enableHTTPSTrafficOnly = false
+		}
+		// EnableHTTPSTrafficOnly only controls REST and has no effect on NFS
+		// mounts when encryptInTransit=true, so skip matching on it in that
+		// case to reuse pre-existing NFS accounts (created when
+		// EnableHTTPSTrafficOnly=false was forced) instead of creating a new
+		// account per request. For plaintext NFS (encryptInTransit=false),
+		// keep the HTTPS match on: reusing an account with
+		// EnableHTTPSTrafficOnly=true would cause Azure to reject the
+		// plaintext mount, so we must land on an HTTPS-off account.
 		if encryptInTransit {
-			klog.V(2).Info("encryptInTransit is enabled")
-			// Right now we have to disable secure transfer on accounts to be able to mount an NFS share.
-			// Even though encryptInTransit is enabled.
-			// enableHTTPSTrafficOnly = true
+			skipHTTPSTrafficOnlyMatch = true
 		}
 		shareProtocol = armstorage.EnabledProtocolsNFS
 		// NFS protocol does not need account key
@@ -451,12 +480,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		// reset protocol field (compatible with "fsType: nfs")
 		setKeyValueInMap(parameters, protocolField, protocol)
 
+		// NFS shares can only be accessed from a secured network, so the subnet
+		// is always configured with a service endpoint unless a private endpoint is used.
 		if !ptr.Deref(createPrivateEndpoint, false) {
-			// set VirtualNetworkResourceIDs for storage account firewall setting
-			var err error
-			if vnetResourceIDs, err = d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
-				return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
-			}
+			createServiceEndpoint = true
+		}
+	}
+
+	if createServiceEndpoint {
+		// set VirtualNetworkResourceIDs for storage account firewall setting
+		var err error
+		if vnetResourceIDs, err = d.updateSubnetServiceEndpoints(ctx, vnetResourceGroup, vnetName, subnetName); err != nil {
+			return nil, status.Errorf(codes.Internal, "update service endpoints failed with error: %v", err)
 		}
 	}
 
@@ -617,6 +652,8 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		StorageEndpointSuffix:                   storageEndpointSuffix,
 		IsMultichannelEnabled:                   isMultichannelEnabled,
 		IsSmbOAuthEnabled:                       requiresSmbOAuth,
+		IsNFSEncryptionInTransitEnabled:         isNFSEncryptionInTransitEnabled,
+		SkipHTTPSTrafficOnlyMatch:               skipHTTPSTrafficOnlyMatch,
 		PickRandomMatchingAccount:               selectRandomMatchingAccount,
 		GetLatestAccountKey:                     getLatestAccountKey,
 		SourceAccountName:                       srcAccountName,
@@ -634,14 +671,14 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		if v, ok := d.volMap.Load(volName); ok {
 			accountName = v.(string)
 		} else {
-			lockKey = fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%v|%v|%v|%v|%v|%v|%v|%v|%v|%v|%s|%s|%s|%s|%s|%v|%s|%s",
+			lockKey = fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%v|%v|%v|%v|%v|%v|%v|%v|%v|%v|%v|%s|%s|%s|%s|%s|%v|%s|%s|%v",
 				sku, accountKind, resourceGroup, location, protocol, subsID, accountAccessTier, privateDNSZoneResourceGroup,
-				ptr.Deref(createPrivateEndpoint, false), ptr.Deref(allowBlobPublicAccess, false), ptr.Deref(requireInfraEncryption, false),
+				ptr.Deref(createPrivateEndpoint, false), createServiceEndpoint, ptr.Deref(allowBlobPublicAccess, false), ptr.Deref(requireInfraEncryption, false),
 				ptr.Deref(enableLFS, false), ptr.Deref(disableDeleteRetentionPolicy, false),
 				ptr.Deref(allowCrossTenantReplication, true), ptr.Deref(allowSharedKeyAccess, true),
 				ptr.Deref(requiresSmbOAuth, false), ptr.Deref(isMultichannelEnabled, false),
 				enableHTTPSTrafficOnly, publicNetworkAccess, vnetResourceGroup, vnetName, vnetLinkName, subnetName,
-				matchTags, serializeTags(tags), storageEndpointSuffix)
+				matchTags, serializeTags(tags), storageEndpointSuffix, ptr.Deref(isNFSEncryptionInTransitEnabled, false))
 			// search in cache first
 			cache, err := d.accountSearchCache.Get(ctx, lockKey, azcache.CacheReadTypeDefault)
 			if err != nil {
@@ -719,8 +756,16 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	}
 
 	klog.V(2).Infof("begin to create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d) protocol(%s)", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, shareProtocol)
+	// shouldCleanupShare indicates whether the file share should be cleaned up on failure.
+	// When fileShareName is user-specified (non-empty), we skip cleanup since the share
+	// may be pre-existing and not owned by CSI. For auto-generated share names, CSI owns
+	// the lifecycle and should clean up on failure to avoid orphaned shares.
+	shouldCleanupShare := (fileShareName == "")
 	if err := d.CreateFileShare(ctx, accountOptions, shareOptions, secret, useDataPlaneAPI); err != nil {
 		if strings.Contains(err.Error(), accountLimitExceedManagementAPI) || strings.Contains(err.Error(), accountLimitExceedDataPlaneAPI) {
+			if account != "" {
+				return nil, status.Errorf(codes.Internal, "account(%s) is in %s, wait for a few minutes to retry", accountName, accountLimitExceedManagementAPI)
+			}
 			klog.Warningf("create file share(%s) on account(%s) type(%s) subID(%s) rg(%s) location(%s) size(%d), error: %v, skip matching current account", validFileShareName, accountName, sku, subsID, resourceGroup, location, fileShareSize, err)
 			if rerr := d.cloud.AddStorageAccountTags(ctx, subsID, resourceGroup, accountName, skipMatchingTag); rerr != nil {
 				klog.Warningf("AddStorageAccountTags(%v) on account(%s) subsID(%s) rg(%s) failed with error: %v", tags, accountName, subsID, resourceGroup, rerr.Error())
@@ -748,6 +793,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if req.GetVolumeContentSource() != nil {
 		accountSASToken, authAzcopyEnv, err := d.getAzcopyAuth(ctx, accountName, accountKey, storageEndpointSuffix, accountOptions, secret, secretName, secretNamespace, false)
 		if err != nil {
+			d.cleanupShareOnFailure(shouldCleanupShare, accountName, validFileShareName, subsID, resourceGroup, secret, useDataPlaneAPI, "getAzcopyAuth failure")
 			return nil, status.Errorf(codes.Internal, "failed to getAzcopyAuth on account(%s) rg(%s), error: %v", accountOptions.Name, accountOptions.ResourceGroup, err)
 		}
 		copyErr := d.copyVolume(ctx, req, accountName, accountSASToken, authAzcopyEnv, secretNamespace, shareOptions, accountOptions, storageEndpointSuffix)
@@ -755,11 +801,13 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			klog.Warningf("azcopy copy failed with AuthorizationPermissionMismatch error, should assign \"Storage File Data Privileged Contributor\" role to controller identity, fall back to use sas token, original error: %v", copyErr)
 			accountSASToken, authAzcopyEnv, err := d.getAzcopyAuth(ctx, accountName, accountKey, storageEndpointSuffix, accountOptions, secret, secretName, secretNamespace, true)
 			if err != nil {
+				d.cleanupShareOnFailure(shouldCleanupShare, accountName, validFileShareName, subsID, resourceGroup, secret, useDataPlaneAPI, "fallback getAzcopyAuth failure")
 				return nil, status.Errorf(codes.Internal, "failed to getAzcopyAuth on account(%s) rg(%s), error: %v", accountOptions.Name, accountOptions.ResourceGroup, err)
 			}
 			copyErr = d.copyVolume(ctx, req, accountName, accountSASToken, authAzcopyEnv, secretNamespace, shareOptions, accountOptions, storageEndpointSuffix)
 		}
 		if copyErr != nil {
+			d.cleanupShareOnFailure(shouldCleanupShare, accountName, validFileShareName, subsID, resourceGroup, secret, useDataPlaneAPI, fmt.Sprintf("copyVolume(%s) failure", validFileShareName))
 			return nil, copyErr
 		}
 		// storeAccountKey is not needed here since copy volume is only using SAS token
@@ -848,6 +896,31 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			ContentSource: req.GetVolumeContentSource(),
 		},
 	}, nil
+}
+
+// cleanupShareOnFailure is a best-effort rollback helper that deletes the file share
+// when shouldCleanupShare is true (i.e., the share name was auto-generated by CSI).
+// It checks for a running azcopy job first — if a job is still in progress, the share
+// is preserved so retries can resume rather than starting from zero.
+func (d *Driver) cleanupShareOnFailure(shouldCleanupShare bool, accountName, shareName, subsID, resourceGroup string, secret map[string]string, useDataPlaneAPI, reason string) {
+	if shouldCleanupShare {
+		// Check if an azcopy job is still running or has completed for this share — if so,
+		// skip cleanup to avoid orphaning a running job or deleting a share that was
+		// successfully copied (race between timeout and job completion).
+		jobState, _, err := d.azcopy.GetAzcopyJob(shareName, []string{})
+		if err == nil && (jobState == util.AzcopyJobRunning || jobState == util.AzcopyJobCompleted) {
+			klog.V(2).Infof("skip cleanup of file share(%s) on account(%s): azcopy job state is %s", shareName, accountName, jobState)
+			return
+		}
+		klog.V(2).Infof("%s on account(%s), cleaning up file share(%s)", reason, accountName, shareName)
+		// Use a background context for cleanup to avoid inheriting a cancelled/expired
+		// context from the original CreateVolume request (e.g., after azcopy timeout).
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if cleanupErr := d.DeleteFileShare(cleanupCtx, subsID, resourceGroup, accountName, shareName, secret, useDataPlaneAPI); cleanupErr != nil {
+			klog.Warningf("failed to clean up file share(%s) on account(%s) rg(%s) after %s: %v", shareName, accountName, resourceGroup, reason, cleanupErr)
+		}
+	}
 }
 
 // DeleteVolume delete an azure file
@@ -1026,6 +1099,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 
 	var useDataPlaneAPI string
+	snapshotMetadata := make(map[string]string)
 	for k, v := range req.GetParameters() {
 		switch strings.ToLower(k) {
 		case useDataPlaneAPIField:
@@ -1033,6 +1107,16 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 				return nil, status.Errorf(codes.InvalidArgument, "invalid %s: %s in snapshot storage class", useDataPlaneAPIField, v)
 			}
 			useDataPlaneAPI = v
+		case metadataField:
+			snapshotMetadata, err = ConvertTagsToMap(v, "")
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid %s in snapshot storage class: %v", metadataField, err)
+			}
+			for key := range snapshotMetadata {
+				if strings.EqualFold(key, snapshotNameKey) {
+					return nil, status.Errorf(codes.InvalidArgument, "%q is reserved snapshot metadata", snapshotNameKey)
+				}
+			}
 		default:
 			return nil, status.Errorf(codes.InvalidArgument, "invalid parameter %q in storage class", k)
 		}
@@ -1068,19 +1152,18 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 		}, nil
 	}
 
+	metadata := getSnapshotMetadata(snapshotName, snapshotMetadata)
+
 	if len(req.GetSecrets()) > 0 || useDataPlaneAPI != "" {
 		shareClient, err := d.getShareClient(ctx, sourceVolumeID, req.GetSecrets(), useDataPlaneAPI)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get share url with (%s): %v", sourceVolumeID, err)
 		}
 
-		snapshotShare, err := shareClient.CreateSnapshot(ctx, &share.CreateSnapshotOptions{
-			Metadata: map[string]*string{snapshotNameKey: to.Ptr(snapshotName)},
-		})
+		snapshotShare, err := createShareSnapshot(ctx, shareClient, metadata)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "create snapshot from(%s) failed with %v", sourceVolumeID, err)
 		}
-
 		properties, err := shareClient.GetProperties(ctx, nil)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to get snapshot properties from (%s): %v", *snapshotShare.Snapshot, err)
@@ -1095,7 +1178,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 			return nil, status.Errorf(codes.Internal, "failed to get snapshot client for subID(%s): %v", subsID, err)
 		}
 		snapshotShare, err := fileshareClient.Create(ctx, rgName, accountName, fileShareName, armstorage.FileShare{Name: to.Ptr(fileShareName),
-			FileShareProperties: &armstorage.FileShareProperties{Metadata: map[string]*string{snapshotNameKey: &snapshotName}}}, to.Ptr(snapshotsExpand))
+			FileShareProperties: &armstorage.FileShareProperties{Metadata: metadata}}, to.Ptr(snapshotsExpand))
 		if err != nil {
 			if isThrottlingError(err) {
 				klog.Warningf("switch to use data plane API instead for account %s since it's throttled", accountName)
@@ -1150,6 +1233,23 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequ
 	}
 
 	return resp, nil
+}
+
+type snapshotShareClient interface {
+	CreateSnapshot(context.Context, *share.CreateSnapshotOptions) (share.CreateSnapshotResponse, error)
+}
+
+func getSnapshotMetadata(snapshotName string, snapshotMetadata map[string]string) map[string]*string {
+	metadata := make(map[string]*string, len(snapshotMetadata)+1)
+	metadata[snapshotNameKey] = to.Ptr(snapshotName)
+	for key, value := range snapshotMetadata {
+		metadata[key] = to.Ptr(value)
+	}
+	return metadata
+}
+
+func createShareSnapshot(ctx context.Context, shareClient snapshotShareClient, metadata map[string]*string) (share.CreateSnapshotResponse, error) {
+	return shareClient.CreateSnapshot(ctx, &share.CreateSnapshotOptions{Metadata: metadata})
 }
 
 // DeleteSnapshot delete a snapshot (todo)

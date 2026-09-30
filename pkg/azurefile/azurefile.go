@@ -19,7 +19,9 @@ package azurefile
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +121,7 @@ const (
 	secretNameField                   = "secretname"
 	createAccountField                = "createaccount"
 	useDataPlaneAPIField              = "usedataplaneapi"
+	metadataField                     = "metadata"
 	storeAccountKeyField              = "storeaccountkey"
 	getLatestAccountKeyField          = "getlatestaccountkey"
 	useSecretCacheField               = "usesecretcache"
@@ -143,6 +146,10 @@ const (
 	provisionedIopsField              = "provisionediops"
 	falseValue                        = "false"
 	trueValue                         = "true"
+	// inline volume secret authorization modes
+	inlineVolumeSecretAuthzOff        = "off"
+	inlineVolumeSecretAuthzWarn       = "warn"
+	inlineVolumeSecretAuthzEnforce    = "enforce"
 	defaultSecretAccountName          = "azurestorageaccountname"
 	defaultSecretAccountKey           = "azurestorageaccountkey"
 	proxyMount                        = "proxy-mount"
@@ -238,6 +245,7 @@ var (
 	supportedProtocolList            = []string{smb, nfs}
 	supportedDiskFsTypeList          = []string{ext4, ext3, ext2, xfs}
 	supportedFSGroupChangePolicyList = []string{FSGroupChangeNone, string(v1.FSGroupChangeAlways), string(v1.FSGroupChangeOnRootMismatch)}
+	supportedNetworkEndpointTypeList = []string{privateEndpoint, serviceEndpoint}
 
 	retriableErrors = []string{accountNotProvisioned, tooManyRequests, shareBeingDeleted, clientThrottled}
 
@@ -269,6 +277,7 @@ type Driver struct {
 	fsGroupChangePolicy                    string
 	allowEmptyCloudConfig                  bool
 	allowInlineVolumeKeyAccessWithIdentity bool
+	inlineVolumeSecretAuthz                string
 	enableVHDDiskFeature                   bool
 	enableGetVolumeStats                   bool
 	enableVolumeMountGroup                 bool
@@ -333,6 +342,8 @@ type Driver struct {
 	directVolume          DirectVolume
 	isKataNode            bool
 	requiredAzCopyToTrust bool
+	// Flag that indicates to use aznfs utility to mount nfs volumes instead of vanilla nfs utility.
+	useAZNFSForNFSMounts bool
 }
 
 // NewDriver Creates a NewCSIDriver object. Assumes vendor version is equal to driver version &
@@ -350,6 +361,7 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.userAgentSuffix = options.UserAgentSuffix
 	driver.allowEmptyCloudConfig = options.AllowEmptyCloudConfig
 	driver.allowInlineVolumeKeyAccessWithIdentity = options.AllowInlineVolumeKeyAccessWithIdentity
+	driver.inlineVolumeSecretAuthz = options.InlineVolumeSecretAuthz
 	driver.enableVHDDiskFeature = options.EnableVHDDiskFeature
 	driver.enableVolumeMountGroup = options.EnableVolumeMountGroup
 	driver.enableGetVolumeStats = options.EnableGetVolumeStats
@@ -378,7 +390,7 @@ func NewDriver(options *DriverOptions) *Driver {
 	driver.directVolume = new(directVolume)
 	driver.isKataNode = false
 	driver.useWinCIMAPI = options.UseWinCIMAPI
-
+	driver.useAZNFSForNFSMounts = options.UseAZNFSForNFSMounts
 	var err error
 	getter := func(_ context.Context, _ string) (interface{}, error) { return nil, nil }
 
@@ -621,27 +633,48 @@ func validateVolumeIDSegment(field, value string) error {
 //
 //	capz-qjbped#f3d5809ad977d4606b8997d#pvc-061c8214-2330-4b3e-88d0-6ef8d84636bc###azurefile-6654#2025-09-05T07:51:41.0000000Z#46678f10-4bbb-447e-98e8-d2829589f2d8
 //	capz-qjbped#f3d5809ad977d4606b8997d#pvc-061c8214-2330-4b3e-88d0-6ef8d84636bc###azurefile-6654#46678f10-4bbb-447e-98e8-d2829589f2d8#2025-09-05T07:51:41.0000000Z
+//	#accountName#fileShareName#2025-09-05T07:51:41.0000000Z (in-tree migration format with 3 #)
+//	#accountName#fileShareName#2025-09-05T07:51:41.0000000Z#46678f10-4bbb-447e-98e8-d2829589f2d8 (in-tree migration format with subsID)
 //
 // output:
 //
 //	capz-qjbped, f3d5809ad977d4606b8997d, pvc-061c8214-2330-4b3e-88d0-6ef8d84636bc, snapshotTime, 46678f10-4bbb-447e-98e8-d2829589f2d8
 func GetInfoFromSnapshotID(id string) (string, string, string, string, string, error) {
 	segments := strings.Split(id, separator)
-	if len(segments) < 7 {
-		return "", "", "", "", "", fmt.Errorf("error parsing snapshot id: %q, should at least contain 6 #", id)
+	if len(segments) < 4 {
+		return "", "", "", "", "", fmt.Errorf("error parsing snapshot id: %q, should at least contain 3 #", id)
 	}
-	snapshotTime := segments[6]
-	var subsID string
-	if len(segments) > 7 {
-		if isValidSubscriptionID(segments[7]) {
-			subsID = segments[7]
-		} else {
-			if isValidSubscriptionID(segments[6]) {
-				subsID = segments[6]
-				snapshotTime = segments[7]
+
+	var snapshotTime, subsID string
+
+	if len(segments) >= 7 {
+		// Standard format: rg#account#share#diskName#namespace#storageClass#snapshotTime[#subsID]
+		snapshotTime = segments[6]
+		if len(segments) > 7 {
+			if isValidSubscriptionID(segments[7]) {
+				subsID = segments[7]
+			} else {
+				if isValidSubscriptionID(segments[6]) {
+					subsID = segments[6]
+					snapshotTime = segments[7]
+				}
 			}
 		}
+	} else {
+		// Short format (e.g. in-tree migration): [rg]#account#share#snapshotTime[#subsID]
+		// The last segment(s) contain snapshotTime and optionally subsID
+		lastIdx := len(segments) - 1
+		if len(segments) >= 5 && isValidSubscriptionID(segments[lastIdx]) {
+			subsID = segments[lastIdx]
+			snapshotTime = segments[lastIdx-1]
+		} else if len(segments) >= 5 && isValidSubscriptionID(segments[lastIdx-1]) {
+			subsID = segments[lastIdx-1]
+			snapshotTime = segments[lastIdx]
+		} else {
+			snapshotTime = segments[lastIdx]
+		}
 	}
+
 	return segments[0], segments[1], segments[2], snapshotTime, subsID, nil
 }
 
@@ -862,6 +895,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 	var protocol, accountKey, secretName, pvcNamespace string
 	// getAccountKeyFromSecret indicates whether get account key only from k8s secret
 	var getAccountKeyFromSecret, getLatestAccountKey, mountWithManagedIdentity, mountWithOAuthToken, mountWithWIToken bool
+	var accountKeyFromCache bool
 	var clientID, tenantID, tokenFilePath, serviceAccountToken string
 
 	for k, v := range reqContext {
@@ -973,7 +1007,9 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		if err != nil {
 			return rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, tokenFilePath, fmt.Errorf("failed to parse service account token: %v", err)
 		}
-		tokenFileName := clientID + "-" + accountName
+		// Use volume ID so concurrent mounts with same clientID and SA do not
+		// share a single token file.
+		tokenFileName := clientID + "-" + accountName + "-" + hashVolumeIDForTokenFile(volumeID)
 		if !isValidTokenFileName(tokenFileName) {
 			return rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, tokenFilePath, fmt.Errorf("invalid token file name(%s) generated for clientID(%s) and accountName(%s)", tokenFileName, clientID, accountName)
 		}
@@ -982,6 +1018,11 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		existingToken, readErr := os.ReadFile(tokenFilePath)
 		if readErr == nil && string(existingToken) == token {
 			klog.V(4).Infof("the token file(%s) already exists and the token value is the same, no need to rewrite the token file", tokenFilePath)
+			if strings.EqualFold(getValueInMap(reqContext, ephemeralField), trueValue) {
+				// The token file is unchanged, but return token file path so caller
+				// refreshes credential cache via setCredentialCache (inline only).
+				return rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, tokenFilePath, nil
+			}
 			return rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, "", nil
 		}
 		// write token to a file
@@ -1006,6 +1047,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		}
 		if cache != nil {
 			accountKey = cache.(string)
+			accountKeyFromCache = true
 		} else {
 			if secretName == "" && accountName != "" {
 				secretName = fmt.Sprintf(secretNameTemplate, accountName)
@@ -1041,7 +1083,7 @@ func (d *Driver) GetAccountInfo(ctx context.Context, volumeID string, secrets, r
 		}
 	}
 
-	if err == nil && accountKey != "" {
+	if err == nil && accountKey != "" && !accountKeyFromCache {
 		d.accountCacheMap.Set(accountName, accountKey)
 	}
 	return rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, tokenFilePath, err
@@ -1089,6 +1131,18 @@ func isSupportedPublicNetworkAccess(publicNetworkAccess string) bool {
 	}
 	for _, tier := range armstorage.PossiblePublicNetworkAccessValues() {
 		if publicNetworkAccess == string(tier) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSupportedNetworkEndpointType(networkEndpointType string) bool {
+	if networkEndpointType == "" {
+		return true
+	}
+	for _, endpointType := range supportedNetworkEndpointTypeList {
+		if strings.EqualFold(networkEndpointType, endpointType) {
 			return true
 		}
 	}
@@ -1700,4 +1754,13 @@ func parseServiceAccountToken(tokenStr string) (string, error) {
 		return "", fmt.Errorf("token for audience %s not found", DefaultTokenAudience)
 	}
 	return token.APIAzureADTokenExchange.Token, nil
+}
+
+// hashVolumeIDForTokenFile returns a filesystem-safe, collision-resistant string
+// derived from the volume ID. It is appended to the workload-identity token cache
+// filename so each volume gets its own token file, preventing concurrent mounts
+// that share a clientID/accountName from racing on a single shared file.
+func hashVolumeIDForTokenFile(volumeID string) string {
+	sum := sha256.Sum256([]byte(volumeID))
+	return hex.EncodeToString(sum[:8])
 }

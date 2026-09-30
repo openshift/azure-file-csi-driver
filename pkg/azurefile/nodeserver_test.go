@@ -17,10 +17,12 @@ limitations under the License.
 package azurefile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -34,15 +36,21 @@ import (
 	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	testingclient "k8s.io/client-go/testing"
+	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	testingexec "k8s.io/utils/exec/testing"
+	mount_azurefile "sigs.k8s.io/azurefile-csi-driver/pkg/azurefile-proxy/pb"
 	"sigs.k8s.io/azurefile-csi-driver/test/utils/testutil"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient"
@@ -60,6 +68,20 @@ type ExecArgs struct {
 	args    []string
 	output  string
 	err     error
+}
+
+type fakeProxyMountServer struct {
+	mount_azurefile.UnimplementedMountServiceServer
+	lastMountOptions     []string
+	validateMountOptions func(mountOptions []string) bool
+}
+
+func (s *fakeProxyMountServer) MountAzureFile(_ context.Context, req *mount_azurefile.MountAzureFileRequest) (*mount_azurefile.MountAzureFileResponse, error) {
+	if s.validateMountOptions != nil && !s.validateMountOptions(req.GetMountOptions()) {
+		return nil, errors.New("mount options validation failed")
+	}
+	s.lastMountOptions = append([]string{}, req.GetMountOptions()...)
+	return &mount_azurefile.MountAzureFileResponse{}, nil
 }
 
 func matchFlakyWindowsError(mainError error, substr string) bool {
@@ -257,6 +279,161 @@ func TestNodePublishVolume(t *testing.T) {
 			},
 		},
 		{
+			desc: "[Error] Ephemeral volume with mountWithOAuthToken and clientID should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e449",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:           "true",
+					storageAccountField:      "teststorageaccount",
+					shareNameField:           "testshare",
+					mountWithOAuthTokenField: "true",
+					clientIDField:            "branch-trigger",
+					serviceAccountTokenField: "fake-token",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "mountWithOAuthToken cannot be used for ephemeral volumes, please use secret based authentication"),
+				WindowsError: status.Error(codes.InvalidArgument, "mountWithOAuthToken cannot be used for ephemeral volumes, please use secret based authentication"),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume with case-colliding secretNamespace keys should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e446",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:    "true",
+					shareNameField:    "testshare",
+					"secretNamespace": "namespace",
+					"SecretNamespace": "namespace-other",
+					podNamespaceField: "namespace",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "ephemeral volume request contains case-colliding volume attribute keys that normalize to \"secretnamespace, secretnamespace\""),
+				WindowsError: status.Error(codes.InvalidArgument, "ephemeral volume request contains case-colliding volume attribute keys that normalize to \"secretnamespace, secretnamespace\""),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume with case-colliding mountWithManagedIdentity keys should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e372",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:             "true",
+					shareNameField:             "testshare",
+					"mountwithmanagedidentity": "false",
+					"MOUNTWITHMANAGEDIDENTITY": "true",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "ephemeral volume request contains case-colliding volume attribute keys that normalize to \"mountwithmanagedidentity, mountwithmanagedidentity\""),
+				WindowsError: status.Error(codes.InvalidArgument, "ephemeral volume request contains case-colliding volume attribute keys that normalize to \"mountwithmanagedidentity, mountwithmanagedidentity\""),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume with diskName should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e441",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:  "true",
+					shareNameField:  "testshare",
+					serverNameField: "test_servername",
+					diskNameField:   "disk.vhd",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "VHD disk feature (diskName or disk fsType) is not supported for ephemeral volumes"),
+				WindowsError: status.Error(codes.InvalidArgument, "VHD disk feature (diskName or disk fsType) is not supported for ephemeral volumes"),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume with disk fsType should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e442",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:  "true",
+					shareNameField:  "testshare",
+					serverNameField: "test_servername",
+					fsTypeField:     "ext4",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "VHD disk feature (diskName or disk fsType) is not supported for ephemeral volumes"),
+				WindowsError: status.Error(codes.InvalidArgument, "VHD disk feature (diskName or disk fsType) is not supported for ephemeral volumes"),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume with bind mount option should fail",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8e445",
+				TargetPath: targetTest,
+				Readonly:   true,
+				VolumeContext: map[string]string{
+					ephemeralField:    "true",
+					shareNameField:    "testshare",
+					serverNameField:   "test_servername",
+					mountOptionsField: "dir_mode=0777,bind",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, "mount option \"bind\" is not supported for ephemeral volumes"),
+				WindowsError: status.Error(codes.InvalidArgument, "mount option \"bind\" is not supported for ephemeral volumes"),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume should reject destination override in mountOptions",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeCapability:  &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:          "csi-inline-destination-override",
+				TargetPath:        targetTest,
+				StagingTargetPath: sourceTest,
+				VolumeContext: map[string]string{
+					ephemeralField:    "true",
+					shareNameField:    "testshare",
+					serverNameField:   "testaccount.file.core.windows.net",
+					mountOptionsField: "nosharesock,addr=203.0.113.10",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, `mount option "addr" is not supported for ephemeral volumes`),
+				WindowsError: status.Error(codes.InvalidArgument, `mount option "addr" is not supported for ephemeral volumes`),
+			},
+		},
+		{
+			desc: "[Error] Ephemeral volume should reject packed authentication override in mount flags",
+			req: &csi.NodePublishVolumeRequest{
+				VolumeCapability: &csi.VolumeCapability{
+					AccessMode: &volumeCap,
+					AccessType: &csi.VolumeCapability_Mount{
+						Mount: &csi.VolumeCapability_MountVolume{
+							MountFlags: []string{"nosharesock,sec=krb5"},
+						},
+					},
+				},
+				VolumeId:          "csi-inline-authentication-override",
+				TargetPath:        targetTest,
+				StagingTargetPath: sourceTest,
+				VolumeContext: map[string]string{
+					ephemeralField:  "true",
+					shareNameField:  "testshare",
+					serverNameField: "testaccount.file.core.windows.net",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(codes.InvalidArgument, `mount option "sec" is not supported for ephemeral volumes`),
+				WindowsError: status.Error(codes.InvalidArgument, `mount option "sec" is not supported for ephemeral volumes`),
+			},
+		},
+		{
 			desc: "[Error] Ephemeral volume with mountWithWIToken should preserve storageAccount",
 			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
 				VolumeId:   "csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8ed84",
@@ -273,6 +450,57 @@ func TestNodePublishVolume(t *testing.T) {
 			expectedErr: testutil.TestError{
 				DefaultError: status.Errorf(codes.InvalidArgument, "GetAccountInfo(csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8ed84) failed with error: clientID is empty for workload identity auth"),
 				WindowsError: status.Errorf(codes.InvalidArgument, "GetAccountInfo(csi-94637b24200724b604b0e2c92e0fcdfabb0e109f656857c5a3c9585777c8ed84) failed with error: clientID is empty for workload identity auth"),
+			},
+		},
+		{
+			desc: "[Success] Republish for clientID-only mount already mounted skips NodeStageVolume",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:          "csi-clientid-republish-already-mounted",
+				TargetPath:        alreadyMountedTarget,
+				StagingTargetPath: sourceTest,
+				Readonly:          true,
+				VolumeContext: map[string]string{
+					storageAccountField:      "teststorageaccount",
+					shareNameField:           "testshare",
+					clientIDField:            "test-client-id-1234",
+					serviceAccountTokenField: "fake-token",
+				},
+			},
+			expectedErr: testutil.TestError{},
+		},
+		{
+			desc: "[Success] Republish for ephemeral clientID-based mount already mounted skips NodeStageVolume",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:          "csi-ephemeral-clientid-republish-already-mounted",
+				TargetPath:        alreadyMountedTarget,
+				StagingTargetPath: sourceTest,
+				Readonly:          true,
+				VolumeContext: map[string]string{
+					ephemeralField:      "true",
+					storageAccountField: "teststorageaccount",
+					shareNameField:      "testshare",
+					clientIDField:       "test-client-id-1234",
+				},
+			},
+			expectedErr: testutil.TestError{},
+		},
+		{
+			desc: "[Error] Republish for mountWithWIToken already mounted should still refresh credentials (do not skip NodeStageVolume)",
+			req: &csi.NodePublishVolumeRequest{VolumeCapability: &csi.VolumeCapability{AccessMode: &volumeCap},
+				VolumeId:          "csi-witoken-republish-already-mounted",
+				TargetPath:        alreadyMountedTarget,
+				StagingTargetPath: sourceTest,
+				Readonly:          true,
+				VolumeContext: map[string]string{
+					storageAccountField:      "teststorageaccount",
+					shareNameField:           "testshare",
+					mountWithWITokenField:    "true",
+					serviceAccountTokenField: "fake-token",
+				},
+			},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Errorf(codes.InvalidArgument, "GetAccountInfo(csi-witoken-republish-already-mounted) failed with error: clientID is empty for workload identity auth"),
+				WindowsError: status.Errorf(codes.InvalidArgument, "GetAccountInfo(csi-witoken-republish-already-mounted) failed with error: clientID is empty for workload identity auth"),
 			},
 		},
 		{
@@ -410,6 +638,224 @@ func TestNodePublishVolume(t *testing.T) {
 	assert.NoError(t, err)
 	err = os.RemoveAll(alreadyMountedTarget)
 	assert.NoError(t, err)
+}
+
+func TestAuthorizeInlineVolumeSecret(t *testing.T) {
+	const (
+		podNS       = "app-ns"
+		podName     = "app-pod"
+		saName      = "app-sa"
+		secretName  = "azure-secret"
+		accountName = "testaccount"
+	)
+
+	newPod := func(sa string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: podNS},
+			Spec:       corev1.PodSpec{ServiceAccountName: sa},
+		}
+	}
+	baseContext := func() map[string]string {
+		return map[string]string{
+			podNameField:         podName,
+			podNamespaceField:    podNS,
+			secretNamespaceField: podNS,
+			secretNameField:      secretName,
+		}
+	}
+
+	tests := []struct {
+		desc       string
+		mode       string
+		context    map[string]string
+		nilClient  bool
+		pod        *corev1.Pod
+		allowed    bool
+		sarErr     error
+		expectDeny bool
+	}{
+		{
+			desc:       "off mode is a no-op even when unauthorized",
+			mode:       inlineVolumeSecretAuthzOff,
+			context:    baseContext(),
+			pod:        newPod(saName),
+			allowed:    false,
+			expectDeny: false,
+		},
+		{
+			desc:       "enforce allows when SA is authorized",
+			mode:       inlineVolumeSecretAuthzEnforce,
+			context:    baseContext(),
+			pod:        newPod(saName),
+			allowed:    true,
+			expectDeny: false,
+		},
+		{
+			desc:       "enforce denies when SA is not authorized",
+			mode:       inlineVolumeSecretAuthzEnforce,
+			context:    baseContext(),
+			pod:        newPod(saName),
+			allowed:    false,
+			expectDeny: true,
+		},
+		{
+			desc:       "warn allows even when SA is not authorized",
+			mode:       inlineVolumeSecretAuthzWarn,
+			context:    baseContext(),
+			pod:        newPod(saName),
+			allowed:    false,
+			expectDeny: false,
+		},
+		{
+			desc:       "enforce denies when kube client is nil",
+			mode:       inlineVolumeSecretAuthzEnforce,
+			context:    baseContext(),
+			nilClient:  true,
+			expectDeny: true,
+		},
+		{
+			desc: "enforce denies when pod identity is missing",
+			mode: inlineVolumeSecretAuthzEnforce,
+			context: map[string]string{
+				secretNamespaceField: podNS,
+				secretNameField:      secretName,
+			},
+			pod:        newPod(saName),
+			expectDeny: true,
+		},
+		{
+			desc: "enforce denies when secret but no secret namespace",
+			mode: inlineVolumeSecretAuthzEnforce,
+			context: map[string]string{
+				secretNameField: secretName,
+			},
+			pod:        newPod(saName),
+			expectDeny: true,
+		},
+		{
+			desc: "no resolvable secret reference is a no-op",
+			mode: inlineVolumeSecretAuthzEnforce,
+			context: map[string]string{
+				podNameField:      podName,
+				podNamespaceField: podNS,
+			},
+			pod:        newPod(saName),
+			allowed:    false,
+			expectDeny: false,
+		},
+		{
+			desc:       "empty pod service account defaults to 'default'",
+			mode:       inlineVolumeSecretAuthzEnforce,
+			context:    baseContext(),
+			pod:        newPod(""),
+			allowed:    true,
+			expectDeny: false,
+		},
+	}
+
+	for _, test := range tests {
+		d := NewFakeDriver()
+		d.inlineVolumeSecretAuthz = test.mode
+		if test.nilClient {
+			d.kubeClient = nil
+		} else {
+			objs := []k8sruntime.Object{}
+			if test.pod != nil {
+				objs = append(objs, test.pod)
+			}
+			client := fake.NewSimpleClientset(objs...)
+			allowed := test.allowed
+			sarErr := test.sarErr
+			client.PrependReactor("create", "subjectaccessreviews", func(action testingclient.Action) (bool, k8sruntime.Object, error) {
+				if sarErr != nil {
+					return true, nil, sarErr
+				}
+				sar := action.(testingclient.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+				sar.Status.Allowed = allowed
+				return true, sar, nil
+			})
+			d.kubeClient = client
+		}
+
+		err := d.authorizeInlineVolumeSecret(context.Background(), test.context)
+		if test.expectDeny {
+			if err == nil {
+				t.Errorf("test %q: expected PermissionDenied, got nil", test.desc)
+			} else if status.Code(err) != codes.PermissionDenied {
+				t.Errorf("test %q: expected PermissionDenied, got %v", test.desc, err)
+			}
+		} else if err != nil {
+			t.Errorf("test %q: expected no error, got %v", test.desc, err)
+		}
+	}
+}
+
+func TestAuthorizeInlineVolumeSecretInvalidMode(t *testing.T) {
+	d := NewFakeDriver()
+	d.inlineVolumeSecretAuthz = "bogus"
+	d.kubeClient = fake.NewSimpleClientset()
+	err := d.authorizeInlineVolumeSecret(context.Background(), map[string]string{
+		podNameField:      "app-pod",
+		podNamespaceField: "app-ns",
+		secretNameField:   "azure-secret",
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for unknown mode, got %v", err)
+	}
+}
+
+func TestAuthorizeInlineVolumeSecretSubject(t *testing.T) {
+	const (
+		podNS      = "app-ns"
+		podName    = "app-pod"
+		saName     = "app-sa"
+		secretName = "azure-secret"
+	)
+	d := NewFakeDriver()
+	d.inlineVolumeSecretAuthz = inlineVolumeSecretAuthzEnforce
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: podNS},
+		Spec:       corev1.PodSpec{ServiceAccountName: saName},
+	}
+	client := fake.NewSimpleClientset(pod)
+	var captured *authorizationv1.SubjectAccessReview
+	client.PrependReactor("create", "subjectaccessreviews", func(action testingclient.Action) (bool, k8sruntime.Object, error) {
+		captured = action.(testingclient.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+		captured.Status.Allowed = true
+		return true, captured, nil
+	})
+	d.kubeClient = client
+
+	ctx := map[string]string{
+		podNameField:         podName,
+		podNamespaceField:    podNS,
+		secretNamespaceField: podNS,
+		secretNameField:      secretName,
+	}
+	if err := d.authorizeInlineVolumeSecret(context.Background(), ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("expected a SubjectAccessReview to be created")
+	}
+	if got, want := captured.Spec.User, "system:serviceaccount:app-ns:app-sa"; got != want {
+		t.Errorf("User = %q, want %q", got, want)
+	}
+	wantGroups := map[string]bool{
+		"system:serviceaccounts":        true,
+		"system:serviceaccounts:app-ns": true,
+		"system:authenticated":          true,
+	}
+	for _, g := range captured.Spec.Groups {
+		delete(wantGroups, g)
+	}
+	if len(wantGroups) != 0 {
+		t.Errorf("missing expected groups in SAR: %v (got %v)", wantGroups, captured.Spec.Groups)
+	}
+	ra := captured.Spec.ResourceAttributes
+	if ra == nil || ra.Verb != "get" || ra.Resource != "secrets" || ra.Namespace != podNS || ra.Name != secretName || ra.Group != "" {
+		t.Errorf("unexpected ResourceAttributes: %+v", ra)
+	}
 }
 
 func TestNodeUnpublishVolume(t *testing.T) {
@@ -557,7 +1003,7 @@ func TestNodeStageVolume(t *testing.T) {
 		serverNameField: "test_servername",
 	}
 	errorSource := `\\test_servername\test_sharename`
-	errorSourceNFS := `test_servername://test_sharename`
+	errorSourceNFS := `test_servername.file.core.windows.net:/test_servername/test_sharename`
 
 	secrets := map[string]string{
 		"accountname": "k8s",
@@ -587,6 +1033,9 @@ func TestNodeStageVolume(t *testing.T) {
 		// error messages
 		flakyWindowsErrorMessage string
 		cleanup                  func()
+		enableAZNFSForNFSMounts  bool
+		shouldEnableProxy        bool
+		storageEndpointSuffix    string
 	}{
 		{
 			desc:        "[Error] Volume ID missing",
@@ -768,17 +1217,34 @@ func TestNodeStageVolume(t *testing.T) {
 			},
 		},
 		{
+			desc: "[Error] PV disk path: diskName traversal is rejected",
+			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
+				VolumeCapability: &stdVolCap,
+				VolumeContext: map[string]string{
+					fsTypeField:     "ext4",
+					diskNameField:   "../../../../host/marker.vhd",
+					shareNameField:  "test_sharename",
+					serverNameField: "test_servername",
+				},
+				Secrets: secrets},
+			expectedErr: testutil.TestError{
+				DefaultError: status.Errorf(codes.InvalidArgument, "invalid %s %q: contains directory traversal sequence", "diskName", "../../../../host/marker.vhd"),
+			},
+		},
+		{
 			desc: "[Error] FormatAndMount mocked by exec commands with protocol as nfs",
 			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
 				VolumeCapability: &stdVolCap,
 				VolumeContext: map[string]string{
-					fsTypeField:       "ext4",
-					protocolField:     "nfs",
-					diskNameField:     "test_disk.vhd",
-					shareNameField:    "test_sharename",
-					serverNameField:   "test_servername",
-					ephemeralField:    "true",
-					mountOptionsField: "test_ephemeral",
+					fsTypeField:                "ext4",
+					protocolField:              "nfs",
+					diskNameField:              "test_disk.vhd",
+					shareNameField:             "test_sharename",
+					serverNameField:            "test_servername.file.core.windows.net",
+					ephemeralField:             "true",
+					mountOptionsField:          "test_ephemeral",
+					storageEndpointSuffixField: ".core.windows.net",
+					storageAccountField:        "test_servername",
 				},
 				Secrets: secrets},
 			execScripts: []ExecArgs{
@@ -845,7 +1311,8 @@ func TestNodeStageVolume(t *testing.T) {
 				VolumeCapability: &stdVolCap,
 				VolumeContext:    volContextEmptyShareName,
 				Secrets:          secrets},
-			skipOnWindows: true,
+			storageEndpointSuffix: "test_suffix",
+			skipOnWindows:         true,
 			flakyWindowsErrorMessage: fmt.Sprintf("volume(vol_1##) mount \\\\k8s.file.test_suffix\\test_sharename on %v failed with "+
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				sourceTest),
@@ -862,6 +1329,122 @@ func TestNodeStageVolume(t *testing.T) {
 				"smb mapping failed with error: rpc error: code = Unknown desc = NewSmbGlobalMapping failed.",
 				errorSource, sourceTest),
 			expectedErr: testutil.TestError{},
+		},
+		{
+			desc: "[Error] NFS + use-aznfs-for-nfs-mounts requires azurefile-proxy",
+			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
+				VolumeCapability: &stdVolCap,
+				VolumeContext: map[string]string{
+					fsTypeField:           "nfs",
+					protocolField:         "nfs",
+					diskNameField:         "test_disk.vhd",
+					shareNameField:        "test_sharename",
+					serverNameField:       "test_servername",
+					mountPermissionsField: "0755",
+				},
+				Secrets: secrets},
+			skipOnWindows:           true,
+			enableAZNFSForNFSMounts: true,
+			expectedErr: testutil.TestError{
+				DefaultError: status.Error(
+					codes.InvalidArgument,
+					"aznfs mounts (encryptInTransit or use-aznfs-for-nfs-mounts) are only available when azurefile-proxy is enabled",
+				),
+			},
+		},
+		{
+			desc: "[Success] valid request with use-aznfs-for-nfs-mounts enabled should have notls mountoption",
+			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
+				VolumeCapability: &stdVolCap,
+				VolumeContext: map[string]string{
+					fsTypeField:           "nfs",
+					protocolField:         "nfs",
+					diskNameField:         "test_disk.vhd",
+					shareNameField:        "test_sharename",
+					serverNameField:       "test_servername",
+					mountPermissionsField: "0755",
+				},
+				Secrets: secrets},
+			skipOnWindows:           true,
+			shouldEnableProxy:       true,
+			enableAZNFSForNFSMounts: true,
+			expectedErr:             testutil.TestError{},
+			setup: func() {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("failed to start fake proxy listener: %v", err)
+				}
+				proxyServer := grpc.NewServer()
+				mountServer := &fakeProxyMountServer{
+					validateMountOptions: func(mountOptions []string) bool {
+						hasNoTLS := false
+						for _, option := range mountOptions {
+							if option == "notls" {
+								hasNoTLS = true
+							}
+						}
+						return hasNoTLS
+					},
+				}
+				mount_azurefile.RegisterMountServiceServer(proxyServer, mountServer)
+				go func() {
+					_ = proxyServer.Serve(listener)
+				}()
+
+				d.azurefileProxyEndpoint = listener.Addr().String()
+				t.Cleanup(func() {
+					proxyServer.Stop()
+					_ = listener.Close()
+				})
+			},
+		},
+		{
+			desc: "[Success] valid request with encryptionIntransit and use-aznfs-for-nfs-mounts enabled should not have notls mountoptions",
+			req: &csi.NodeStageVolumeRequest{VolumeId: "vol_1##", StagingTargetPath: sourceTest,
+				VolumeCapability: &stdVolCap,
+				VolumeContext: map[string]string{
+					fsTypeField:           "nfs",
+					protocolField:         "nfs",
+					diskNameField:         "test_disk.vhd",
+					shareNameField:        "test_sharename",
+					serverNameField:       "test_servername",
+					mountPermissionsField: "0755",
+					encryptInTransitField: "true",
+				},
+				Secrets: secrets},
+			skipOnWindows:           true,
+			shouldEnableProxy:       true,
+			enableAZNFSForNFSMounts: true,
+			expectedErr:             testutil.TestError{},
+			setup: func() {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("failed to start fake proxy listener: %v", err)
+				}
+				proxyServer := grpc.NewServer()
+				mountServer := &fakeProxyMountServer{
+					validateMountOptions: func(mountOptions []string) bool {
+						hasNoTLS := false
+						for _, option := range mountOptions {
+							if option == "notls" {
+								hasNoTLS = true
+							}
+						}
+						// Expected not to have notls in mount options
+						return !hasNoTLS
+					},
+				}
+				mount_azurefile.RegisterMountServiceServer(proxyServer, mountServer)
+				go func() {
+					_ = proxyServer.Serve(listener)
+				}()
+
+				d.azurefileProxyEndpoint = listener.Addr().String()
+				t.Cleanup(func() {
+					proxyServer.Stop()
+					_ = listener.Close()
+				})
+			},
 		},
 		{
 			desc: "[Success] Valid request with supported fsType disk",
@@ -1017,6 +1600,14 @@ func TestNodeStageVolume(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to get fake mounter: %v", err)
 		}
+		d.useAZNFSForNFSMounts = false
+		d.enableAzurefileProxy = false
+		if test.enableAZNFSForNFSMounts {
+			d.WithEnableAznfsForNFSMounts()
+		}
+		if test.shouldEnableProxy {
+			d.enableAzurefileProxy = true
+		}
 
 		if runtime.GOOS != "windows" {
 			fakeExec := &testingexec.FakeExec{ExactOrder: true}
@@ -1034,8 +1625,12 @@ func TestNodeStageVolume(t *testing.T) {
 		clientFactory := mock_azclient.NewMockClientFactory(ctrl)
 		mockAccountClient := mock_accountclient.NewMockInterface(ctrl)
 		clientFactory.EXPECT().GetAccountClientForSub(gomock.Any()).Return(mockAccountClient, nil).AnyTimes()
+		storageEndpointSuffix := test.storageEndpointSuffix
+		if storageEndpointSuffix == "" {
+			storageEndpointSuffix = defaultStorageEndPointSuffix
+		}
 		d.cloud = &storage.AccountRepo{
-			Environment:          &azclient.Environment{StorageEndpointSuffix: "test_suffix"},
+			Environment:          &azclient.Environment{StorageEndpointSuffix: storageEndpointSuffix},
 			NetworkClientFactory: clientFactory,
 			ComputeClientFactory: clientFactory,
 		}
@@ -1063,6 +1658,125 @@ func TestNodeStageVolume(t *testing.T) {
 	assert.NoError(t, err)
 	err = os.RemoveAll(errorMountSensSource)
 	assert.NoError(t, err)
+}
+
+func TestValidateInlineSMBMountOptions(t *testing.T) {
+	tests := []struct {
+		desc          string
+		mountOptions  []string
+		expectedError string
+	}{
+		{
+			desc:         "empty options",
+			mountOptions: []string{"", "  "},
+		},
+		{
+			desc:         "options without values",
+			mountOptions: []string{"ro", "nosharesock"},
+		},
+		{
+			desc: "allowed options",
+			mountOptions: []string{
+				"acdirmax=30,acregmax=30,actimeo=30,cache=strict,closetimeo=0",
+				"dir_mode=0777,file_mode=0777,gid=1000,max_channels=4",
+				"mfsymlinks,nobrl,nosharesock,ro,sloppy,uid=1000,vers=3.1.1",
+			},
+		},
+		{
+			desc:         "read-write override",
+			mountOptions: []string{"rw"},
+		},
+		{
+			desc:          "bind option",
+			mountOptions:  []string{"bind"},
+			expectedError: `mount option "bind" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "recursive bind option",
+			mountOptions:  []string{"rbind"},
+			expectedError: `mount option "rbind" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "cred option",
+			mountOptions:  []string{"cred=/tmp/credentials"},
+			expectedError: `mount option "cred" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "credentials option with arbitrary path",
+			mountOptions:  []string{"credentials=/proc/self/fd/0"},
+			expectedError: `mount option "credentials" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "mixed case and whitespace",
+			mountOptions:  []string{" CREDENTIALS = /dev/zero "},
+			expectedError: `mount option "CREDENTIALS" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "addr option",
+			mountOptions:  []string{"addr=203.0.113.10"},
+			expectedError: `mount option "addr" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "packed IP option",
+			mountOptions:  []string{"nosharesock,ip=203.0.113.10"},
+			expectedError: `mount option "ip" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "packed mixed case UNC option",
+			mountOptions:  []string{"ro, UNC = //attacker/share"},
+			expectedError: `mount option "UNC" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "target alias",
+			mountOptions:  []string{"target=//attacker/share"},
+			expectedError: `mount option "target" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "path alias",
+			mountOptions:  []string{"path=//attacker/share"},
+			expectedError: `mount option "path" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "Kerberos security option",
+			mountOptions:  []string{"sec=krb5"},
+			expectedError: `mount option "sec" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "credential UID option",
+			mountOptions:  []string{"cruid=0"},
+			expectedError: `mount option "cruid" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "upcall target option",
+			mountOptions:  []string{"upcall_target=mount"},
+			expectedError: `mount option "upcall_target" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "CIFS ACL option",
+			mountOptions:  []string{"cifsacl"},
+			expectedError: `mount option "cifsacl" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:          "mode from SID option",
+			mountOptions:  []string{"modefromsid"},
+			expectedError: `mount option "modefromsid" is not supported for ephemeral volumes`,
+		},
+		{
+			desc:         "unknown option is not denied",
+			mountOptions: []string{"unknown=value"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			err := validateInlineSMBMountOptions(test.mountOptions)
+			if test.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, test.expectedError)
+			}
+		})
+	}
 }
 
 func TestNodeUnstageVolume(t *testing.T) {
@@ -1310,7 +2024,7 @@ func TestEnsureMountPoint(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		_, err := d.ensureMountPoint(test.target, 0777, test.shouldUnmount)
+		_, err := d.ensureMountPoint(test.target, 0777, test.shouldUnmount, false)
 		if !reflect.DeepEqual(err, test.expectedErr) {
 			t.Errorf("[%s]: Unexpected Error: %v, expected error: %v", test.desc, err, test.expectedErr)
 		}
@@ -1326,6 +2040,77 @@ func TestEnsureMountPoint(t *testing.T) {
 	assert.NoError(t, err)
 	err = os.RemoveAll(targetTest)
 	assert.NoError(t, err)
+}
+
+func TestEnsureMountPointEphemeralLogVerbosity(t *testing.T) {
+	// The "already mounted to target ..." log is demoted to V(6) for the
+	// ephemeral (CSI inline) volume path to avoid flooding logs on kubelet
+	// republish reconciles. Non-ephemeral callers must keep V(2) visibility.
+	alreadyMountedTarget := "./false_is_likely_ephemeral_target"
+	_ = makeDir(alreadyMountedTarget, 0755)
+	defer func() { _ = os.RemoveAll(alreadyMountedTarget) }()
+
+	d := NewFakeDriver()
+	fakeMounter := &fakeMounter{}
+	fakeExec := &testingexec.FakeExec{ExactOrder: true}
+	d.mounter = &mount.SafeFormatAndMount{
+		Interface: fakeMounter,
+		Exec:      fakeExec,
+	}
+
+	buf := new(bytes.Buffer)
+	// klog defaults to logtostderr=true, which bypasses SetOutput. Disable it
+	// so the buffer captures the log output.
+	klog.LogToStderr(false)
+	defer klog.LogToStderr(true)
+	klog.SetOutput(buf)
+	defer klog.SetOutput(io.Discard)
+	var vLevel klog.Level
+	defer func() { _ = vLevel.Set("0") }()
+
+	tests := []struct {
+		name         string
+		v            string
+		ephemeralVol bool
+		expectLog    bool
+	}{
+		{
+			name:         "non-ephemeral: already-mounted log is visible at V(2)",
+			v:            "2",
+			ephemeralVol: false,
+			expectLog:    true,
+		},
+		{
+			name:         "ephemeral: already-mounted log is suppressed at V(2)",
+			v:            "2",
+			ephemeralVol: true,
+			expectLog:    false,
+		},
+		{
+			name:         "ephemeral: already-mounted log is visible at V(6)",
+			v:            "6",
+			ephemeralVol: true,
+			expectLog:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_ = vLevel.Set(test.v)
+			buf.Reset()
+
+			// shouldUnmount=false hits the fast "already mounted" branch.
+			_, err := d.ensureMountPoint(alreadyMountedTarget, 0777, false, test.ephemeralVol)
+			assert.NoError(t, err)
+			klog.Flush()
+
+			if test.expectLog {
+				assert.Contains(t, buf.String(), "already mounted to target")
+			} else {
+				assert.NotContains(t, buf.String(), "already mounted to target")
+			}
+		})
+	}
 }
 
 func TestMakeDir(t *testing.T) {
@@ -1564,6 +2349,97 @@ func TestSetCredentialCacheWithOAuthToken(t *testing.T) {
 			} else if test.expectedErr != "" {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), test.expectedErr)
+			}
+		})
+	}
+}
+
+func TestGetKerberosHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		server   string
+		expected string
+	}{
+		{
+			name:     "canonical name is unchanged",
+			server:   "acct.file.core.windows.net",
+			expected: "acct.file.core.windows.net",
+		},
+		{
+			name:     "privatelink name is canonicalized",
+			server:   "acct.privatelink.file.core.windows.net",
+			expected: "acct.file.core.windows.net",
+		},
+		{
+			name:     "privatelink in China cloud",
+			server:   "acct.privatelink.file.core.chinacloudapi.cn",
+			expected: "acct.file.core.chinacloudapi.cn",
+		},
+		{
+			name:     "privatelink in US government cloud",
+			server:   "acct.privatelink.file.core.usgovcloudapi.net",
+			expected: "acct.file.core.usgovcloudapi.net",
+		},
+		{
+			name:     "empty server",
+			server:   "",
+			expected: "",
+		},
+		{
+			name:     "custom endpoint without privatelink label",
+			server:   "acct.file.example.com",
+			expected: "acct.file.example.com",
+		},
+		{
+			name:     "only strips first .privatelink.file. occurrence",
+			server:   "acct.privatelink.file.privatelink.file.core.windows.net",
+			expected: "acct.file.privatelink.file.core.windows.net",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := getKerberosHost(tc.server)
+			if got != tc.expected {
+				t.Errorf("getKerberosHost(%q) = %q, want %q", tc.server, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestValidateDiskIsRegularFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping symlink-based test on windows")
+	}
+	shareDir := t.TempDir()
+
+	regularPath := filepath.Join(shareDir, "disk.vhd")
+	if err := os.WriteFile(regularPath, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A CIFS-emulated symlink surfaces to the VFS as a symlink; model that with a
+	// real symlink and assert the no-follow check rejects it regardless of target.
+	symlinkPath := filepath.Join(shareDir, "link.vhd")
+	if err := os.Symlink("/etc/hostname", symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		desc      string
+		diskPath  string
+		expectErr bool
+	}{
+		{desc: "regular file is accepted", diskPath: regularPath, expectErr: false},
+		{desc: "missing file is tolerated", diskPath: filepath.Join(shareDir, "absent.vhd"), expectErr: false},
+		{desc: "symlink is rejected", diskPath: symlinkPath, expectErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			err := validateDiskIsRegularFile(tc.diskPath)
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
 			}
 		})
 	}
