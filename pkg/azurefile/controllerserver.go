@@ -1064,7 +1064,7 @@ func (d *Driver) copyFileShareByAzcopy(ctx context.Context, srcFileShareName, ds
 	jobState, percent, err := d.azcopy.GetAzcopyJob(dstFileShareName, authAzcopyEnv)
 	klog.V(2).Infof("azcopy job status: %s, copy percent: %s%%, error: %v", jobState, percent, err)
 	switch jobState {
-	case volumehelper.AzcopyJobError, volumehelper.AzcopyJobCompleted:
+	case volumehelper.AzcopyJobError, volumehelper.AzcopyJobCompleted, volumehelper.AzcopyJobCompletedWithErrors, volumehelper.AzcopyJobCompletedWithSkipped, volumehelper.AzcopyJobCompletedWithErrorsAndSkipped:
 		return err
 	case volumehelper.AzcopyJobRunning:
 		return fmt.Errorf("wait for the existing AzCopy job to complete, current copy percentage is %s%%", percent)
@@ -1112,6 +1112,9 @@ func (d *Driver) copyFileShareByAzcopy(ctx context.Context, srcFileShareName, ds
 			klog.Warningf("CopyFileShare(%s, %s, %s) failed with error: %v", accountOptions.ResourceGroup, dstAccountName, dstFileShareName, copyErr)
 		} else {
 			klog.V(2).Infof("copied fileshare %s to %s successfully", srcFileShareName, dstFileShareName)
+			if out, err := d.azcopy.CleanJobs(); err != nil {
+				klog.Warningf("clean azcopy jobs failed with error: %v, output: %s", err, string(out))
+			}
 		}
 		return copyErr
 	}

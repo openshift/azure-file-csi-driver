@@ -35,10 +35,13 @@ const (
 type AzcopyJobState string
 
 const (
-	AzcopyJobError     AzcopyJobState = "Error"
-	AzcopyJobNotFound  AzcopyJobState = "NotFound"
-	AzcopyJobRunning   AzcopyJobState = "Running"
-	AzcopyJobCompleted AzcopyJobState = "Completed"
+	AzcopyJobError                         AzcopyJobState = "Error"
+	AzcopyJobNotFound                      AzcopyJobState = "NotFound"
+	AzcopyJobRunning                       AzcopyJobState = "Running"
+	AzcopyJobCompleted                     AzcopyJobState = "Completed"
+	AzcopyJobCompletedWithErrors           AzcopyJobState = "CompletedWithErrors"
+	AzcopyJobCompletedWithSkipped          AzcopyJobState = "CompletedWithSkipped"
+	AzcopyJobCompletedWithErrorsAndSkipped AzcopyJobState = "CompletedWithErrorsAndSkipped"
 )
 
 var powershellCmdMutex = &sync.Mutex{}
@@ -165,6 +168,11 @@ func (ac *Azcopy) TestListJobs(accountName, storageEndpointSuffix string, authAz
 		ac.ExecCmd = &ExecCommand{}
 	}
 	return ac.ExecCmd.RunCommand(cmdStr, authAzcopyEnv)
+}
+
+// CleanJobs clean up completed azcopy jobs to reduce .azcopy/plans folder files
+func (ac *Azcopy) CleanJobs() (string, error) {
+	return ac.ExecCmd.RunCommand("azcopy jobs clean", nil)
 }
 
 // parseAzcopyJobList parse command azcopy jobs list, get jobid and state from joblist
