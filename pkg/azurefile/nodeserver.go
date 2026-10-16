@@ -19,6 +19,7 @@ package azurefile
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	volume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume/util"
 
@@ -67,6 +72,15 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 		mc.Observe(returnedErr == nil)
 	}()
 
+	// Track inline (ephemeral) volume usage independently of persistent
+	// volumes; the outcome is the NodePublishVolume result.
+	if strings.EqualFold(req.GetVolumeContext()[ephemeralField], trueValue) {
+		inlineMC := csiMetrics.NewCSIMetricContext("inline_mount")
+		defer func() {
+			inlineMC.Observe(returnedErr == nil)
+		}()
+	}
+
 	volCap := req.GetVolumeCapability()
 	if volCap == nil {
 		return nil, status.Error(codes.InvalidArgument, "Volume capability missing in request")
@@ -84,8 +98,51 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	mountPermissions := d.mountPermissions
 	context := req.GetVolumeContext()
 	if context != nil {
-		if getValueInMap(context, serviceAccountTokenField) != "" && shouldUseServiceAccountToken(context) {
-			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s, mountWithWIToken: %s", volumeID, target, getValueInMap(context, clientIDField), getValueInMap(context, mountWithWITokenField))
+		// ephemeral volume
+		if strings.EqualFold(context[ephemeralField], trueValue) {
+			// Reject case duplicate keys
+			if key, ok := caseCollidingKey(context); ok {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("ephemeral volume request contains case-colliding volume attribute keys that normalize to %q", key))
+			}
+			setKeyValueInMap(context, secretNamespaceField, context[podNamespaceField])
+			// Inline volumes do not support the VHD disk feature.
+			if getValueInMap(context, diskNameField) != "" || isDiskFsType(getValueInMap(context, fsTypeField)) {
+				return nil, status.Error(codes.InvalidArgument, "VHD disk feature (diskName or disk fsType) is not supported for ephemeral volumes")
+			}
+			mountOptions := strings.TrimSpace(getValueInMap(context, mountOptionsField))
+			useWIToken := strings.EqualFold(getValueInMap(context, mountWithWITokenField), trueValue)
+			mountFlags := req.GetVolumeCapability().GetMount().GetMountFlags()
+			inlineMountOptions := append([]string(nil), mountFlags...)
+			inlineMountOptions = append(inlineMountOptions, mountOptions)
+			if err := validateInlineSMBMountOptions(inlineMountOptions); err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			// When Managed Identity or OAuth token is used for ephemeral volumes then reject the request.
+			// Allowing access for inline volume with identity will open up risk of arbitrary pods accessing fileshares with node identity permissions.
+			if strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) {
+				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("mountWithManagedIdentity cannot be used for ephemeral volumes, please use either %s or secret based authentication", mountWithWITokenField))
+			}
+			if strings.EqualFold(getValueInMap(context, mountWithOAuthTokenField), trueValue) {
+				return nil, status.Error(codes.InvalidArgument, "mountWithOAuthToken cannot be used for ephemeral volumes, please use secret based authentication")
+			}
+
+			if d.canSkipRepublishNodeStage(context, target) {
+				klog.V(2).Infof("NodePublishVolume: ephemeral volume(%s) already mounted on %s, skipping NodeStageVolume (no time-bound credential to refresh)", volumeID, target)
+				return &csi.NodePublishVolumeResponse{}, nil
+			}
+			if !d.allowInlineVolumeKeyAccessWithIdentity && !useWIToken {
+				// only get storage account from secret when not using managed identity or workload identity
+				setKeyValueInMap(context, getAccountKeyFromSecretField, trueValue)
+				setKeyValueInMap(context, storageAccountField, "")
+			}
+			// For secret-based inline volumes, confirm the mounting pod's own ServiceAccount
+			// is authorized to read the referenced Secret before mounting.
+			if !useWIToken {
+				if err := d.authorizeInlineVolumeSecret(ctx, context); err != nil {
+					return nil, err
+				}
+			}
+			klog.V(6).Infof("NodePublishVolume: ephemeral volume(%s) mount on %s", volumeID, target)
 			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 				StagingTargetPath: target,
 				VolumeContext:     context,
@@ -95,24 +152,12 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 			return &csi.NodePublishVolumeResponse{}, err
 		}
 
-		// ephemeral volume
-		if strings.EqualFold(context[ephemeralField], trueValue) {
-			setKeyValueInMap(context, secretNamespaceField, context[podNamespaceField])
-			// When Managed Identity or OAuth token is used for ephemeral volumes then reject the request.
-			// Allowing access for inline volume with identity will open up risk of arbitrary pods accessing fileshares with node identity permissions.
-			if strings.EqualFold(getValueInMap(context, mountWithManagedIdentityField), trueValue) {
-				return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("mountWithManagedIdentity cannot be used for ephemeral volumes, please use either %s or secret based authentication", mountWithWITokenField))
+		if getValueInMap(context, serviceAccountTokenField) != "" && shouldUseServiceAccountToken(context) {
+			if d.canSkipRepublishNodeStage(context, target) {
+				klog.V(2).Infof("NodePublishVolume: volume(%s) already mounted on %s with clientID auth, skipping NodeStageVolume (no time-bound credential to refresh)", volumeID, target)
+				return &csi.NodePublishVolumeResponse{}, nil
 			}
-			if strings.EqualFold(getValueInMap(context, mountWithOAuthTokenField), trueValue) {
-				return nil, status.Error(codes.InvalidArgument, "mountWithOAuthToken cannot be used for ephemeral volumes, please use secret based authentication")
-			}
-			useWIToken := strings.EqualFold(getValueInMap(context, mountWithWITokenField), trueValue)
-			if !d.allowInlineVolumeKeyAccessWithIdentity && !useWIToken {
-				// only get storage account from secret when not using managed identity or workload identity
-				setKeyValueInMap(context, getAccountKeyFromSecretField, trueValue)
-				setKeyValueInMap(context, storageAccountField, "")
-			}
-			klog.V(2).Infof("NodePublishVolume: ephemeral volume(%s) mount on %s", volumeID, target)
+			klog.V(2).Infof("NodePublishVolume: volume(%s) mount on %s with service account token, clientID: %s, mountWithWIToken: %s", volumeID, target, getValueInMap(context, clientIDField), getValueInMap(context, mountWithWITokenField))
 			_, err := d.NodeStageVolume(ctx, &csi.NodeStageVolumeRequest{
 				StagingTargetPath: target,
 				VolumeContext:     context,
@@ -207,7 +252,7 @@ func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolu
 	}
 
 	// NodePublishVolume should only alter volume content after the initial successful mount.
-	mnt, err := d.ensureMountPoint(target, os.FileMode(mountPermissions), false)
+	mnt, err := d.ensureMountPoint(target, os.FileMode(mountPermissions), false, false)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not mount target %s: %v", target, err)
 	}
@@ -306,7 +351,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		mc.WithAdditionalVolumeInfo(VolumeID, volumeID).Observe(returnedErr == nil)
 	}()
 
-	_, accountName, accountKey, fileShareName, diskName, _, tenantID, tokenFilePath, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), context)
+	rgName, accountName, accountKey, fileShareName, diskName, subsID, tenantID, tokenFilePath, err := d.GetAccountInfo(ctx, volumeID, req.GetSecrets(), context)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("GetAccountInfo(%s) failed with error: %v", volumeID, err))
 	}
@@ -461,11 +506,19 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 	isDiskMount := isDiskFsType(fsType)
 	if isDiskMount {
+		// Reuse traversal check from GetFileShareInfo.
+		if err := validateVolumeIDSegment("diskName", diskName); err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
 		if !strings.HasSuffix(diskName, vhdSuffix) {
 			return nil, status.Errorf(codes.Internal, "diskname could not be empty, targetPath: %s", targetPath)
 		}
 		cifsMountFlags = []string{"dir_mode=0777,file_mode=0777,cache=strict,actimeo=30", "nostrictsync"}
 		cifsMountPath = filepath.Join(filepath.Dir(targetPath), proxyMount)
+	}
+
+	if err := validateSMBCredentialValues(accountName, accountKey); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	var mountOptions, sensitiveMountOptions []string
@@ -484,9 +537,12 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			sensitiveMountOptions = []string{"sec=krb5,cruid=0,upcall_target=mount"}
 			klog.V(2).Infof("using workload identity token for volume %s with mount options: %v", volumeID, sensitiveMountOptions)
 			if tokenFilePath != "" {
+				// Kerberos SPN must be the canonical <account>.file.<suffix>; the CIFS
+				// mount source below still uses `server` (which may be privatelink).
+				krbHost := getKerberosHost(server)
 				// always set credential cache when token file is provided even mount does not happen
-				if out, err := setCredentialCache(server, clientID, tenantID, tokenFilePath, "", d.getActiveDirectoryEndpoint(), d.getStorageResource()); err != nil {
-					return nil, status.Errorf(codes.Internal, "setCredentialCache failed for %s with error: %v, output: %s", server, err, out)
+				if out, err := setCredentialCache(krbHost, clientID, tenantID, tokenFilePath, "", d.getActiveDirectoryEndpoint(), d.getStorageResource()); err != nil {
+					return nil, status.Errorf(codes.Internal, "setCredentialCache failed for %s with error: %v, output: %s", krbHost, err, out)
 				}
 			}
 		} else if mountWithOAuthToken && runtime.GOOS != "windows" {
@@ -519,12 +575,19 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 				cifsMountFlags = util.JoinMountOptions(cifsMountFlags, strings.Split(ephemeralVolMountOptions, ","))
 			}
 			mountOptions = appendDefaultCifsMountOptions(cifsMountFlags, d.appendNoShareSockOption, d.appendClosetimeoOption)
+			if isDiskMount {
+				// A VHD PV is loop-mounted from a plain data blob and never needs CIFS
+				// symlink emulation (enabled by default).
+				if opts, existed := removeOptionIfExists(mountOptions, mfsymlinks); existed {
+					mountOptions = opts
+				}
+			}
 		}
 	}
 
 	klog.V(2).Infof("cifsMountPath(%v) fstype(%v) volumeID(%v) mountflags(%v) mountOptions(%v) volumeMountGroup(%s)", cifsMountPath, fsType, volumeID, mountFlags, mountOptions, volumeMountGroup)
 
-	isDirMounted, err := d.ensureMountPoint(cifsMountPath, os.FileMode(mountPermissions), true)
+	isDirMounted, err := d.ensureMountPoint(cifsMountPath, os.FileMode(mountPermissions), true, ephemeralVol)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not mount target %s: %v", cifsMountPath, err)
 	}
@@ -539,32 +602,43 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 				encryptInTransit = true
 				mountOptions = newOptions
 			}
-			if encryptInTransit {
+			if encryptInTransit || d.useAZNFSForNFSMounts {
 				mountFsType = aznfs
+			}
+			if d.useAZNFSForNFSMounts && !encryptInTransit {
+				mountOptions = append(mountOptions, "notls")
+				klog.V(2).Infof("azurefile driver is configured to use aznfs for all nfs mounts, adding notls to mount options for volume %s since encryptInTransit is disabled", volumeID)
 			}
 		}
 		if mountFsType == aznfs && !d.enableAzurefileProxy {
-			return nil, status.Error(codes.InvalidArgument, "encryptInTransit is only available when azurefile-proxy is enabled")
+			return nil, status.Error(codes.InvalidArgument, "aznfs mounts (encryptInTransit or use-aznfs-for-nfs-mounts) are only available when azurefile-proxy is enabled")
 		}
 
 		if err := prepareStagePath(cifsMountPath, d.mounter); err != nil {
 			return nil, status.Errorf(codes.Internal, "prepare stage path failed for %s with error: %v", cifsMountPath, err)
 		}
 		if mountFsType == aznfs {
-			klog.V(2).Infof("encryptInTransit is enabled, mount by azurefile-proxy")
-			if err := d.mountWithProxy(ctx, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions); err != nil {
-				if strings.Contains(err.Error(), "no such file or directory") {
+			klog.V(2).Infof("either of encryptInTransit (%t) (or) useAZNFSForNFSMounts (%t) is enabled, mount by azurefile-proxy", encryptInTransit, d.useAZNFSForNFSMounts)
+			mountMC := csiMetrics.NewCSIMetricContext("node_stage_volume_mount").WithBasicVolumeInfo(rgName, subsID, d.Name)
+			mountErr := d.mountWithProxy(ctx, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions)
+			mountMC.ObserveMountWithLabels(mountErr == nil, csiMetrics.Protocol, mountFsType, csiMetrics.StorageAccount, accountName,
+				csiMetrics.SubscriptionID, subsID, csiMetrics.MountErrorReason, classifyMountError(mountErr))
+			if mountErr != nil {
+				if strings.Contains(mountErr.Error(), "no such file or directory") {
 					return nil, status.Errorf(codes.Internal, "mount with proxy failed for %s with error: %v. "+
-						"Encryption in Transit (EiT) does not support Ubuntu 20.04, please upgrade your node OS version.", cifsMountPath, err)
+						"Encryption in Transit (EiT) does not support Ubuntu 20.04, please upgrade your node OS version.", cifsMountPath, mountErr)
 				}
-				return nil, status.Errorf(codes.Internal, "mount with proxy failed for %s with error: %v", cifsMountPath, err)
+				return nil, status.Errorf(codes.Internal, "mount with proxy failed for %s with error: %v", cifsMountPath, mountErr)
 			}
 			klog.V(2).Infof("mount with proxy succeeded for %s", cifsMountPath)
 		} else {
 			execFunc := func() error {
 				if mountWithManagedIdentity && protocol != nfs && runtime.GOOS != "windows" {
-					if out, err := setCredentialCache(server, clientID, tenantID, tokenFilePath, "", d.getActiveDirectoryEndpoint(), d.getStorageResource()); err != nil {
-						return fmt.Errorf("setCredentialCache failed for %s with error: %v, output: %s", server, err, out)
+					// Kerberos SPN must be the canonical <account>.file.<suffix>; the CIFS
+					// mount source below still uses `source` (which may be privatelink).
+					krbHost := getKerberosHost(server)
+					if out, err := setCredentialCache(krbHost, clientID, tenantID, tokenFilePath, "", d.getActiveDirectoryEndpoint(), d.getStorageResource()); err != nil {
+						return fmt.Errorf("%w for %s with error: %v, output: %s", errCredentialCacheSetup, krbHost, err, out)
 					}
 				}
 				return SMBMount(d.mounter, source, cifsMountPath, mountFsType, mountOptions, sensitiveMountOptions)
@@ -572,12 +646,18 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 			timeoutFunc := func() error {
 				return fmt.Errorf("mount operation timed out after %d seconds: source=%s, target=%s", MountTimeoutInSec, source, cifsMountPath)
 			}
-			if err := volumehelper.WaitUntilTimeout(MountTimeoutInSec*time.Second, execFunc, timeoutFunc); err != nil {
+			mountMC := csiMetrics.NewCSIMetricContext("node_stage_volume_mount").WithBasicVolumeInfo(rgName, subsID, d.Name)
+			mountErr := volumehelper.WaitUntilTimeout(MountTimeoutInSec*time.Second, execFunc, timeoutFunc)
+			if !errors.Is(mountErr, errCredentialCacheSetup) {
+				mountMC.ObserveMountWithLabels(mountErr == nil, csiMetrics.Protocol, mountFsType, csiMetrics.StorageAccount, accountName,
+					csiMetrics.SubscriptionID, subsID, csiMetrics.MountErrorReason, classifyMountError(mountErr))
+			}
+			if mountErr != nil {
 				var helpLinkMsg string
 				if d.appendMountErrorHelpLink {
 					helpLinkMsg = "\nPlease refer to http://aka.ms/filemounterror for possible causes and solutions for mount errors."
 				}
-				return nil, status.Error(codes.Internal, fmt.Sprintf("volume(%s) mount %s on %s failed with %v%s", volumeID, source, cifsMountPath, err, helpLinkMsg))
+				return nil, status.Error(codes.Internal, fmt.Sprintf("volume(%s) mount %s on %s failed with %v%s", volumeID, source, cifsMountPath, mountErr, helpLinkMsg))
 			}
 		}
 		if protocol == nfs {
@@ -631,7 +711,7 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 
 	if isDiskMount {
-		mnt, err := d.ensureMountPoint(targetPath, os.FileMode(mountPermissions), true)
+		mnt, err := d.ensureMountPoint(targetPath, os.FileMode(mountPermissions), true, ephemeralVol)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "mount %s on target %s failed with %v", volumeID, targetPath, err)
 		}
@@ -641,6 +721,9 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 		}
 
 		diskPath := filepath.Join(cifsMountPath, diskName)
+		if err := validateDiskIsRegularFile(diskPath); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid disk source: %v", err)
+		}
 		options := util.JoinMountOptions(mountFlags, []string{"loop"})
 		if strings.HasPrefix(fsType, "ext") {
 			// following mount options are only valid for ext2/ext3/ext4 file systems
@@ -649,7 +732,11 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 
 		klog.V(2).Infof("NodeStageVolume: volume %s formatting %s and mounting at %s with mount options(%s)", volumeID, targetPath, diskPath, options)
 		// FormatAndMount will format only if needed
-		if err := d.mounter.FormatAndMount(diskPath, targetPath, fsType, options); err != nil {
+		mountMC := csiMetrics.NewCSIMetricContext("node_stage_volume_mount").WithBasicVolumeInfo(rgName, subsID, d.Name)
+		mountErr := d.mounter.FormatAndMount(diskPath, targetPath, fsType, options)
+		mountMC.ObserveMountWithLabels(mountErr == nil, csiMetrics.Protocol, "disk", csiMetrics.StorageAccount, accountName,
+			csiMetrics.SubscriptionID, subsID, csiMetrics.MountErrorReason, classifyMountError(mountErr))
+		if mountErr != nil {
 			return nil, status.Error(codes.Internal, fmt.Sprintf("could not format %s and mount it at %s", targetPath, diskPath))
 		}
 		klog.V(2).Infof("NodeStageVolume: volume %s format %s and mounting at %s successfully", volumeID, targetPath, diskPath)
@@ -665,6 +752,17 @@ func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRe
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+// validateDiskIsRegularFile verifies that diskPath is a real regular file. A
+// missing file is left to fail naturally later in FormatAndMount, and an
+// existing symlink is always reported as a link (never "not found") because
+// Lstat does not traverse it.
+func validateDiskIsRegularFile(diskPath string) error {
+	if fi, err := os.Lstat(diskPath); err == nil && !fi.Mode().IsRegular() {
+		return fmt.Errorf("disk path %q is not a regular file (mode %s)", diskPath, fi.Mode())
+	}
+	return nil
 }
 
 // NodeUnstageVolume unmount the volume from the staging path
@@ -711,6 +809,21 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 	}
 
 	klog.V(2).Infof("NodeUnstageVolume: unmount volume %s on %s successfully", volumeID, stagingTargetPath)
+
+	// Best effort removal of any per-volume workload-identity token cache file
+	// written by GetAccountInfo for this volume.
+	if runtime.GOOS != "windows" {
+		tokenFileGlob := filepath.Join(defaultAzureOAuthTokenDir, "*-"+hashVolumeIDForTokenFile(volumeID))
+		if matches, globErr := filepath.Glob(tokenFileGlob); globErr != nil {
+			klog.Warningf("NodeUnstageVolume: failed to list token cache files for volume %s: %v", volumeID, globErr)
+		} else {
+			for _, tokenFile := range matches {
+				if rmErr := os.Remove(tokenFile); rmErr != nil && !os.IsNotExist(rmErr) {
+					klog.Warningf("NodeUnstageVolume: failed to remove token cache file %s for volume %s: %v", tokenFile, volumeID, rmErr)
+				}
+			}
+		}
+	}
 
 	isOperationSucceeded = true
 	return &csi.NodeUnstageVolumeResponse{}, nil
@@ -817,7 +930,10 @@ func (d *Driver) NodeExpandVolume(_ context.Context, _ *csi.NodeExpandVolumeRequ
 
 // ensureMountPoint: create mount point if not exists
 // return <true, nil> if it's already a mounted point otherwise return <false, nil>
-func (d *Driver) ensureMountPoint(target string, perm os.FileMode, shouldUnmount bool) (bool, error) {
+// ephemeralVol indicates whether this call is on the CSI ephemeral (inline) volume
+// short-circuit path; kubelet reconciles those on every sync loop, so the
+// "already mounted" log is demoted to V(6) to avoid log flooding.
+func (d *Driver) ensureMountPoint(target string, perm os.FileMode, shouldUnmount, ephemeralVol bool) (bool, error) {
 	notMnt, err := d.mounter.IsLikelyNotMountPoint(target)
 	if err != nil && !os.IsNotExist(err) {
 		if IsCorruptedDir(target) {
@@ -862,7 +978,11 @@ func (d *Driver) ensureMountPoint(target string, perm os.FileMode, shouldUnmount
 			}
 		}
 		if err == nil {
-			klog.V(2).Infof("already mounted to target %s", target)
+			if ephemeralVol {
+				klog.V(6).Infof("already mounted to target %s", target)
+			} else {
+				klog.V(2).Infof("already mounted to target %s", target)
+			}
 			return !notMnt, nil
 		}
 		if shouldUnmount {
@@ -911,6 +1031,19 @@ func validateMountWithOAuthToken(protocol, fsType string, volumeContext map[stri
 		return status.Error(codes.InvalidArgument, "createFolderIfNotExist is not supported with mountWithOAuthToken")
 	}
 	return nil
+}
+
+// getKerberosHost strips the ".privatelink" label from an Azure Files FQDN so
+// the Kerberos SPN matches the canonical <account>.file.<suffix> that Azure AD
+// (Entra) issues tickets for. The CIFS mount source is not changed; the
+// canonical name still resolves (via the privatelink private DNS zone) to the
+// private endpoint IP, so traffic keeps going through the private link.
+//
+// Callers should use this helper for anything passed to Kerberos (setCredentialCache,
+// SPN lookups) but keep the original server value for the CIFS mount source and
+// volume context.
+func getKerberosHost(server string) string {
+	return strings.Replace(server, ".privatelink.file.", ".file.", 1)
 }
 
 func (d *Driver) setCredentialCacheWithOAuthToken(ctx context.Context, volumeID string, volumeContext map[string]string) (string, error) {
@@ -962,13 +1095,14 @@ func (d *Driver) setCredentialCacheWithOAuthToken(ctx context.Context, volumeID 
 		return server, nil
 	}
 
-	if output, err := setCredentialCache(server, "", "", "", oauthToken, "", ""); err != nil {
-		klog.Errorf("setCredentialCache failed for %s with output: %s, error: %v", server, strings.ReplaceAll(string(output), oauthToken, "<redacted>"), err)
-		return "", status.Errorf(codes.Internal, "setCredentialCache failed for %s: %v", server, err)
+	krbHost := getKerberosHost(server)
+	if output, err := setCredentialCache(krbHost, "", "", "", oauthToken, "", ""); err != nil {
+		klog.Errorf("setCredentialCache failed for %s with output: %s, error: %v", krbHost, strings.ReplaceAll(string(output), oauthToken, "<redacted>"), err)
+		return "", status.Errorf(codes.Internal, "setCredentialCache failed for %s: %v", krbHost, err)
 	}
 
 	d.oauthTokenSHAMap.Store(server, tokenSHA)
-	klog.V(2).Infof("setCredentialCacheWithOAuthToken: refreshed credential cache for server %s using secret %s/%s", server, secretNamespace, secretName)
+	klog.V(2).Infof("setCredentialCacheWithOAuthToken: refreshed credential cache for server %s (SPN host %s) using secret %s/%s", server, krbHost, secretNamespace, secretName)
 	return server, nil
 }
 
@@ -1029,6 +1163,76 @@ func checkGidPresentInMountFlags(mountFlags []string) bool {
 	return false
 }
 
+// authorizeInlineVolumeSecret uses SubjectAccessReview to ensure the mounting pod's
+// ServiceAccount is authorized to "get" the referenced Secret before mounting on its behalf.
+// d.inlineVolumeSecretAuthz selects the mode: off (default, no check), warn (log only) or
+// enforce (deny unauthorized mounts).
+func (d *Driver) authorizeInlineVolumeSecret(ctx context.Context, volumeContext map[string]string) error {
+	var enforce bool
+	switch strings.ToLower(d.inlineVolumeSecretAuthz) {
+	case "", inlineVolumeSecretAuthzOff:
+		return nil
+	case inlineVolumeSecretAuthzWarn:
+	case inlineVolumeSecretAuthzEnforce:
+		enforce = true
+	default:
+		return status.Errorf(codes.InvalidArgument, "invalid inline-volume-secret-authz mode %q", d.inlineVolumeSecretAuthz)
+	}
+
+	// Resolve the Secret the mount will read. Use the same resolution as the
+	// read path (getSecretNamespace).
+	secretNamespace := getSecretNamespace(volumeContext)
+	secretName := getValueInMap(volumeContext, secretNameField)
+	if secretName == "" {
+		if accountName := getValueInMap(volumeContext, storageAccountField); accountName != "" {
+			secretName = fmt.Sprintf(secretNameTemplate, accountName)
+		}
+	}
+
+	if secretName == "" || secretNamespace == "" {
+		return nil
+	}
+
+	deny := func(reason string) error {
+		msg := fmt.Sprintf("inline volume Secret %s/%s: %s", secretNamespace, secretName, reason)
+		if enforce {
+			return status.Error(codes.PermissionDenied, msg)
+		}
+		klog.Warningf("inline-volume-secret-authz(warn): %s", msg)
+		return nil
+	}
+
+	podName := volumeContext[podNameField]
+	podNamespace := volumeContext[podNamespaceField]
+	if d.kubeClient == nil || podName == "" || podNamespace == "" {
+		return deny("kube client or pod identity (podInfoOnMount) unavailable")
+	}
+	pod, err := d.kubeClient.CoreV1().Pods(podNamespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return deny(fmt.Sprintf("failed to get pod %s/%s: %v", podNamespace, podName, err))
+	}
+	serviceAccountName := pod.Spec.ServiceAccountName
+	if serviceAccountName == "" {
+		serviceAccountName = "default"
+	}
+	// Mirror the identity the API server assigns to a ServiceAccount token (username plus
+	// the implicit groups) and do a SubjectAccessReview.
+	serviceAccountUser := serviceaccount.MakeUsername(podNamespace, serviceAccountName)
+	sar := &authorizationv1.SubjectAccessReview{Spec: authorizationv1.SubjectAccessReviewSpec{
+		User:               serviceAccountUser,
+		Groups:             append(serviceaccount.MakeGroupNames(podNamespace), user.AllAuthenticated),
+		ResourceAttributes: &authorizationv1.ResourceAttributes{Namespace: secretNamespace, Verb: "get", Resource: "secrets", Name: secretName},
+	}}
+	result, err := d.kubeClient.AuthorizationV1().SubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+	if err != nil {
+		return deny(fmt.Sprintf("SubjectAccessReview for %s failed: %v", serviceAccountUser, err))
+	}
+	if !result.Status.Allowed {
+		return deny(fmt.Sprintf("service account %s is not authorized to get it", serviceAccountUser))
+	}
+	return nil
+}
+
 // shouldUseServiceAccountToken determines whether a service account token should be used for authentication based on the volume context attributes.
 func shouldUseServiceAccountToken(attrib map[string]string) bool {
 	if getValueInMap(attrib, mountWithWITokenField) == trueValue {
@@ -1038,4 +1242,54 @@ func shouldUseServiceAccountToken(attrib map[string]string) bool {
 		return true
 	}
 	return false
+}
+
+// canSkipRepublishNodeStage reports whether a NodePublishVolume call is a kubelet
+// requiresRepublish retry (target already mounted) whose auth mode has no time-bound
+// credential to refresh. When true, callers should return success without re-invoking
+// NodeStageVolume, avoiding wasteful ARM ListKeys calls (clientID-only mounts) or
+// kube-apiserver Secret.Get calls (secret-based ephemeral mounts) whose result would
+// be discarded because NodeStageVolume's ensureMountPoint short-circuits on an
+// existing mount. The WI-token path is excluded so setCredentialCache continues to
+// rotate the Kerberos ticket on every republish.
+func (d *Driver) canSkipRepublishNodeStage(context map[string]string, target string) bool {
+	if strings.EqualFold(getValueInMap(context, mountWithWITokenField), trueValue) {
+		return false
+	}
+	notMnt, err := d.mounter.IsLikelyNotMountPoint(target)
+	return err == nil && !notMnt
+}
+
+// deniedInlineSMBMountOptions is a set of mount options that are not allowed for ephemeral volumes with inline SMB mounts
+var deniedInlineSMBMountOptions = map[string]struct{}{
+	"bind":          {},
+	"rbind":         {},
+	"cred":          {},
+	"credentials":   {},
+	"addr":          {},
+	"ip":            {},
+	"unc":           {},
+	"target":        {},
+	"path":          {},
+	"sec":           {},
+	"cruid":         {},
+	"upcall_target": {},
+	"cifsacl":       {},
+	"modefromsid":   {},
+}
+
+func validateInlineSMBMountOptions(mountOptions []string) error {
+	for _, options := range mountOptions {
+		for _, option := range strings.Split(options, ",") {
+			key, _, _ := strings.Cut(strings.TrimSpace(option), "=")
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			if _, denied := deniedInlineSMBMountOptions[strings.ToLower(key)]; denied {
+				return fmt.Errorf("mount option %q is not supported for ephemeral volumes", key)
+			}
+		}
+	}
+	return nil
 }

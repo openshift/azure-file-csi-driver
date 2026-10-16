@@ -44,7 +44,7 @@ skuName | Azure file storage account type (alias: `storageAccountType`) | `Stand
 storageAccount | specify Azure storage account name| STORAGE_ACCOUNT_NAME | No | If the driver is not provided with a specific storage account name, it will search for a suitable storage account that matches the account settings within the same resource group. If it cannot find a matching storage account, it will create a new one. However, if a storage account name is specified, the storage account must already exist.
 enableLargeFileShares | indicate whether the storage account should have large file shares enabled or disabled. This parameter should be **only** used on Standard account as Premium account is already enabled by default.  | `true`,`false` | No | `false`
 protocol | file share protocol | `smb`, `nfs` | No | `smb`
-networkEndpointType | specify network endpoint type for the storage account created by driver. If `privateEndpoint` is specified, a private endpoint will be created for the storage account. For other cases, a service endpoint will be created for `nfs` protocol by default. | "",`privateEndpoint` | No | `` <br>for AKS cluster, make sure cluster Control plane identity (that is, your AKS cluster name) is added to the Contributor role in the resource group hosting the VNet
+networkEndpointType | specify network endpoint type for the storage account created by driver. If `privateEndpoint` is specified, a private endpoint will be created for the storage account. If `serviceEndpoint` is specified, the `Microsoft.Storage` service endpoint will be configured on the subnet(s) and the storage account firewall will be restricted to those subnets. For `nfs` protocol, a service endpoint is created by default; for `smb` protocol, a service endpoint is only created when `serviceEndpoint` is set explicitly. | "",`privateEndpoint`,`serviceEndpoint` | No | `` <br>for AKS cluster, make sure cluster Control plane identity (that is, your AKS cluster name) is added to the Contributor role in the resource group hosting the VNet
 location | specify Azure storage account location | `eastus`, `westus`, etc. | No | if empty, driver will use the same location name as current k8s cluster
 resourceGroup | specify the resource group in which Azure file share will be created | existing resource group name | No | if empty, driver will use the same resource group name as current k8s cluster
 subscriptionID | specify Azure subscription ID where Azure file share will be created | Azure subscription ID | No | if not empty, `resourceGroup` must be provided
@@ -76,8 +76,8 @@ clientID | Specify the Azure client ID that will be used to create the Azure fil
 allowSharedKeyAccess | Allow or disallow shared key access for storage account created by driver | `true`,`false` | No | `true`
 rootSquashType | specify root squashing behavior on the share. The default is `NoRootSquash` | `AllSquash`, `NoRootSquash`, `RootSquash` | No |
 mountPermissions | mounted folder permissions. The default is `0777`, if set as `0`, driver will not perform `chmod` after mount | `0777` | No |
-encryptInTransit | support [Encrypt in Transit(EiT) for NFS (Preview)](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares) | `true`,`false` | No | `false`
---- | **Following parameters are only for vnet setting, e.g. NFS, private endpoint** | --- | --- |
+encryptInTransit | support [Encrypt in Transit(EiT) for NFS](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares). When `true`, per-protocol encryption in transit is configured on the storage account's file service (`ProtocolSettings.Nfs.EncryptionInTransit.Required=true`) only for storage accounts newly created by the driver; the driver never mutates this property on an existing account, and account matching may reuse an existing NFS account whose `Required` is unset or `false`. The account-level `Required=true` setting, once stamped, applies to all NFS shares in that account. GA and available wherever premium (SSD) NFS file shares are offered. When specifying `storageAccount`, do not mix `encryptInTransit` and non-`encryptInTransit` NFS volumes in the same account. | `true`,`false` | No | `false`
+--- | **Following parameters are only for vnet setting, e.g. NFS, private endpoint, service endpoint** | --- | --- |
 vnetResourceGroup | specify vnet resource group where virtual network is | existing resource group name | No | if empty, driver will use the `vnetResourceGroup` value in azure cloud config file
 vnetName | virtual network name | existing virtual network name | No | if empty, driver will use the `vnetName` value in azure cloud config file
 subnetName | subnet name | existing subnet name(s) of virtual network, if you want to update service endpoints on multiple subnets, separate them using a comma (`,`) | No | if empty, driver will update all the subnets under the cluster virtual network
@@ -128,7 +128,7 @@ nodeStageSecretRef.namespace | secret namespace | k8s namespace  |  Yes  |
 --- | **Following parameters are only for NFS protocol** | --- | --- |
 volumeAttributes.fsGroupChangePolicy | indicates how volume's ownership will be changed by the driver, pod `securityContext.fsGroupChangePolicy` is ignored  | `OnRootMismatch`(by default), `Always`, `None` | No | `OnRootMismatch`
 volumeAttributes.mountPermissions | mounted folder permissions. The default is `0777` |  | No |
-volumeAttributes.encryptInTransit | support [Encrypt in Transit(EiT) for NFS (Preview)](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares)| `true`,`false` | No | `false`
+volumeAttributes.encryptInTransit | support [Encrypt in Transit(EiT) for NFS](https://learn.microsoft.com/en-us/azure/storage/files/encryption-in-transit-for-nfs-shares)| `true`,`false` | No | `false`
 
  - create a Kubernetes secret for `nodeStageSecretRef.name`
  ```console
@@ -140,6 +140,7 @@ kubectl create secret generic azure-storage-account-{accountname}-secret --from-
 Name | Meaning | Available Value | Mandatory | Default value
 --- | --- | --- | --- | ---
 useDataPlaneAPI | specify whether use [data plane API](https://github.com/Azure/azure-sdk-for-go/blob/master/storage/share.go) for snapshot create/delete, this could solve the SRP API throttling issue since data plane API has almost no limit, while it would fail when there is firewall or vnet setting on storage account | `true`,`false` | No | `false`
+metadata | metadata to store on the [file share snapshot](https://learn.microsoft.com/en-us/rest/api/storageservices/snapshot-share#request-headers). Metadata names must follow the Azure Files metadata naming rules. The `initiator` name is reserved by the driver. | key-value pairs in the same format as `tags`, e.g. `'comment=snapshot before database migration,environment=production'` | No | `""`
 
 ### `VolumeAttributesClass`
 

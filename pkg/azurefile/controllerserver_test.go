@@ -30,6 +30,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v9"
 	armstorage "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/storage/armstorage/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/share"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/onsi/ginkgo/v2"
@@ -45,6 +46,7 @@ import (
 	"sigs.k8s.io/azurefile-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient/mock_accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileservicepropertiesclient/mock_fileservicepropertiesclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/fileshareclient/mock_fileshareclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/mock_azclient"
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/subnetclient/mock_subnetclient"
@@ -710,6 +712,136 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 			gomega.Expect(err).To(gomega.Equal(expectedErr))
 		})
 	})
+	ginkgo.When("networkEndpointType is not supported", func() {
+		ginkgo.It("should fail", func(ctx context.Context) {
+			allParam := map[string]string{
+				networkEndpointTypeField: "serviceEndpiont",
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-invalid-network-endpoint-type",
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCap,
+				Parameters:         allParam,
+			}
+
+			expectedErr := status.Errorf(codes.InvalidArgument, "networkEndpointType(serviceEndpiont) is not supported, supported networkEndpointType list: %v", supportedNetworkEndpointTypeList)
+			_, err := d.CreateVolume(ctx, req)
+			gomega.Expect(err).To(gomega.Equal(expectedErr))
+		})
+	})
+	ginkgo.When("networkEndpointType is serviceEndpoint on an SMB volume", func() {
+		ginkgo.It("should update the subnet service endpoints", func(ctx context.Context) {
+			allParam := map[string]string{
+				networkEndpointTypeField: "serviceEndpoint",
+				vnetResourceGroupField:   "vnet-rg",
+				vnetNameField:            "smb-vnet",
+				subnetNameField:          "smb-subnet",
+			}
+
+			fakeCloud := &storage.AccountRepo{
+				Config: config.Config{
+					ResourceGroup: "rg",
+					Location:      "loc",
+				},
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-smb-service-endpoint",
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCap,
+				Parameters:         allParam,
+			}
+			d.cloud = fakeCloud
+			mockSubnetClient := mock_subnetclient.NewMockInterface(ctrl)
+			fakeCloud.NetworkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			fakeCloud.NetworkClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+
+			// the subnet is returned without any service endpoint, so it must be updated
+			mockSubnetClient.EXPECT().Get(gomock.Any(), "vnet-rg", "smb-vnet", "smb-subnet", gomock.Any()).Return(
+				&armnetwork.Subnet{
+					Name:       ptr.To("smb-subnet"),
+					Properties: &armnetwork.SubnetPropertiesFormat{},
+				}, nil).Times(1)
+			mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), "vnet-rg", "smb-vnet", "smb-subnet", gomock.Any()).Return(nil, nil).Times(1)
+
+			// the subnet is updated first, the request then fails later on in EnsureStorageAccount
+			_, err := d.CreateVolume(ctx, req)
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("failed to ensure storage account"))
+		})
+	})
+	ginkgo.When("networkEndpointType is not set on an SMB volume", func() {
+		ginkgo.It("should not touch the subnet service endpoints", func(ctx context.Context) {
+			allParam := map[string]string{
+				vnetResourceGroupField: "vnet-rg",
+				vnetNameField:          "smb-vnet",
+				subnetNameField:        "smb-subnet",
+			}
+
+			fakeCloud := &storage.AccountRepo{
+				Config: config.Config{
+					ResourceGroup: "rg",
+					Location:      "loc",
+				},
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-smb-no-network-endpoint-type",
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCap,
+				Parameters:         allParam,
+			}
+			d.cloud = fakeCloud
+			mockSubnetClient := mock_subnetclient.NewMockInterface(ctrl)
+			fakeCloud.NetworkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			fakeCloud.NetworkClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+
+			mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockSubnetClient.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+			_, err := d.CreateVolume(ctx, req)
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("failed to ensure storage account"))
+		})
+	})
+	ginkgo.When("networkEndpointType is privateEndpoint on an SMB volume", func() {
+		ginkgo.It("should not touch the subnet service endpoints", func(ctx context.Context) {
+			allParam := map[string]string{
+				networkEndpointTypeField: "privateEndpoint",
+				vnetResourceGroupField:   "vnet-rg",
+				vnetNameField:            "smb-vnet",
+				subnetNameField:          "smb-subnet",
+			}
+
+			fakeCloud := &storage.AccountRepo{
+				Config: config.Config{
+					ResourceGroup: "rg",
+					Location:      "loc",
+				},
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-smb-private-endpoint",
+				CapacityRange:      stdCapRange,
+				VolumeCapabilities: stdVolCap,
+				Parameters:         allParam,
+			}
+			d.cloud = fakeCloud
+			mockSubnetClient := mock_subnetclient.NewMockInterface(ctrl)
+			fakeCloud.NetworkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			fakeCloud.NetworkClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+
+			mockSubnetClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockSubnetClient.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+			_, err := d.CreateVolume(ctx, req)
+			gomega.Expect(err).To(gomega.HaveOccurred())
+			gomega.Expect(err.Error()).To(gomega.ContainSubstring("failed to ensure storage account"))
+		})
+	})
 	ginkgo.When("Failed with storeAccountKey is not supported for account with shared access key disabled", func() {
 		ginkgo.It("should fail", func(ctx context.Context) {
 			allParam := map[string]string{
@@ -1277,6 +1409,205 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 			})
 		})
 
+		// NFS + encryptInTransit exercises the new AccountOptions wiring
+		// (IsNFSEncryptionInTransitEnabled + SkipHTTPSTrafficOnlyMatch) added
+		// in this PR. Beyond parsing, these cases assert that:
+		//   - the NFS branch succeeds for both encryptInTransit values, and
+		//   - EnableHTTPSTrafficOnly on the created account tracks the
+		//     encryptInTransit request: true when EiT=true (client-side TLS
+		//     via aznfs), and false when EiT=false so plaintext Azure Files
+		//     NFS mounts are not rejected by the server.
+		nfsEncryptInTransitTest := func(ctx context.Context, encryptInTransit string, preExistingHTTPSOnAccount bool, expectCreate bool) {
+			SKU := "Premium_LRS"
+			kind := "FileStorage"
+			location := "centralus"
+			value := "foo bar"
+			// Optionally seed one pre-existing NFS account with
+			// EnableHTTPSTrafficOnly=true and a matching VNet allow-rule so
+			// we can prove:
+			//   - plaintext NFS refuses to reuse it (HTTPS-only mismatch)
+			//     and calls Create,
+			//   - EiT NFS is allowed to reuse it (SkipHTTPSTrafficOnlyMatch)
+			//     and skips Create.
+			// The subnet resource ID that updateSubnetServiceEndpoints will
+			// produce for vnet-rg/nfs-vnet/nfs-subnet (SubscriptionID is
+			// empty in this test config).
+			subnetResourceID := "/subscriptions//resourceGroups/vnet-rg/providers/Microsoft.Network/virtualNetworks/nfs-vnet/subnets/nfs-subnet"
+			var accounts []*armstorage.Account
+			if preExistingHTTPSOnAccount {
+				accounts = []*armstorage.Account{
+					{
+						Name:     ptr.To("preexistingnfs"),
+						Location: &location,
+						SKU:      &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))},
+						Kind:     to.Ptr(armstorage.Kind(kind)),
+						Properties: &armstorage.AccountProperties{
+							EnableHTTPSTrafficOnly: ptr.To(true),
+							// AccountOptions in this path defaults
+							// AllowBlobPublicAccess=false; the reuse matcher
+							// treats a missing value as true and would
+							// therefore reject reuse before the HTTPS-only
+							// check is exercised, so pin it explicitly.
+							AllowBlobPublicAccess: ptr.To(false),
+							ProvisioningState:     to.Ptr(armstorage.ProvisioningStateSucceeded),
+							NetworkRuleSet: &armstorage.NetworkRuleSet{
+								VirtualNetworkRules: []*armstorage.VirtualNetworkRule{
+									{
+										VirtualNetworkResourceID: ptr.To(subnetResourceID),
+										Action:                   to.Ptr(string(armstorage.DefaultActionAllow)),
+									},
+								},
+							},
+						},
+					},
+				}
+			} else {
+				// No pre-existing account listed; forces a Create so we can
+				// inspect AccountCreateParameters.
+				accounts = []*armstorage.Account{}
+			}
+			keys := []*armstorage.AccountKey{
+				{Value: &value},
+			}
+
+			allParam := map[string]string{
+				protocolField:          "nfs",
+				skuNameField:           SKU,
+				encryptInTransitField:  encryptInTransit,
+				vnetResourceGroupField: "vnet-rg",
+				vnetNameField:          "nfs-vnet",
+				subnetNameField:        "nfs-subnet",
+			}
+
+			req := &csi.CreateVolumeRequest{
+				Name:               "random-vol-name-nfs-eit-" + encryptInTransit,
+				VolumeCapabilities: stdVolCap,
+				CapacityRange:      lessThanPremCapRange,
+				Parameters:         allParam,
+			}
+
+			// Use a fakeCloud with a real Config so updateSubnetServiceEndpoints
+			// and EnsureStorageAccount proceed into the account-create branch.
+			var err error
+			d.cloud, err = storage.NewRepository(
+				config.Config{
+					ResourceGroup: "rg",
+					Location:      location,
+				},
+				&azclient.Environment{},
+				nil,
+				computeClientFactory,
+				networkClientFactory,
+			)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			fakeCloud := d.cloud
+
+			// Mock the subnet client so updateSubnetServiceEndpoints succeeds.
+			mockSubnetClient := mock_subnetclient.NewMockInterface(ctrl)
+			fakeCloud.NetworkClientFactory = mock_azclient.NewMockClientFactory(ctrl)
+			fakeCloud.NetworkClientFactory.(*mock_azclient.MockClientFactory).EXPECT().GetSubnetClient().Return(mockSubnetClient).AnyTimes()
+			mockSubnetClient.EXPECT().Get(gomock.Any(), "vnet-rg", "nfs-vnet", "nfs-subnet", gomock.Any()).Return(
+				&armnetwork.Subnet{
+					Name:       ptr.To("nfs-subnet"),
+					Properties: &armnetwork.SubnetPropertiesFormat{},
+				}, nil).AnyTimes()
+			mockSubnetClient.EXPECT().CreateOrUpdate(gomock.Any(), "vnet-rg", "nfs-vnet", "nfs-subnet", gomock.Any()).Return(nil, nil).AnyTimes()
+
+			// Mock the file service properties client so the NFS EiT branch
+			// in EnsureStorageAccount (which reads/writes account-level
+			// ProtocolSettings.Nfs.EncryptionInTransit) can run to completion
+			// instead of panicking on a nil client.
+			mockFilePropsClient := mock_fileservicepropertiesclient.NewMockInterface(ctrl)
+			computeClientFactory.EXPECT().GetFileServicePropertiesClient().Return(mockFilePropsClient).AnyTimes()
+			computeClientFactory.EXPECT().GetFileServicePropertiesClientForSub(gomock.Any()).Return(mockFilePropsClient, nil).AnyTimes()
+			mockFilePropsClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileServiceProperties{FileServiceProperties: &armstorage.FileServicePropertiesProperties{}}, nil).AnyTimes()
+			var capturedSetProps *armstorage.FileServiceProperties
+			mockFilePropsClient.EXPECT().Set(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, _, _ string, props armstorage.FileServiceProperties) (*armstorage.FileServiceProperties, error) {
+					capturedSetProps = &props
+					return &props, nil
+				}).AnyTimes()
+
+			mockStorageAccountsClient := d.cloud.ComputeClientFactory.GetAccountClient().(*mock_accountclient.MockInterface)
+
+			var capturedCreateParams *armstorage.AccountCreateParameters
+			mockFileClient.EXPECT().Create(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: nil}}, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().List(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
+			mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, _ string, accountName string, params *armstorage.AccountCreateParameters) (*armstorage.Account, error) {
+					capturedCreateParams = params
+					return &armstorage.Account{Name: &accountName, SKU: &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))}, Kind: to.Ptr(armstorage.Kind(kind)), Location: &location}, nil
+				}).AnyTimes()
+			mockFileClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: &fakeShareQuota}}, nil).AnyTimes()
+
+			_, err = d.CreateVolume(ctx, req)
+			// CreateVolume may still fail past this point due to unmocked
+			// dependencies (private DNS zone, file service properties, etc.),
+			// but by then the account Create call must already have been
+			// invoked in the create-branch cases -- assert on the captured
+			// params unconditionally so a regression that skips Create
+			// fails this test loudly.
+			if expectCreate {
+				gomega.Expect(capturedCreateParams).NotTo(gomega.BeNil(),
+					"account Create must be invoked so the NFS EiT wiring is exercised")
+				gomega.Expect(capturedCreateParams.Properties).NotTo(gomega.BeNil())
+				expectedHTTPSOnly := encryptInTransit == "true"
+				gomega.Expect(ptr.Deref(capturedCreateParams.Properties.EnableHTTPSTrafficOnly, false)).To(gomega.Equal(expectedHTTPSOnly),
+					"EnableHTTPSTrafficOnly on NFS accounts should track encryptInTransit (true→true, false→false)")
+			} else {
+				// Reuse branch: with EiT=true and a pre-existing HTTPS-on
+				// NFS account, SkipHTTPSTrafficOnlyMatch=true must let the
+				// existing account be reused, so no Create call happens.
+				gomega.Expect(capturedCreateParams).To(gomega.BeNil(),
+					"pre-existing HTTPS-on NFS account should be reused when encryptInTransit=true, no Create expected")
+			}
+			if encryptInTransit == "true" && expectCreate {
+				// Also assert the post-Create ProtocolSettings.Set call
+				// carried Nfs.EncryptionInTransit.Required=true; a
+				// regression that skips this update would leave the account
+				// without EiT enforcement. Note: this ProtocolSettings.Set
+				// only runs on the create-new-account path in
+				// EnsureStorageAccount, so we don't assert it in the reuse
+				// (expectCreate=false) branch.
+				gomega.Expect(capturedSetProps).NotTo(gomega.BeNil(),
+					"fileServiceProperties.Set must be called to stamp Nfs.EncryptionInTransit.Required=true")
+				gomega.Expect(capturedSetProps.FileServiceProperties).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs).NotTo(gomega.BeNil())
+				gomega.Expect(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs.EncryptionInTransit).NotTo(gomega.BeNil())
+				gomega.Expect(ptr.Deref(capturedSetProps.FileServiceProperties.ProtocolSettings.Nfs.EncryptionInTransit.Required, false)).To(gomega.BeTrue(),
+					"ProtocolSettings.Nfs.EncryptionInTransit.Required must be true for encryptInTransit=true")
+			}
+			if err != nil {
+				gomega.Expect(err).NotTo(gomega.MatchError(gomega.ContainSubstring(encryptInTransitField)))
+			}
+		}
+
+		ginkgo.When("protocol is nfs and encryptInTransit is true", func() {
+			ginkgo.It("should exercise the NFS EiT AccountOptions wiring", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "true", false, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is false", func() {
+			ginkgo.It("should exercise the NFS non-EiT AccountOptions wiring", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "false", false, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is false with a pre-existing HTTPS-on NFS account", func() {
+			ginkgo.It("must reject reuse of the HTTPS-on account and create a new HTTPS-off account", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "false", true, true)
+			})
+		})
+
+		ginkgo.When("protocol is nfs and encryptInTransit is true with a pre-existing HTTPS-on NFS account", func() {
+			ginkgo.It("should reuse the HTTPS-on account and skip Create", func(ctx context.Context) {
+				nfsEncryptInTransitTest(ctx, "true", true, false)
+			})
+		})
+
 		ginkgo.When("invalid mountPermissions", func() {
 			ginkgo.It("should fail", func(ctx context.Context) {
 				req := &csi.CreateVolumeRequest{
@@ -1418,8 +1749,8 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 				gomega.Expect(err).To(gomega.Equal(expectedErr))
 			})
 		})
-		ginkgo.When("Account limit exceeded", func() {
-			ginkgo.It("should fail", func(ctx context.Context) {
+		ginkgo.When("Account limit exceeded on auto-selected account", func() {
+			ginkgo.It("should retry with another matching account", func(ctx context.Context) {
 				name := "baz"
 				SKU := "SKU"
 				kind := "StorageV2"
@@ -1435,7 +1766,6 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 					skuNameField:            "premium",
 					storageAccountTypeField: "stoacctype",
 					locationField:           "loc",
-					storageAccountField:     "stoacc",
 					resourceGroupField:      "rg",
 					shareNameField:          "",
 					diskNameField:           "diskname.vhd",
@@ -1468,6 +1798,48 @@ var _ = ginkgo.Describe("TestCreateVolume", func() {
 				_, err = d.CreateVolume(ctx, req)
 				gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
+			})
+		})
+		ginkgo.When("Account limit exceeded on fixed storage account", func() {
+			ginkgo.It("should fail fast without recursively retrying the same account", func(ctx context.Context) {
+				name := "stoacc"
+				SKU := "SKU"
+				kind := "StorageV2"
+				location := "centralus"
+				value := "foo bar"
+				accounts := []*armstorage.Account{
+					{Name: &name, SKU: &armstorage.SKU{Name: to.Ptr(armstorage.SKUName(SKU))}, Kind: to.Ptr(armstorage.Kind(kind)), Location: &location},
+				}
+				keys := []*armstorage.AccountKey{{Value: &value}}
+				allParam := map[string]string{
+					skuNameField:            "premium",
+					storageAccountTypeField: "stoacctype",
+					locationField:           "loc",
+					storageAccountField:     "stoacc",
+					resourceGroupField:      "rg",
+					shareNameField:          "",
+					diskNameField:           "diskname.vhd",
+					fsTypeField:             "",
+					storeAccountKeyField:    "storeaccountkey",
+					secretNamespaceField:    "default",
+				}
+
+				req := &csi.CreateVolumeRequest{
+					Name:               "random-vol-name-fixed-account-limit",
+					VolumeCapabilities: stdVolCap,
+					CapacityRange:      lessThanPremCapRange,
+					Parameters:         allParam,
+				}
+				mockStorageAccountsClient := d.cloud.ComputeClientFactory.GetAccountClient().(*mock_accountclient.MockInterface)
+				mockFileClient.EXPECT().Create(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{FileShareProperties: &armstorage.FileShareProperties{ShareQuota: nil}}, fmt.Errorf(accountLimitExceedManagementAPI)).Times(1)
+				mockStorageAccountsClient.EXPECT().ListKeys(gomock.Any(), gomock.Any(), gomock.Any()).Return(keys, nil).AnyTimes()
+				mockStorageAccountsClient.EXPECT().List(gomock.Any(), gomock.Any()).Return(accounts, nil).AnyTimes()
+				mockStorageAccountsClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+				mockFileClient.EXPECT().Get(ctx, gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{}, &azcore.ResponseError{StatusCode: http.StatusNotFound}).AnyTimes()
+
+				expectedErr := status.Errorf(codes.Internal, "account(%s) is in %s, wait for a few minutes to retry", "stoacc", accountLimitExceedManagementAPI)
+				_, err := d.CreateVolume(ctx, req)
+				gomega.Expect(err).To(gomega.Equal(expectedErr))
 			})
 		})
 		ginkgo.When("Premium storage account type (SKU) loads from storage account when not given as parameter and share request size is increased to min. size required by premium", func() {
@@ -1823,7 +2195,7 @@ var _ = ginkgo.Describe("TestCopyVolume", func() {
 				VolumeContentSource: &volumecontensource,
 			}
 
-			expectedErr := status.Errorf(codes.NotFound, "error parsing snapshot id: \"unit-test\", should at least contain 6 #")
+			expectedErr := status.Errorf(codes.NotFound, "error parsing snapshot id: \"unit-test\", should at least contain 3 #")
 			err := d.copyVolume(ctx, req, "", "", []string{}, "", &ShareOptions{Name: "dstFileshare"}, nil, "core.windows.net")
 			gomega.Expect(err).To(gomega.Equal(expectedErr))
 		})
@@ -2227,6 +2599,28 @@ var _ = ginkgo.Describe("CreateSnapshot", func() {
 					expectedErr: status.Errorf(codes.InvalidArgument, "invalid %s: %s in snapshot storage class", useDataPlaneAPIField, "invalid"),
 				},
 				{
+					desc: "Invalid snapshot metadata",
+					req: &csi.CreateSnapshotRequest{
+						SourceVolumeId: "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
+						Name:           "snapname",
+						Parameters: map[string]string{
+							"metadata": "comment",
+						},
+					},
+					expectedErrMsg: "invalid metadata in snapshot storage class",
+				},
+				{
+					desc: "Reserved snapshot metadata",
+					req: &csi.CreateSnapshotRequest{
+						SourceVolumeId: "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
+						Name:           "snapname",
+						Parameters: map[string]string{
+							"metadata": "Initiator=custom",
+						},
+					},
+					expectedErr: status.Errorf(codes.InvalidArgument, "%q is reserved snapshot metadata", snapshotNameKey),
+				},
+				{
 					desc: "Snapshot already exists",
 					req: &csi.CreateSnapshotRequest{
 						SourceVolumeId: "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
@@ -2253,8 +2647,20 @@ var _ = ginkgo.Describe("CreateSnapshot", func() {
 					},
 					expectedErrMsg: "failed to check if snapshot(snapname) exists",
 				},
+				{
+					desc: "Create snapshot success with metadata",
+					req: &csi.CreateSnapshotRequest{
+						SourceVolumeId: "rg#f5713de20cde511e8ba4900#fileShareName#diskname.vhd#uuid#namespace#subsID",
+						Name:           "snapname",
+						Parameters: map[string]string{
+							"metadata": "comment=snapshot before migration,environment=production",
+						},
+					},
+					expectedErr: nil,
+				},
 			}
 
+			var createdShare armstorage.FileShare
 			for _, test := range tests {
 				if test.desc == "Snapshot already exists" {
 					mockFileClient.EXPECT().List(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return([]*armstorage.FileShareItem{
@@ -2289,13 +2695,17 @@ var _ = ginkgo.Describe("CreateSnapshot", func() {
 							ShareQuota: to.Ptr(int32(100)),
 						},
 					}, nil).AnyTimes()
-					mockFileClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&armstorage.FileShare{
-						Name: to.Ptr("fileShareName"),
-						FileShareProperties: &armstorage.FileShareProperties{
-							SnapshotTime: to.Ptr(time.Now()),
-							ShareQuota:   to.Ptr(int32(0)),
-						},
-					}, nil).AnyTimes()
+					mockFileClient.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+						func(_ context.Context, _, _, _ string, resource armstorage.FileShare, _ *string) (*armstorage.FileShare, error) {
+							createdShare = resource
+							return &armstorage.FileShare{
+								Name: to.Ptr("fileShareName"),
+								FileShareProperties: &armstorage.FileShareProperties{
+									SnapshotTime: to.Ptr(time.Now()),
+									ShareQuota:   to.Ptr(int32(0)),
+								},
+							}, nil
+						}).AnyTimes()
 				}
 
 				_, err := d.CreateSnapshot(context.Background(), test.req)
@@ -2308,10 +2718,45 @@ var _ = ginkgo.Describe("CreateSnapshot", func() {
 				} else {
 					gomega.Expect(err).To(gomega.BeNil())
 				}
+
+				if test.desc == "Create snapshot success with metadata" {
+					gomega.Expect(createdShare.FileShareProperties.Metadata).To(gomega.HaveKeyWithValue("comment", to.Ptr("snapshot before migration")))
+					gomega.Expect(createdShare.FileShareProperties.Metadata).To(gomega.HaveKeyWithValue("environment", to.Ptr("production")))
+					gomega.Expect(createdShare.FileShareProperties.Metadata).To(gomega.HaveKeyWithValue(snapshotNameKey, to.Ptr("snapname")))
+				}
 			}
+		})
+
+		ginkgo.It("passes metadata to the data-plane snapshot request", func(ctx context.Context) {
+			var capturedOptions *share.CreateSnapshotOptions
+			shareClient := &fakeSnapshotShareClient{
+				createSnapshot: func(_ context.Context, options *share.CreateSnapshotOptions) (share.CreateSnapshotResponse, error) {
+					capturedOptions = options
+					return share.CreateSnapshotResponse{}, nil
+				},
+			}
+
+			_, err := createShareSnapshot(ctx, shareClient, getSnapshotMetadata("snapname", map[string]string{
+				"comment":     "snapshot before migration",
+				"environment": "production",
+			}))
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(capturedOptions.Metadata).To(gomega.HaveKeyWithValue(snapshotNameKey, to.Ptr("snapname")))
+			gomega.Expect(capturedOptions.Metadata).To(gomega.HaveKeyWithValue("comment", to.Ptr("snapshot before migration")))
+			gomega.Expect(capturedOptions.Metadata).To(gomega.HaveKeyWithValue("environment", to.Ptr("production")))
 		})
 	})
 })
+
+type fakeSnapshotShareClient struct {
+	createSnapshot func(context.Context, *share.CreateSnapshotOptions) (share.CreateSnapshotResponse, error)
+}
+
+func (f *fakeSnapshotShareClient) CreateSnapshot(ctx context.Context, options *share.CreateSnapshotOptions) (share.CreateSnapshotResponse, error) {
+	return f.createSnapshot(ctx, options)
+}
+
 var _ = ginkgo.DescribeTable("DeleteSnapshot", func(req *csi.DeleteSnapshotRequest, expectedErr error) {
 	d := NewFakeDriver()
 	d.cloud = &storage.AccountRepo{}

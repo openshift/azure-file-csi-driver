@@ -96,6 +96,11 @@ func NewFakeDriverCustomOptions(opts DriverOptions) *Driver {
 	return driver
 }
 
+func (d *Driver) WithEnableAznfsForNFSMounts() *Driver {
+	d.useAZNFSForNFSMounts = true
+	return d
+}
+
 func TestNewFakeDriver(t *testing.T) {
 	driverOptions := DriverOptions{
 		NodeID:     fakeNodeID,
@@ -917,6 +922,174 @@ func TestGetAccountInfo(t *testing.T) {
 			assert.Equal(t, test.expectDiskName, diskName, test.volumeID)
 		}
 	}
+}
+
+func TestGetAccountInfoCacheWriteback(t *testing.T) {
+	t.Run("cache hit does not refresh cache entry timestamp", func(t *testing.T) {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+
+		const (
+			accountName = "cacheaccount"
+			staleKey    = "stale-key"
+		)
+		reqContext := map[string]string{
+			resourceGroupField:  "rg",
+			storageAccountField: accountName,
+			shareNameField:      "share",
+		}
+
+		d.accountCacheMap.Set(accountName, staleKey)
+		entry, exists, err := d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry := entry.(*cache.AzureCacheEntry)
+		oldCreatedOn := time.Now().UTC().Add(-2 * time.Minute)
+		cacheEntry.CreatedOn = oldCreatedOn
+
+		_, returnedAccountName, accountKey, fileShareName, _, _, _, _, err := d.GetAccountInfo(context.Background(), "invalid-volume-id", nil, reqContext)
+		assert.NoError(t, err)
+		assert.Equal(t, accountName, returnedAccountName)
+		assert.Equal(t, staleKey, accountKey)
+		assert.Equal(t, "share", fileShareName)
+
+		entry, exists, err = d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry = entry.(*cache.AzureCacheEntry)
+		assert.Equal(t, staleKey, cacheEntry.Data)
+		assert.True(t, cacheEntry.CreatedOn.Equal(oldCreatedOn), "cache hit should not rewrite the same key back into cache")
+	})
+
+	t.Run("request secrets still update cache", func(t *testing.T) {
+		d := NewFakeDriver()
+		d.cloud = &storage.AccountRepo{}
+
+		const (
+			accountName = "secretaccount"
+			staleKey    = "stale-key"
+			freshKey    = "fresh-key"
+		)
+		reqContext := map[string]string{
+			resourceGroupField: "rg",
+			shareNameField:     "share",
+		}
+		secrets := map[string]string{
+			defaultSecretAccountName: accountName,
+			defaultSecretAccountKey:  freshKey,
+		}
+
+		d.accountCacheMap.Set(accountName, staleKey)
+		entry, exists, err := d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry := entry.(*cache.AzureCacheEntry)
+		oldCreatedOn := time.Now().UTC().Add(-2 * time.Minute)
+		cacheEntry.CreatedOn = oldCreatedOn
+
+		_, returnedAccountName, accountKey, fileShareName, _, _, _, _, err := d.GetAccountInfo(context.Background(), "invalid-volume-id", secrets, reqContext)
+		assert.NoError(t, err)
+		assert.Equal(t, accountName, returnedAccountName)
+		assert.Equal(t, freshKey, accountKey)
+		assert.Equal(t, "share", fileShareName)
+
+		entry, exists, err = d.accountCacheMap.GetStore().GetByKey(accountName)
+		assert.NoError(t, err)
+		if !assert.True(t, exists) {
+			return
+		}
+		cacheEntry = entry.(*cache.AzureCacheEntry)
+		assert.Equal(t, freshKey, cacheEntry.Data)
+		assert.True(t, cacheEntry.CreatedOn.After(oldCreatedOn), "secret-derived key should still be written back into cache")
+	})
+}
+
+// TestGetAccountInfoWorkloadIdentityTokenFile covers the workload-identity
+// token-file behaviors: (1) the token cache filename must be unique per volume
+// so shared clientID/accountName do not race on one shared file. (2) when the
+// token file is unchanged, (for inline volumes only) GetAccountInfo must still
+// return a non-empty tokenFilePath so the caller always refreshes the
+// credential cache.
+func TestGetAccountInfoWorkloadIdentityTokenFile(t *testing.T) {
+	skipIfTestingOnWindows(t)
+
+	origTokenDir := defaultAzureOAuthTokenDir
+	tokenDir := t.TempDir()
+	defaultAzureOAuthTokenDir = tokenDir
+	defer func() { defaultAzureOAuthTokenDir = origTokenDir }()
+
+	d := NewFakeDriver()
+	d.cloud = &storage.AccountRepo{}
+
+	const (
+		clientID    = "test-client-id-1234"
+		accountName = "testaccount"
+		tokenValue  = "test-token-value"
+	)
+	saToken := `{"api://AzureADTokenExchange":{"token":"` + tokenValue + `","expirationTimestamp":"2025-01-01T00:00:00Z"}}`
+	baseContext := func() map[string]string {
+		return map[string]string{
+			mountWithWITokenField:    "true",
+			clientIDField:            clientID,
+			tenantIDField:            "test-tenant-id",
+			storageAccountField:      accountName,
+			shareNameField:           "testshare",
+			serviceAccountTokenField: saToken,
+		}
+	}
+	ephemeralContext := func() map[string]string {
+		ctx := baseContext()
+		ctx[ephemeralField] = "true"
+		return ctx
+	}
+
+	getTokenFilePath := func(volumeID string, reqContext map[string]string) (string, error) {
+		rgName, returnedAccountName, accountKey, fileShareName, diskName, subsID, returnedTenantID, tokenFilePath, err := d.GetAccountInfo(context.Background(), volumeID, nil, reqContext)
+		_ = rgName
+		_ = returnedAccountName
+		_ = accountKey
+		_ = fileShareName
+		_ = diskName
+		_ = subsID
+		_ = returnedTenantID
+		return tokenFilePath, err
+	}
+
+	// distinct volume IDs must yield distinct token file paths.
+	tokenFilePathA, err := getTokenFilePath("volume-A", baseContext())
+	assert.NoError(t, err)
+	tokenFilePathB, err := getTokenFilePath("volume-B", baseContext())
+	assert.NoError(t, err)
+
+	assert.NotEmpty(t, tokenFilePathA)
+	assert.NotEmpty(t, tokenFilePathB)
+	assert.NotEqual(t, tokenFilePathA, tokenFilePathB, "token file path must be unique per volume ID")
+	assert.True(t, strings.HasSuffix(tokenFilePathA, hashVolumeIDForTokenFile("volume-A")))
+	assert.True(t, strings.HasSuffix(tokenFilePathB, hashVolumeIDForTokenFile("volume-B")))
+	assert.Equal(t, filepath.Join(tokenDir, clientID+"-"+accountName+"-"+hashVolumeIDForTokenFile("volume-A")), tokenFilePathA)
+
+	// token file was actually written with the parsed token value.
+	written, readErr := os.ReadFile(tokenFilePathA)
+	assert.NoError(t, readErr)
+	assert.Equal(t, tokenValue, string(written))
+
+	// unchanged token, non-ephemeral volume: return an empty path so the caller
+	// skips the (unnecessary) credential-cache refresh.
+	tokenFilePathNonEphemeral, err := getTokenFilePath("volume-A", baseContext())
+	assert.NoError(t, err)
+	assert.Empty(t, tokenFilePathNonEphemeral, "unchanged token on a non-ephemeral volume must return an empty path")
+
+	// unchanged token, ephemeral inline volume: still return the token file path
+	// (non-empty) so the caller refreshes the credential cache and re-enforces identity.
+	tokenFilePathEphemeral, err := getTokenFilePath("volume-A", ephemeralContext())
+	assert.NoError(t, err)
+	assert.Equal(t, tokenFilePathA, tokenFilePathEphemeral, "unchanged token on an ephemeral volume must still return the token file path, not empty")
 }
 
 func TestCreateDisk(t *testing.T) {
@@ -2036,6 +2209,45 @@ func TestIsSupportedPublicNetworkAccess(t *testing.T) {
 	}
 }
 
+func TestIsSupportedNetworkEndpointType(t *testing.T) {
+	tests := []struct {
+		networkEndpointType string
+		expectedResult      bool
+	}{
+		{
+			networkEndpointType: "",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "privateEndpoint",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "serviceEndpoint",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "SERVICEENDPOINT",
+			expectedResult:      true,
+		},
+		{
+			networkEndpointType: "serviceEndpiont",
+			expectedResult:      false,
+		},
+		{
+			networkEndpointType: "InvalidValue",
+			expectedResult:      false,
+		},
+	}
+
+	for _, test := range tests {
+		result := isSupportedNetworkEndpointType(test.networkEndpointType)
+		if result != test.expectedResult {
+			t.Errorf("isSupportedNetworkEndpointType(%s) returned %v, expected %v", test.networkEndpointType, result, test.expectedResult)
+		}
+	}
+}
+
 func TestCreateFolderIfNotExists(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping test in short mode")
@@ -2214,24 +2426,74 @@ func TestGetInfoFromSnapshotID(t *testing.T) {
 			expectedError: nil,
 		},
 		{
-			name:          "Invalid snapshot ID with less than 7 segments",
-			id:            "rg#accountname#sharename#diskname#namespace",
+			name:          "Short snapshot ID with 5 segments (in-tree migration with subsID)",
+			id:            "#accountname#sharename#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012",
 			expectedRG:    "",
-			expectedAcct:  "",
-			expectedShare: "",
-			expectedTime:  "",
-			expectedSubs:  "",
-			expectedError: fmt.Errorf("error parsing snapshot id: \"rg#accountname#sharename#diskname#namespace\", should at least contain 6 #"),
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
 		},
 		{
-			name:          "Invalid snapshot ID with 6 segments",
-			id:            "rg#accountname#sharename#diskname#namespace#azurefile-6654",
+			name:          "Short snapshot ID with 5 segments (subsID before snapshotTime)",
+			id:            "#accountname#sharename#12345678-1234-1234-1234-123456789012#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 4 segments (in-tree migration without subsID)",
+			id:            "#accountname#sharename#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "Short snapshot ID with 6 segments",
+			id:            "rg#accountname#sharename#diskname#namespace#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "rg",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "In-tree migration snapshot ID with empty RG and 7 segments",
+			id:            "#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "",
+			expectedError: nil,
+		},
+		{
+			name:          "In-tree migration snapshot ID with empty RG and 8 segments (with subsID)",
+			id:            "#accountname#sharename#diskname#namespace#azurefile-6654#2025-09-05T07:51:41.0000000Z#12345678-1234-1234-1234-123456789012",
+			expectedRG:    "",
+			expectedAcct:  "accountname",
+			expectedShare: "sharename",
+			expectedTime:  "2025-09-05T07:51:41.0000000Z",
+			expectedSubs:  "12345678-1234-1234-1234-123456789012",
+			expectedError: nil,
+		},
+		{
+			name:          "Invalid snapshot ID with less than 4 segments",
+			id:            "rg#accountname#sharename",
 			expectedRG:    "",
 			expectedAcct:  "",
 			expectedShare: "",
 			expectedTime:  "",
 			expectedSubs:  "",
-			expectedError: fmt.Errorf("error parsing snapshot id: \"rg#accountname#sharename#diskname#namespace#azurefile-6654\", should at least contain 6 #"),
+			expectedError: fmt.Errorf("error parsing snapshot id: \"rg#accountname#sharename\", should at least contain 3 #"),
 		},
 		{
 			name:          "Empty snapshot ID",
@@ -2241,7 +2503,7 @@ func TestGetInfoFromSnapshotID(t *testing.T) {
 			expectedShare: "",
 			expectedTime:  "",
 			expectedSubs:  "",
-			expectedError: fmt.Errorf("error parsing snapshot id: \"\", should at least contain 6 #"),
+			expectedError: fmt.Errorf("error parsing snapshot id: \"\", should at least contain 3 #"),
 		},
 		{
 			name:          "Snapshot ID with empty segments",
